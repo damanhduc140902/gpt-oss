@@ -1,8 +1,11 @@
 // TODO: Modify this file to optimize end-to-end throughput
 #include "getp_eval.cpp"
+#include "getp_transformer.cpp"
 
 #ifndef GETP_RUN
 #define GETP_RUN
+
+Transformer *dev_transformer = new Transformer;
 
 void warm_up(Transformer *transformer, Tokenizer *tokenizer) {
   // Do not inference here
@@ -11,6 +14,60 @@ void warm_up(Transformer *transformer, Tokenizer *tokenizer) {
   // - Memory allocation
   // - Load model
   // - ...
+  upload_transformer(transformer, dev_transformer);
+
+  // Test upload phase
+  TransformerWeights *w = &transformer->weights;
+  TransformerWeights *dev_w = &dev_transformer->weights;
+  Config *cfg = &transformer->config;
+  int head_dim = cfg->head_dim;
+  int n_layers = cfg->n_layers;
+  int n_experts = cfg->n_experts;
+  // token_embedding_table points to the beginning of the memory region consisting of the TransformerWeights
+  // b_mlp2 points the "almost" ending of the memory region
+  ssize_t weights_size = (w->b_mlp2 - w->token_embedding_table + 
+    1ll * n_layers * n_experts * cfg->hidden_dim) * sizeof(float);
+  float *new_data = reinterpret_cast<float *>(malloc(weights_size));
+  HIP_CHECK(hipMemcpy(new_data, dev_w->token_embedding_table, weights_size, hipMemcpyDeviceToHost));
+
+  float *ptr = new_data;
+  w->token_embedding_table = ptr;
+  ptr += 1ll * cfg->vocab_size * cfg->hidden_dim;
+  w->out = ptr; // unembedding
+  ptr += 1ll * cfg->vocab_size * cfg->hidden_dim;
+  w->rms_attn_w = ptr;
+  ptr += 1ll * n_layers * cfg->hidden_dim;
+  w->rms_ffn_w = ptr;
+  ptr += 1ll * n_layers * cfg->hidden_dim;
+  w->rms_out_w = ptr;
+  ptr += 1ll * cfg->hidden_dim;
+  // hey it's qkvqkv, not qqkkvv
+  w->w_qkv = ptr;
+  ptr += 1ll * n_layers * cfg->hidden_dim *
+         (head_dim * cfg->n_attn_heads + 2 * head_dim * cfg->n_kv_heads);
+  w->b_qkv = ptr;
+  ptr += 1ll * n_layers *
+         (head_dim * cfg->n_attn_heads + 2 * head_dim * cfg->n_kv_heads);
+  w->w_o = ptr;
+  ptr += 1ll * n_layers * (head_dim * cfg->n_attn_heads) * cfg->hidden_dim;
+  w->b_o = ptr;
+  ptr += 1ll * n_layers * cfg->hidden_dim;
+  w->attn_sinks = ptr;
+  ptr += 1ll * n_layers * cfg->n_attn_heads;
+  w->w_router = ptr;
+  ptr += 1ll * n_layers * cfg->hidden_dim * n_experts;
+  w->b_router = ptr;
+  ptr += 1ll * n_layers * n_experts;
+  // hey it's gate_upgate_up, not gategateupup
+  w->w_mlp1 = ptr;
+  ptr +=
+      1ll * n_layers * n_experts * 2 * cfg->intermediate_dim * cfg->hidden_dim;
+  w->b_mlp1 = ptr;
+  ptr += 1ll * n_layers * n_experts * 2 * cfg->intermediate_dim;
+  w->w_mlp2 = ptr;
+  ptr += 1ll * n_layers * n_experts * cfg->hidden_dim * cfg->intermediate_dim;
+  w->b_mlp2 = ptr;
+  ptr += 1ll * n_layers * n_experts * cfg->hidden_dim;
 }
 
 void finish(Transformer *transformer, Tokenizer *tokenizer) {
@@ -20,6 +77,11 @@ void finish(Transformer *transformer, Tokenizer *tokenizer) {
   // - Memory deallocation
   // - Unload model
   // - ...
+  cleanup(transformer, dev_transformer);
+
+  // Test upload phase
+  TransformerWeights *w = &transformer->weights;
+  free(w->token_embedding_table);
 }
 
 long long simple_getp_generate(Transformer *transformer, Tokenizer *tokenizer,
