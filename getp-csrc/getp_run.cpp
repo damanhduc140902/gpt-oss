@@ -23,7 +23,10 @@ void warm_up(Transformer *transformer, Tokenizer *tokenizer) {
 
   // Test upload phase
   TransformerWeights *w = &transformer->weights;
-  TransformerWeights *dev_w = &dev_transformers[0]->weights;
+  TransformerWeights *dev_w[4] = {&dev_transformers[0]->weights, 
+                                  &dev_transformers[1]->weights,
+                                  &dev_transformers[2]->weights, 
+                                  &dev_transformers[3]->weights};
   Config *cfg = &transformer->config;
 
   int head_dim = cfg->head_dim;
@@ -79,7 +82,7 @@ void warm_up(Transformer *transformer, Tokenizer *tokenizer) {
   for (int l = 0; l < n_layers; ++l) {
     for (int i = 0; i < NGPU; ++i) {
       HIP_CHECK(hipSetDevice(i));
-      HIP_CHECK(hipMemcpy(ptr, dev_w->w_mlp1 + 1ll * l * (n_experts / NGPU) * 2 * intermediate_dim * hidden_dim, 
+      HIP_CHECK(hipMemcpy(ptr, dev_w[i]->w_mlp1 + 1ll * l * (n_experts / NGPU) * 2 * intermediate_dim * hidden_dim, 
                 (n_experts / NGPU) * 2 * intermediate_dim * hidden_dim * sizeof(float), 
                 hipMemcpyDeviceToHost));
       ptr += (n_experts / NGPU) * 2 * intermediate_dim * hidden_dim;
@@ -90,7 +93,7 @@ void warm_up(Transformer *transformer, Tokenizer *tokenizer) {
   for (int l = 0; l < n_layers; ++l) {
     for (int i = 0; i < NGPU; ++i) {
       HIP_CHECK(hipSetDevice(i));
-      HIP_CHECK(hipMemcpy(ptr, dev_w->b_mlp1 + 1ll * l * (n_experts / NGPU) * 2 * intermediate_dim, 
+      HIP_CHECK(hipMemcpy(ptr, dev_w[i]->b_mlp1 + 1ll * l * (n_experts / NGPU) * 2 * intermediate_dim, 
                 (n_experts / NGPU) * 2 * intermediate_dim * sizeof(float), 
                 hipMemcpyDeviceToHost));
       ptr += (n_experts / NGPU) * 2 * intermediate_dim;
@@ -101,7 +104,7 @@ void warm_up(Transformer *transformer, Tokenizer *tokenizer) {
   for (int l = 0; l < n_layers; ++l) {
     for (int i = 0; i < NGPU; ++i) {
       HIP_CHECK(hipSetDevice(i));
-      HIP_CHECK(hipMemcpy(ptr, dev_w->w_mlp2 + 1ll * l * (n_experts / NGPU) * hidden_dim * intermediate_dim, 
+      HIP_CHECK(hipMemcpy(ptr, dev_w[i]->w_mlp2 + 1ll * l * (n_experts / NGPU) * hidden_dim * intermediate_dim, 
                 (n_experts / NGPU) * hidden_dim * intermediate_dim * sizeof(float), 
                 hipMemcpyDeviceToHost));
       ptr += (n_experts / NGPU) * hidden_dim * intermediate_dim;
@@ -112,7 +115,7 @@ void warm_up(Transformer *transformer, Tokenizer *tokenizer) {
   for (int l = 0; l < n_layers; ++l) {
     for (int i = 0; i < NGPU; ++i) {
       HIP_CHECK(hipSetDevice(i));
-      HIP_CHECK(hipMemcpy(ptr, dev_w->b_mlp2 + 1ll * l * (n_experts / NGPU) * hidden_dim, 
+      HIP_CHECK(hipMemcpy(ptr, dev_w[i]->b_mlp2 + 1ll * l * (n_experts / NGPU) * hidden_dim, 
                 (n_experts / NGPU) * hidden_dim * sizeof(float), 
                 hipMemcpyDeviceToHost));
       ptr += (n_experts / NGPU) * hidden_dim;
@@ -128,7 +131,7 @@ void finish(Transformer *transformer, Tokenizer *tokenizer) {
   // - Unload model
   // - ...
   for (int i = 0; i < NGPU; ++i) {
-    cleanup(transformer, dev_transformers[i]);
+    // cleanup(transformer, dev_transformers[i]);
     free(dev_transformers[i]);
   }
 
