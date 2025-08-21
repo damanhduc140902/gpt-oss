@@ -20,107 +20,6 @@ void warm_up(Transformer *transformer, Tokenizer *tokenizer) {
     dev_transformers[i]->device_index = i;
     upload_transformer(transformer, dev_transformers[i]);
   }
-
-  // Test upload phase
-  TransformerWeights *w = &transformer->weights;
-  TransformerWeights *dev_w[4] = {&dev_transformers[0]->weights, 
-                                  &dev_transformers[1]->weights,
-                                  &dev_transformers[2]->weights, 
-                                  &dev_transformers[3]->weights};
-  Config *cfg = &transformer->config;
-
-  int head_dim = cfg->head_dim;
-  int n_layers = cfg->n_layers;
-  int n_experts = cfg->n_experts;
-  int intermediate_dim = cfg->intermediate_dim;
-  int hidden_dim = cfg->hidden_dim;
-  
-  float *weights_begin = w->token_embedding_table;
-  float *weights_end = w->b_mlp2 + 1ll * n_layers * n_experts * cfg->hidden_dim;
-  ssize_t weights_size = (weights_end - weights_begin) * sizeof(float);
-
-  float *experts_begin = w->w_mlp1;
-  float *experts_end = weights_end;
-  ssize_t experts_size = (experts_end - experts_begin) * sizeof(float);
-
-  float *new_data = reinterpret_cast<float *>(malloc(weights_size));
-  HIP_CHECK(hipSetDevice(0));
-  HIP_CHECK(hipMemcpy(new_data, dev_transformers[0]->dev_data, weights_size - experts_size, hipMemcpyDeviceToHost));
-
-  float *ptr = new_data;
-  {
-    w->token_embedding_table = ptr;
-    ptr += 1ll * cfg->vocab_size * cfg->hidden_dim;
-    w->out = ptr; // unembedding
-    ptr += 1ll * cfg->vocab_size * cfg->hidden_dim;
-    w->rms_attn_w = ptr;
-    ptr += 1ll * n_layers * cfg->hidden_dim;
-    w->rms_ffn_w = ptr;
-    ptr += 1ll * n_layers * cfg->hidden_dim;
-    w->rms_out_w = ptr;
-    ptr += 1ll * cfg->hidden_dim;
-    // hey it's qkvqkv, not qqkkvv
-    w->w_qkv = ptr;
-    ptr += 1ll * n_layers * cfg->hidden_dim *
-          (head_dim * cfg->n_attn_heads + 2 * head_dim * cfg->n_kv_heads);
-    w->b_qkv = ptr;
-    ptr += 1ll * n_layers *
-          (head_dim * cfg->n_attn_heads + 2 * head_dim * cfg->n_kv_heads);
-    w->w_o = ptr;
-    ptr += 1ll * n_layers * (head_dim * cfg->n_attn_heads) * cfg->hidden_dim;
-    w->b_o = ptr;
-    ptr += 1ll * n_layers * cfg->hidden_dim;
-    w->attn_sinks = ptr;
-    ptr += 1ll * n_layers * cfg->n_attn_heads;
-    w->w_router = ptr;
-    ptr += 1ll * n_layers * cfg->hidden_dim * n_experts;
-    w->b_router = ptr;
-    ptr += 1ll * n_layers * n_experts;
-  }
-
-  w->w_mlp1 = ptr;
-  for (int l = 0; l < n_layers; ++l) {
-    for (int i = 0; i < NGPU; ++i) {
-      HIP_CHECK(hipSetDevice(i));
-      HIP_CHECK(hipMemcpy(ptr, dev_w[i]->w_mlp1 + 1ll * l * (n_experts / NGPU) * 2 * intermediate_dim * hidden_dim, 
-                (n_experts / NGPU) * 2 * intermediate_dim * hidden_dim * sizeof(float), 
-                hipMemcpyDeviceToHost));
-      ptr += (n_experts / NGPU) * 2 * intermediate_dim * hidden_dim;
-    }
-  }
-
-  w->b_mlp1 = ptr;
-  for (int l = 0; l < n_layers; ++l) {
-    for (int i = 0; i < NGPU; ++i) {
-      HIP_CHECK(hipSetDevice(i));
-      HIP_CHECK(hipMemcpy(ptr, dev_w[i]->b_mlp1 + 1ll * l * (n_experts / NGPU) * 2 * intermediate_dim, 
-                (n_experts / NGPU) * 2 * intermediate_dim * sizeof(float), 
-                hipMemcpyDeviceToHost));
-      ptr += (n_experts / NGPU) * 2 * intermediate_dim;
-    }
-  }
-
-  w->w_mlp2 = ptr;
-  for (int l = 0; l < n_layers; ++l) {
-    for (int i = 0; i < NGPU; ++i) {
-      HIP_CHECK(hipSetDevice(i));
-      HIP_CHECK(hipMemcpy(ptr, dev_w[i]->w_mlp2 + 1ll * l * (n_experts / NGPU) * hidden_dim * intermediate_dim, 
-                (n_experts / NGPU) * hidden_dim * intermediate_dim * sizeof(float), 
-                hipMemcpyDeviceToHost));
-      ptr += (n_experts / NGPU) * hidden_dim * intermediate_dim;
-    }
-  }
-
-  w->b_mlp2 = ptr;
-  for (int l = 0; l < n_layers; ++l) {
-    for (int i = 0; i < NGPU; ++i) {
-      HIP_CHECK(hipSetDevice(i));
-      HIP_CHECK(hipMemcpy(ptr, dev_w[i]->b_mlp2 + 1ll * l * (n_experts / NGPU) * hidden_dim, 
-                (n_experts / NGPU) * hidden_dim * sizeof(float), 
-                hipMemcpyDeviceToHost));
-      ptr += (n_experts / NGPU) * hidden_dim;
-    }
-  }
 }
 
 void finish(Transformer *transformer, Tokenizer *tokenizer) {
@@ -134,10 +33,6 @@ void finish(Transformer *transformer, Tokenizer *tokenizer) {
     // cleanup(transformer, dev_transformers[i]);
     free(dev_transformers[i]);
   }
-
-  // Test upload phase
-  TransformerWeights *w = &transformer->weights;
-  free(w->token_embedding_table);
 }
 
 long long simple_getp_generate(Transformer *transformer, Tokenizer *tokenizer,
