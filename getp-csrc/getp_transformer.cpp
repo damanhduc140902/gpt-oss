@@ -31,7 +31,7 @@ DeviceTransformer::~DeviceTransformer() {
 }
 
 static void upload_weights(TransformerWeights *w, TransformerWeights *dev_w, Config *cfg, 
-                           float *_dev_data, float *_dev_experts, int device_index) {
+                           float **_dev_data, float **_dev_experts, int device_index) {
   int head_dim = cfg->head_dim;
   int n_layers = cfg->n_layers;
   int n_experts = cfg->n_experts;
@@ -50,10 +50,10 @@ static void upload_weights(TransformerWeights *w, TransformerWeights *dev_w, Con
   HIP_CHECK(hipSetDevice(device_index));
 
   if (device_index == 0) {
-    HIP_CHECK(hipMalloc(&_dev_data, weights_size - experts_size));
-    HIP_CHECK(hipMemcpy(_dev_data, w->token_embedding_table, weights_size - experts_size, hipMemcpyHostToDevice));
+    HIP_CHECK(hipMalloc(_dev_data, weights_size - experts_size));
+    HIP_CHECK(hipMemcpy(*_dev_data, w->token_embedding_table, weights_size - experts_size, hipMemcpyHostToDevice));
   
-    float *ptr = _dev_data;
+    float *ptr = *_dev_data;
     dev_w->token_embedding_table = ptr;
     ptr += 1ll * cfg->vocab_size * cfg->hidden_dim;
     dev_w->out = ptr; // unembedding
@@ -83,8 +83,8 @@ static void upload_weights(TransformerWeights *w, TransformerWeights *dev_w, Con
     ptr += 1ll * n_layers * n_experts;
   }
 
-  HIP_CHECK(hipMalloc(&_dev_experts, experts_size / NGPU));
-  float *ptr = _dev_experts;
+  HIP_CHECK(hipMalloc(_dev_experts, experts_size / NGPU));
+  float *ptr = *_dev_experts;
 
   dev_w->w_mlp1 = ptr;
   for (int l = 0; l < n_layers; ++l) {
@@ -244,7 +244,7 @@ void free_device_run_state(RunState *s) {
 void upload_transformer(Transformer *transformer, DeviceTransformer *dev_transformer) {
   dev_transformer->config = transformer->config;
   upload_weights(&transformer->weights, &dev_transformer->weights, &transformer->config, 
-    dev_transformer->dev_data, dev_transformer->dev_experts, dev_transformer->device_index);
+    &dev_transformer->dev_data, &dev_transformer->dev_experts, dev_transformer->device_index);
   init_device_run_state(&dev_transformer->state, &dev_transformer->config);
 }
 
