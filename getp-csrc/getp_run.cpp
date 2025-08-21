@@ -5,7 +5,7 @@
 #ifndef GETP_RUN
 #define GETP_RUN
 
-Transformer *dev_transformer = new Transformer;
+DeviceTransformer *dev_transformers[NGPU];
 
 void warm_up(Transformer *transformer, Tokenizer *tokenizer) {
   // Do not inference here
@@ -14,7 +14,11 @@ void warm_up(Transformer *transformer, Tokenizer *tokenizer) {
   // - Memory allocation
   // - Load model
   // - ...
-  upload_transformer(transformer, dev_transformer);
+  for (int i = 0; i < NGPU; ++i) {
+    dev_transformers[i] = new DeviceTransformer;
+    dev_transformers[i]->device_index = i;
+    upload_transformer(transformer, dev_transformers[i]);
+  }
 }
 
 void finish(Transformer *transformer, Tokenizer *tokenizer) {
@@ -24,7 +28,10 @@ void finish(Transformer *transformer, Tokenizer *tokenizer) {
   // - Memory deallocation
   // - Unload model
   // - ...
-  cleanup(transformer, dev_transformer);
+  for (int i = 0; i < NGPU; ++i) {
+    cleanup(transformer, dev_transformers[i]);
+    free(dev_transformers[i]);
+  }
 }
 
 long long simple_getp_generate(Transformer *transformer, Tokenizer *tokenizer,

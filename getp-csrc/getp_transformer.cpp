@@ -1,6 +1,7 @@
 #pragma once
 
 #include "getp_eval.cpp"
+#include "getp_transformer.hpp"
 #include <iostream>
 #include <hip/hip_runtime.h>
 
@@ -16,63 +17,129 @@
     }                                          \
 }
 
-static void upload_weights(TransformerWeights *w, TransformerWeights *dev_w, Config *cfg) {
+void free_device_run_state(RunState *s);
+
+DeviceTransformer::~DeviceTransformer() {
+  HIP_CHECK(hipSetDevice(device_index));
+  if (dev_data) {
+    HIP_CHECK(hipFree(dev_data));
+  }
+  if (dev_experts) {
+    HIP_CHECK(hipFree(dev_experts))
+  }
+  free_device_run_state(&state);
+}
+
+static void upload_weights(TransformerWeights *w, TransformerWeights *dev_w, Config *cfg, 
+                           float *_dev_data, float *_dev_experts, int device_index) {
   int head_dim = cfg->head_dim;
   int n_layers = cfg->n_layers;
   int n_experts = cfg->n_experts;
+  int intermediate_dim = cfg->intermediate_dim;
+  int hidden_dim = cfg->hidden_dim;
   // token_embedding_table points to the beginning of the memory region consisting of the TransformerWeights
   // b_mlp2 points the "almost" ending of the memory region
-  ssize_t weights_size = (w->b_mlp2 - w->token_embedding_table + 
-    1ll * n_layers * n_experts * cfg->hidden_dim) * sizeof(float);
-  float *dev_data;
-  HIP_CHECK(hipMalloc(&dev_data, weights_size));
-  HIP_CHECK(hipMemcpy(dev_data, w->token_embedding_table, weights_size, hipMemcpyHostToDevice));
+  float *weights_begin = w->token_embedding_table;
+  float *weights_end = w->b_mlp2 + 1ll * n_layers * n_experts * cfg->hidden_dim;
+  ssize_t weights_size = (weights_end - weights_begin) * sizeof(float);
 
-  dev_w->token_embedding_table = dev_data;
-  dev_data += 1ll * cfg->vocab_size * cfg->hidden_dim;
-  dev_w->out = dev_data; // unembedding
-  dev_data += 1ll * cfg->vocab_size * cfg->hidden_dim;
-  dev_w->rms_attn_w = dev_data;
-  dev_data += 1ll * n_layers * cfg->hidden_dim;
-  dev_w->rms_ffn_w = dev_data;
-  dev_data += 1ll * n_layers * cfg->hidden_dim;
-  dev_w->rms_out_w = dev_data;
-  dev_data += 1ll * cfg->hidden_dim;
-  // hey it's qkvqkv, not qqkkvv
-  dev_w->w_qkv = dev_data;
-  dev_data += 1ll * n_layers * cfg->hidden_dim *
-         (head_dim * cfg->n_attn_heads + 2 * head_dim * cfg->n_kv_heads);
-  dev_w->b_qkv = dev_data;
-  dev_data += 1ll * n_layers *
-         (head_dim * cfg->n_attn_heads + 2 * head_dim * cfg->n_kv_heads);
-  dev_w->w_o = dev_data;
-  dev_data += 1ll * n_layers * (head_dim * cfg->n_attn_heads) * cfg->hidden_dim;
-  dev_w->b_o = dev_data;
-  dev_data += 1ll * n_layers * cfg->hidden_dim;
-  dev_w->attn_sinks = dev_data;
-  dev_data += 1ll * n_layers * cfg->n_attn_heads;
-  dev_w->w_router = dev_data;
-  dev_data += 1ll * n_layers * cfg->hidden_dim * n_experts;
-  dev_w->b_router = dev_data;
-  dev_data += 1ll * n_layers * n_experts;
+  float *experts_begin = w->w_mlp1;
+  float *experts_end = weights_end;
+  ssize_t experts_size = (experts_end - experts_begin) * sizeof(float);
+
+  HIP_CHECK(hipSetDevice(device_index));
+
+  if (device_index == 0) {
+    HIP_CHECK(hipMalloc(&_dev_data, weights_size - experts_size));
+    HIP_CHECK(hipMemcpy(_dev_data, w->token_embedding_table, weights_size - experts_size, hipMemcpyHostToDevice));
+  
+    float *ptr = _dev_data;
+    dev_w->token_embedding_table = ptr;
+    ptr += 1ll * cfg->vocab_size * cfg->hidden_dim;
+    dev_w->out = ptr; // unembedding
+    ptr += 1ll * cfg->vocab_size * cfg->hidden_dim;
+    dev_w->rms_attn_w = ptr;
+    ptr += 1ll * n_layers * cfg->hidden_dim;
+    dev_w->rms_ffn_w = ptr;
+    ptr += 1ll * n_layers * cfg->hidden_dim;
+    dev_w->rms_out_w = ptr;
+    ptr += 1ll * cfg->hidden_dim;
+    // hey it's qkvqkv, not qqkkvv
+    dev_w->w_qkv = ptr;
+    ptr += 1ll * n_layers * cfg->hidden_dim *
+           (head_dim * cfg->n_attn_heads + 2 * head_dim * cfg->n_kv_heads);
+    dev_w->b_qkv = ptr;
+    ptr += 1ll * n_layers *
+           (head_dim * cfg->n_attn_heads + 2 * head_dim * cfg->n_kv_heads);
+    dev_w->w_o = ptr;
+    ptr += 1ll * n_layers * (head_dim * cfg->n_attn_heads) * cfg->hidden_dim;
+    dev_w->b_o = ptr;
+    ptr += 1ll * n_layers * cfg->hidden_dim;
+    dev_w->attn_sinks = ptr;
+    ptr += 1ll * n_layers * cfg->n_attn_heads;
+    dev_w->w_router = ptr;
+    ptr += 1ll * n_layers * cfg->hidden_dim * n_experts;
+    dev_w->b_router = ptr;
+    ptr += 1ll * n_layers * n_experts;
+  }
+
+  HIP_CHECK(hipMalloc(&_dev_experts, experts_size / NGPU));
+  float *ptr = _dev_experts;
+
+  dev_w->w_mlp1 = ptr;
+  for (int l = 0; l < n_layers; ++l) {
+    HIP_CHECK(hipMemcpy(ptr, w->w_mlp1 + 
+              1ll * l * n_experts * 2 * intermediate_dim * hidden_dim + 
+              1ll * device_index * (n_experts / NGPU) * 2 * intermediate_dim * hidden_dim,
+              (n_experts / NGPU) * 2 * intermediate_dim * hidden_dim * sizeof(float), 
+              hipMemcpyHostToDevice));
+    ptr += (n_experts / NGPU) * 2 * intermediate_dim * hidden_dim;
+  }
+
+  dev_w->b_mlp1 = ptr;
+  for (int l = 0; l < n_layers; ++l) {
+    HIP_CHECK(hipMemcpy(ptr, w->b_mlp1 + 
+              1ll * l * n_experts * 2 * intermediate_dim + 
+              1ll * device_index * (n_experts / NGPU) * 2 * intermediate_dim,
+              (n_experts / NGPU) * 2 * intermediate_dim * sizeof(float), 
+              hipMemcpyHostToDevice));
+    ptr += (n_experts / NGPU) * 2 * intermediate_dim;
+  }
+
+  dev_w->w_mlp2 = ptr;
+  for (int l = 0; l < n_layers; ++l) {
+    HIP_CHECK(hipMemcpy(ptr, w->w_mlp2 + 
+              1ll * l * n_experts * hidden_dim * intermediate_dim + 
+              1ll * device_index * (n_experts / NGPU) * hidden_dim * intermediate_dim,
+              (n_experts / NGPU) * hidden_dim * intermediate_dim * sizeof(float), 
+              hipMemcpyHostToDevice));
+    ptr += (n_experts / NGPU) * hidden_dim * intermediate_dim;
+  }
+
+  dev_w->b_mlp2 = ptr;
+  for (int l = 0; l < n_layers; ++l) {
+    HIP_CHECK(hipMemcpy(ptr, w->b_mlp2 + 
+              1ll * l * n_experts * hidden_dim + 
+              1ll * device_index * (n_experts / NGPU) * hidden_dim,
+              (n_experts / NGPU) * hidden_dim * sizeof(float), 
+              hipMemcpyHostToDevice));
+    ptr += (n_experts / NGPU) * hidden_dim;
+  }
+
   // hey it's gate_upgate_up, not gategateupup
-  dev_w->w_mlp1 = dev_data;
-  dev_data +=
-      1ll * n_layers * n_experts * 2 * cfg->intermediate_dim * cfg->hidden_dim;
-  dev_w->b_mlp1 = dev_data;
-  dev_data += 1ll * n_layers * n_experts * 2 * cfg->intermediate_dim;
-  dev_w->w_mlp2 = dev_data;
-  dev_data += 1ll * n_layers * n_experts * cfg->hidden_dim * cfg->intermediate_dim;
-  dev_w->b_mlp2 = dev_data;
-  dev_data += 1ll * n_layers * n_experts * cfg->hidden_dim;
+  // dev_w->w_mlp1 = ptr;
+  // ptr +=
+  //     1ll * n_layers * n_experts * 2 * cfg->intermediate_dim * cfg->hidden_dim;
+  // dev_w->b_mlp1 = ptr;
+  // ptr += 1ll * n_layers * n_experts * 2 * cfg->intermediate_dim;
+  // dev_w->w_mlp2 = ptr;
+  // ptr += 1ll * n_layers * n_experts * cfg->hidden_dim * cfg->intermediate_dim;
+  // dev_w->b_mlp2 = ptr;
+  // ptr += 1ll * n_layers * n_experts * cfg->hidden_dim;
+
 }
 
-static void free_device_weights(TransformerWeights *dev_w) {
-  // token_embedding_table points to the beginning of the memory region consisting of the TransformerWeights
-  HIP_CHECK(hipFree(dev_w->token_embedding_table));
-}
-
-static void init_device_run_state(RunState *s, Config *p) {
+void init_device_run_state(RunState *s, Config *p) {
   int kv_dim = p->head_dim * p->n_kv_heads;
   // s->x = reinterpret_cast<float *>(calloc(p->hidden_dim, sizeof(float)));
   HIP_CHECK(hipMalloc(&s->x, p->hidden_dim * sizeof(float)));
@@ -147,7 +214,7 @@ static void init_device_run_state(RunState *s, Config *p) {
 
 }
 
-static void free_device_run_state(RunState *s) {
+void free_device_run_state(RunState *s) {
   HIP_CHECK(hipFree(s->x));
   HIP_CHECK(hipFree(s->t));
   HIP_CHECK(hipFree(s->tb));
@@ -174,13 +241,13 @@ static void free_device_run_state(RunState *s) {
     HIP_CHECK(hipFree(s->mask));
 }
 
-void upload_transformer(Transformer *transformer, Transformer *dev_transformer) {
+void upload_transformer(Transformer *transformer, DeviceTransformer *dev_transformer) {
   dev_transformer->config = transformer->config;
-  upload_weights(&transformer->weights, &dev_transformer->weights, &transformer->config);
+  upload_weights(&transformer->weights, &dev_transformer->weights, &transformer->config, 
+    dev_transformer->dev_data, dev_transformer->dev_experts, dev_transformer->device_index);
   init_device_run_state(&dev_transformer->state, &dev_transformer->config);
 }
 
-void cleanup(Transformer *transformer, Transformer *dev_transformer) {
-  free_device_weights(&dev_transformer->weights);
+void cleanup(Transformer *transformer, DeviceTransformer *dev_transformer) {
   free_device_run_state(&dev_transformer->state);
 }
