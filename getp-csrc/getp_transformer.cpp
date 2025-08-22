@@ -2,6 +2,7 @@
 
 #include "getp_eval.cpp"
 #include "getp_transformer.hpp"
+#include <cmath>
 #include <iostream>
 #include <hip/hip_runtime.h>
 
@@ -15,6 +16,15 @@
                   << " at " << __FILE__ << ":" \
                   << __LINE__ << std::endl;    \
     }                                          \
+}
+
+__global__ void init_mask_kernel(float *mask, int seq_len, int sliding_window) {
+  int i = blockDim.y * blockIdx.y + threadIdx.y;
+  int j = blockDim.x * blockIdx.x + threadIdx.x;
+
+  if (i >= seq_len || j >= seq_len) return;
+
+  mask[i * seq_len + j] = (sliding_window > 0 && i - j >= sliding_window ? -INFINITY : 0);
 }
 
 void free_device_run_state(RunState *s);
@@ -125,18 +135,6 @@ static void upload_weights(TransformerWeights *w, TransformerWeights *dev_w, Con
               hipMemcpyHostToDevice));
     ptr += (n_experts / NGPU) * hidden_dim;
   }
-
-  // hey it's gate_upgate_up, not gategateupup
-  // dev_w->w_mlp1 = ptr;
-  // ptr +=
-  //     1ll * n_layers * n_experts * 2 * cfg->intermediate_dim * cfg->hidden_dim;
-  // dev_w->b_mlp1 = ptr;
-  // ptr += 1ll * n_layers * n_experts * 2 * cfg->intermediate_dim;
-  // dev_w->w_mlp2 = ptr;
-  // ptr += 1ll * n_layers * n_experts * cfg->hidden_dim * cfg->intermediate_dim;
-  // dev_w->b_mlp2 = ptr;
-  // ptr += 1ll * n_layers * n_experts * cfg->hidden_dim;
-
 }
 
 void init_device_run_state(RunState *s, Config *p) {
@@ -198,20 +196,14 @@ void init_device_run_state(RunState *s, Config *p) {
   //                                 : NULL;
   if (p->sliding_window > 0) {
     HIP_CHECK(hipMalloc(&s->mask, p->seq_len * p->seq_len * sizeof(float)));
+    dim3 blockDim(32, 32);
+    dim3 gridDim((p->seq_len + blockDim.x - 1) / blockDim.x, 
+                 (p->seq_len + blockDim.y - 1) / blockDim.y);
+    init_mask_kernel<<<gridDim, blockDim>>>(s->mask, p->seq_len, p->sliding_window);
   }
   else {
     s->mask = NULL;
   }
-  
-  // TODO: initialize mask on device
-  // for (int i = 0; i < p->seq_len; i++) {
-  //   for (int j = 0; j < p->seq_len; j++) {
-  //     if (p->sliding_window > 0 && i - j >= p->sliding_window) {
-  //       s->mask[i * p->seq_len + j] = -INFINITY; // Sliding window mask
-  //     }
-  //   }
-  // }
-
 }
 
 void free_device_run_state(RunState *s) {
