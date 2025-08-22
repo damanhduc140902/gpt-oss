@@ -1,6 +1,7 @@
 // TODO: Modify this file to optimize end-to-end throughput
 #include "getp_eval.cpp"
 #include "getp_transformer.cpp"
+#include "getp_forward.cpp"
 #include <hip/driver_types.h>
 
 #ifndef GETP_RUN
@@ -71,7 +72,7 @@ long long simple_getp_generate(Transformer *transformer, Tokenizer *tokenizer,
   while (pos < steps) {
 
     // forward the transformer to get logits for the next token
-    float *logits = forward(transformer, token, pos);
+    float *logits = getp_forward(transformer, dev_transformers, token, pos);
 
     // advance the state machine
     pos++;
