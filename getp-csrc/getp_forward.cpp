@@ -1,6 +1,5 @@
 #include "getp_transformer.hpp"
 #include <cmath>
-#include <hip/driver_types.h>
 #include <hip/hip_runtime.h>
 #include <iostream>
 #include <cstdlib>
@@ -46,13 +45,13 @@ __global__ void square_reduction_kernel(float *x, float *sum, int size) {
   }
 }
 
-__global__ void rmsnorm_kernel(float *o, float *x, float *weight, float ss, int size) {
+__global__ void rmsnorm_kernel(float *o, float *x, __hip_bfloat16 *weight, float ss, int size) {
   int i = blockDim.x * blockIdx.x + threadIdx.x;
   if (i >= size) return;
-  o[i] = weight[i] * (ss * x[i]);
+  o[i] = __bfloat162float(weight[i]) * (ss * x[i]);
 }
 
-void getp_rmsnorm(float *o, float *x, float *weight, int size) {
+void getp_rmsnorm(float *o, float *x, __hip_bfloat16 *weight, int size) {
   float ss;
   float *dev_ss;
   HIP_CHECK(hipMalloc(&dev_ss, sizeof(float)));
@@ -78,17 +77,17 @@ void getp_rmsnorm(float *o, float *x, float *weight, int size) {
   HIP_CHECK(hipFree(dev_ss));
 }
 
-__global__ void matmul_kernel(float *xout, float *x, float *w, float *b, int n, int d) {
+__global__ void matmul_kernel(float *xout, float *x, __hip_bfloat16 *w, __hip_bfloat16 *b, int n, int d) {
   int i = blockDim.x * blockIdx.x + threadIdx.x;
   if (i >= d) return;
   float val = 0.f;
   for (int j = 0; j < n; ++j) {
-    val += w[1ll * i * n + j] * x[j];
+    val += __bfloat162float(w[1ll * i * n + j]) * x[j];
   }
-  xout[i] = val + b[i];
+  xout[i] = val + __bfloat162float(b[i]);
 }
 
-void getp_matmul(float *xout, float *x, float *w, float *b, int n, int d) {
+void getp_matmul(float *xout, float *x, __hip_bfloat16 *w, __hip_bfloat16 *b, int n, int d) {
   dim3 blockDim(64);
   dim3 gridDim((d + blockDim.x - 1) / blockDim.x);
   matmul_kernel<<<gridDim, blockDim>>>(xout, x, w, b, n, d);
@@ -198,7 +197,7 @@ void getp_apply_rotary_emb(float *x, float *cos, float *sin, int n_heads,
   apply_rotary_emb_kernel<<<gridDim, blockDim>>>(x, cos, sin, n_heads, head_dim);
 }
 
-__global__ void multihead_attention_kernel(float *key_cache, float *value_cache, float *query, float *mask, float *attn_sinks, float *attn, 
+__global__ void multihead_attention_kernel(float *key_cache, float *value_cache, float *query, float *mask, __hip_bfloat16 *attn_sinks, float *attn, 
                                            int l, int head_dim, int n_attn_heads, int n_kv_heads, int pos, int seq_len, int apply_mask
 ) {
   int h = blockDim.y * blockIdx.y + threadIdx.y;
@@ -207,7 +206,7 @@ __global__ void multihead_attention_kernel(float *key_cache, float *value_cache,
   if (h >= n_attn_heads || t > pos + 1) return;
 
   if (t == pos + 1) {
-    attn[h * seq_len + t] = attn_sinks[l * n_attn_heads + h];
+    attn[h * seq_len + t] = __bfloat162float(attn_sinks[l * n_attn_heads + h]);
     return;
   }
 
@@ -229,7 +228,7 @@ __global__ void multihead_attention_kernel(float *key_cache, float *value_cache,
   attn[h * seq_len + t] = score;
 }
 
-void getp_multihead_attention(float *key_cache, float *value_cache, float *query, float *mask, float *attn_sinks, float *attn,
+void getp_multihead_attention(float *key_cache, float *value_cache, float *query, float *mask, __hip_bfloat16 *attn_sinks, float *attn,
                               int l, int head_dim, int n_attn_heads, int n_kv_heads, int pos, int seq_len, int sliding_window) {
   int apply_mask = (sliding_window > 0 && (l % 2 == 0) ? 1 : 0);
   dim3 blockDim(16, 16); // arbitrary
@@ -501,7 +500,7 @@ float *getp_forward(Transformer *transformer, DeviceTransformer **dev_transforme
   TransformerWeights *w = &transformer->weights;
   RunState *s = &transformer->state;
 
-  TransformerWeights *dev_w = &dev_transformeres[0]->weights;
+  DeviceTransformerWeights *dev_w = &dev_transformeres[0]->weights;
   RunState *dev_s = &dev_transformeres[0]->state;
 
   float *x = s->x;
@@ -541,11 +540,11 @@ float *getp_forward(Transformer *transformer, DeviceTransformer **dev_transforme
 
     // s->qkv = w->w_qkv * s->t = (head_dim * (n_attn_heads + 2 * n_kv_heads),
     // hidden_dim) * (hidden_dim, ) = head_dim * (n_attn_heads + 2 * n_kv_heads)
-    float *dev_w_qkv = dev_w->w_qkv + 1ll * l * hidden_dim * 
-                                          (head_dim * p->n_attn_heads + 
-                                           2 * head_dim * p->n_kv_heads);
-    float *dev_b_qkv = dev_w->b_qkv + 1ll * l * (head_dim * p->n_attn_heads + 
-                                                 2 * head_dim * p->n_kv_heads);
+    __hip_bfloat16 *dev_w_qkv = dev_w->w_qkv + 1ll * l * hidden_dim * 
+                                                  (head_dim * p->n_attn_heads + 
+                                                  2 * head_dim * p->n_kv_heads);
+    __hip_bfloat16 *dev_b_qkv = dev_w->b_qkv + 1ll * l * (head_dim * p->n_attn_heads + 
+                                                   2 * head_dim * p->n_kv_heads);
     getp_matmul(dev_s->qkv, dev_s->t, dev_w_qkv, dev_b_qkv, 
                 hidden_dim, (p->n_attn_heads + 2 * p->n_kv_heads) * head_dim);
     // Separate q, k, v
@@ -581,8 +580,8 @@ float *getp_forward(Transformer *transformer, DeviceTransformer **dev_transforme
                       p->seq_len, p->n_attn_heads, p->n_kv_heads, pos, head_dim);
 
     // final matmul to get the output of the attention
-    float *dev_w_o = dev_w->w_o + 1ll * l * (head_dim * p->n_attn_heads) * hidden_dim;
-    float *dev_b_o = dev_w->b_o + 1ll * l * hidden_dim;
+    __hip_bfloat16 *dev_w_o = dev_w->w_o + 1ll * l * (head_dim * p->n_attn_heads) * hidden_dim;
+    __hip_bfloat16 *dev_b_o = dev_w->b_o + 1ll * l * hidden_dim;
     getp_matmul(dev_s->tb2, dev_s->tb, dev_w_o, dev_b_o, head_dim * p->n_attn_heads, hidden_dim);
 
     // residual connection back into x
@@ -593,8 +592,8 @@ float *getp_forward(Transformer *transformer, DeviceTransformer **dev_transforme
 
     // MoE GPU implementation with multi-GPU expert sharding
     // Compute router_score on device 0 (router weights are on device 0)
-    float *dev_w_router = dev_w->w_router + 1ll * l * hidden_dim * n_experts;
-    float *dev_b_router = dev_w->b_router + 1ll * l * n_experts;
+    __hip_bfloat16 *dev_w_router = dev_w->w_router + 1ll * l * hidden_dim * n_experts;
+    __hip_bfloat16 *dev_b_router = dev_w->b_router + 1ll * l * n_experts;
     getp_matmul(dev_s->router_score, dev_s->t, dev_w_router, dev_b_router, 
                 hidden_dim, n_experts);
     
@@ -624,7 +623,7 @@ float *getp_forward(Transformer *transformer, DeviceTransformer **dev_transforme
       int expert_end = expert_start + experts_per_device;
       
       // Get device transformer for this GPU
-      TransformerWeights *curr_dev_w = &dev_transformeres[device_id]->weights;
+      DeviceTransformerWeights *curr_dev_w = &dev_transformeres[device_id]->weights;
       RunState *curr_dev_s = &dev_transformeres[device_id]->state;
       
       // Copy normalized input to current device if not device 0
@@ -650,10 +649,10 @@ float *getp_forward(Transformer *transformer, DeviceTransformer **dev_transforme
           int local_expert_id = expert_id - expert_start;
           
           // Get expert weights pointers (local indexing)
-          float *dev_w_mlp1 = curr_dev_w->w_mlp1 + 1ll * (l * experts_per_device + local_expert_id) *
-                                                      (2 * p->intermediate_dim) * hidden_dim;
-          float *dev_b_mlp1 = curr_dev_w->b_mlp1 + 1ll * (l * experts_per_device + local_expert_id) * 
-                                                      (2 * p->intermediate_dim);
+          __hip_bfloat16 *dev_w_mlp1 = curr_dev_w->w_mlp1 + 1ll * (l * experts_per_device + local_expert_id) *
+                                                                (2 * p->intermediate_dim) * hidden_dim;
+          __hip_bfloat16 *dev_b_mlp1 = curr_dev_w->b_mlp1 + 1ll * (l * experts_per_device + local_expert_id) * 
+                                                                (2 * p->intermediate_dim);
           
           // MLP layer 1: gate_up projection
           getp_matmul(curr_dev_s->mlp1_out, curr_dev_s->t, dev_w_mlp1, dev_b_mlp1, 
@@ -668,10 +667,10 @@ float *getp_forward(Transformer *transformer, DeviceTransformer **dev_transforme
                       p->intermediate_dim, p->swiglu_limit);
           
           // MLP layer 2: down projection
-          float *dev_w_mlp2 = curr_dev_w->w_mlp2 + 1ll * (l * experts_per_device + local_expert_id) * 
-                                                      hidden_dim * p->intermediate_dim;
-          float *dev_b_mlp2 = curr_dev_w->b_mlp2 + 1ll * (l * experts_per_device + local_expert_id) * 
-                                                      hidden_dim;
+          __hip_bfloat16 *dev_w_mlp2 = curr_dev_w->w_mlp2 + 1ll * (l * experts_per_device + local_expert_id) * 
+                                                                hidden_dim * p->intermediate_dim;
+          __hip_bfloat16 *dev_b_mlp2 = curr_dev_w->b_mlp2 + 1ll * (l * experts_per_device + local_expert_id) * 
+                                                                hidden_dim;
           getp_matmul(curr_dev_s->tb2, curr_dev_s->gate_up, dev_w_mlp2, dev_b_mlp2, 
                       p->intermediate_dim, hidden_dim);
           
