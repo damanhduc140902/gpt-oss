@@ -1,5 +1,6 @@
 #include "getp_transformer.hpp"
 #include <cmath>
+#include <hip/driver_types.h>
 #include <hip/hip_runtime.h>
 #include <iostream>
 #include <cstdlib>
@@ -529,9 +530,10 @@ float *getp_forward(Transformer *transformer, DeviceTransformer **dev_transforme
 
   // copy the token embedding into x
   float *content_row = w->token_embedding_table + token * hidden_dim;
-  memcpy(x, content_row, hidden_dim * sizeof(*x));
+  // memcpy(x, content_row, hidden_dim * sizeof(*x));
   // copy to GPU
   HIP_CHECK(hipSetDevice(0));
+  HIP_CHECK(hipMemcpy(dev_x, content_row, hidden_dim * sizeof(*x), hipMemcpyHostToDevice));
 
   // Allocate precomputing sin, cos memory
   float *dev_cos_vals, *dev_sin_vals;
@@ -542,9 +544,6 @@ float *getp_forward(Transformer *transformer, DeviceTransformer **dev_transforme
   for (unsigned long long l = 0; l < p->n_layers; l++) {
     HIP_CHECK(hipSetDevice(0));
     // s->t (hidden_dim, )
-    // input or output of previous layer is stored in host memory
-    // copy to device
-    HIP_CHECK(hipMemcpy(dev_x, x, hidden_dim * sizeof(*x), hipMemcpyHostToDevice));
     getp_rmsnorm(dev_s->t, dev_x, dev_w->rms_attn_w + 1ll * l * hidden_dim, hidden_dim);
     // key and value point to the kv cache
     int loff = l * p->seq_len * kv_dim; // kv cache layer offset for convenience
@@ -709,14 +708,16 @@ float *getp_forward(Transformer *transformer, DeviceTransformer **dev_transforme
     
     // Residual connection on device 0
     getp_vecadd(dev_x, dev_s->e_agg, hidden_dim);
-    
-    // Copy final result back to host
-    HIP_CHECK(hipMemcpy(x, dev_x, sizeof(float) * hidden_dim, hipMemcpyDeviceToHost));
   }
 
   // Deallocate precomputing sin, cos
   HIP_CHECK(hipFree(dev_cos_vals));
   HIP_CHECK(hipFree(dev_sin_vals));
+
+  // Copy output result to host
+  HIP_CHECK(hipMemcpy(x, dev_x, sizeof(float) * hidden_dim, hipMemcpyDeviceToHost));
+
+  // TODO: put 2 remaining below operations to GPU
 
   // final rmsnorm
   rmsnorm(x, x, w->rms_out_w, hidden_dim);
