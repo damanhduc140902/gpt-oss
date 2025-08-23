@@ -517,6 +517,9 @@ float *getp_forward(Transformer *transformer, DeviceTransformer **dev_transforme
   DeviceTransformerWeights *dev_w = &dev_transformeres[0]->weights;
   RunState *dev_s = &dev_transformeres[0]->state;
 
+  int n_devices;
+  HIP_CHECK(hipGetDeviceCount(&n_devices));
+
   float *x = s->x;
   float *dev_x = dev_s->x;
   int head_dim = p->head_dim;
@@ -626,11 +629,11 @@ float *getp_forward(Transformer *transformer, DeviceTransformer **dev_transforme
                         hipMemcpyDeviceToHost));
 
     // Process experts across multiple GPUs
-    for (int device_id = 0; device_id < NGPU; device_id++) {
+    for (int device_id = 0; device_id < n_devices; device_id++) {
       HIP_CHECK(hipSetDevice(device_id));
       
       // Determine expert range for this device
-      int experts_per_device = n_experts / NGPU;
+      int experts_per_device = n_experts / n_devices;
       int expert_start = device_id * experts_per_device;
       int expert_end = expert_start + experts_per_device;
       

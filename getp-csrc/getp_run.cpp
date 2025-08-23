@@ -2,12 +2,13 @@
 #include "getp_eval.cpp"
 #include "getp_transformer.cpp"
 #include "getp_forward.cpp"
+#include "getp_transformer.hpp"
 #include <hip/driver_types.h>
 
 #ifndef GETP_RUN
 #define GETP_RUN
 
-DeviceTransformer *dev_transformers[NGPU];
+DeviceTransformer **dev_transformers;
 
 void warm_up(Transformer *transformer, Tokenizer *tokenizer) {
   // Do not inference here
@@ -16,7 +17,12 @@ void warm_up(Transformer *transformer, Tokenizer *tokenizer) {
   // - Memory allocation
   // - Load model
   // - ...
-  for (int i = 0; i < NGPU; ++i) {
+  int n_devices;
+  HIP_CHECK(hipGetDeviceCount(&n_devices));
+
+  dev_transformers = reinterpret_cast<DeviceTransformer **>(malloc(sizeof(DeviceTransformer *) * n_devices));
+
+  for (int i = 0; i < n_devices; ++i) {
     dev_transformers[i] = new DeviceTransformer;
     dev_transformers[i]->device_index = i;
     upload_transformer(transformer, dev_transformers[i]);
@@ -30,10 +36,13 @@ void finish(Transformer *transformer, Tokenizer *tokenizer) {
   // - Memory deallocation
   // - Unload model
   // - ...
-  for (int i = 0; i < NGPU; ++i) {
+  int n_devices;
+  HIP_CHECK(hipGetDeviceCount(&n_devices));
+  for (int i = 0; i < n_devices; ++i) {
     // cleanup(transformer, dev_transformers[i]);
     free(dev_transformers[i]);
   }
+  free(dev_transformers);
 }
 
 long long simple_getp_generate(Transformer *transformer, Tokenizer *tokenizer,

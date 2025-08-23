@@ -2,8 +2,6 @@
 
 #include <hip/hip_bf16.h>
 
-#define NGPU  (2)
-
 struct DeviceTransformerWeights {
   // token_embedding_table - embedding.weight
   float *token_embedding_table; // (vocab_size, hidden_dim) (in, out)

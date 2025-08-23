@@ -103,43 +103,46 @@ static void upload_weights(TransformerWeights *w, DeviceTransformerWeights *dev_
     ptr += 1ll * n_layers * n_experts;
   }
 
-  HIP_CHECK(hipMalloc(_dev_experts, (experts_size / sizeof(float)) * sizeof(__hip_bfloat16) / NGPU));
+  int n_devices;
+  HIP_CHECK(hipGetDeviceCount(&n_devices));
+
+  HIP_CHECK(hipMalloc(_dev_experts, (experts_size / sizeof(float)) * sizeof(__hip_bfloat16) / n_devices));
   __hip_bfloat16 *ptr = *_dev_experts;
 
   dev_w->w_mlp1 = ptr;
   for (int l = 0; l < n_layers; ++l) {
     getp_memcpy_fp32_to_bf16(ptr, w->w_mlp1 + 
               1ll * l * n_experts * 2 * intermediate_dim * hidden_dim + 
-              1ll * device_index * (n_experts / NGPU) * 2 * intermediate_dim * hidden_dim, 
-              (n_experts / NGPU) * 2 * intermediate_dim * hidden_dim);
-    ptr += (n_experts / NGPU) * 2 * intermediate_dim * hidden_dim;
+              1ll * device_index * (n_experts / n_devices) * 2 * intermediate_dim * hidden_dim, 
+              (n_experts / n_devices) * 2 * intermediate_dim * hidden_dim);
+    ptr += (n_experts / n_devices) * 2 * intermediate_dim * hidden_dim;
   }
 
   dev_w->b_mlp1 = ptr;
   for (int l = 0; l < n_layers; ++l) {
     getp_memcpy_fp32_to_bf16(ptr, w->b_mlp1 + 
               1ll * l * n_experts * 2 * intermediate_dim + 
-              1ll * device_index * (n_experts / NGPU) * 2 * intermediate_dim, 
-              (n_experts / NGPU) * 2 * intermediate_dim);
-    ptr += (n_experts / NGPU) * 2 * intermediate_dim;
+              1ll * device_index * (n_experts / n_devices) * 2 * intermediate_dim, 
+              (n_experts / n_devices) * 2 * intermediate_dim);
+    ptr += (n_experts / n_devices) * 2 * intermediate_dim;
   }
 
   dev_w->w_mlp2 = ptr;
   for (int l = 0; l < n_layers; ++l) {
     getp_memcpy_fp32_to_bf16(ptr, w->w_mlp2 + 
               1ll * l * n_experts * hidden_dim * intermediate_dim + 
-              1ll * device_index * (n_experts / NGPU) * hidden_dim * intermediate_dim, 
-              (n_experts / NGPU) * hidden_dim * intermediate_dim);
-    ptr += (n_experts / NGPU) * hidden_dim * intermediate_dim;
+              1ll * device_index * (n_experts / n_devices) * hidden_dim * intermediate_dim, 
+              (n_experts / n_devices) * hidden_dim * intermediate_dim);
+    ptr += (n_experts / n_devices) * hidden_dim * intermediate_dim;
   }
 
   dev_w->b_mlp2 = ptr;
   for (int l = 0; l < n_layers; ++l) {
     getp_memcpy_fp32_to_bf16(ptr, w->b_mlp2 + 
               1ll * l * n_experts * hidden_dim + 
-              1ll * device_index * (n_experts / NGPU) * hidden_dim, 
-              (n_experts / NGPU) * hidden_dim);
-    ptr += (n_experts / NGPU) * hidden_dim;
+              1ll * device_index * (n_experts / n_devices) * hidden_dim, 
+              (n_experts / n_devices) * hidden_dim);
+    ptr += (n_experts / n_devices) * hidden_dim;
   }
 }
 
