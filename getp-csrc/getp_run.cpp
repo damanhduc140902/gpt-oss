@@ -58,7 +58,7 @@ long long simple_getp_generate(Transformer *transformer, Tokenizer *tokenizer,
   int num_prompt_tokens = 0;
   int *prompt_tokens = (int *)malloc((strlen(input_seq) + 3) *
                                      sizeof(int)); // +3 for '\0', ?BOS, ?EOS
-  encode(tokenizer, input_seq, 1, 0, prompt_tokens, &num_prompt_tokens,
+  encode(tokenizer, input_seq, -1, -1, prompt_tokens, &num_prompt_tokens,
          transformer->config.initial_context_length);
   if (num_prompt_tokens < 1) {
     fprintf(stderr, "something is wrong, expected at least 1 prompt token\n");
@@ -69,6 +69,13 @@ long long simple_getp_generate(Transformer *transformer, Tokenizer *tokenizer,
   int next;                     // will store the next token in the sequence
   int token = prompt_tokens[0]; // kick off with the first token in the prompt
   int pos = 0;                  // position in the sequence
+
+  // print the very first token
+  // should be removed
+  const char *first_piece = decode_piece(tokenizer, 200006, token);
+  safe_printf(first_piece);
+  fflush(stdout);
+
   while (pos < steps) {
 
     // forward the transformer to get logits for the next token
