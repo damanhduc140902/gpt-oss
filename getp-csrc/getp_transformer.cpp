@@ -50,7 +50,7 @@ void getp_memcpy_fp32_to_bf16(__hip_bfloat16 *dst, float *src, int n_elements) {
 }
 
 static void upload_weights(TransformerWeights *w, DeviceTransformerWeights *dev_w, Config *cfg, 
-                           __hip_bfloat16 **_dev_data, __hip_bfloat16 **_dev_experts, int device_index) {
+                           float **_dev_data, __hip_bfloat16 **_dev_experts, int device_index) {
   int head_dim = cfg->head_dim;
   int n_layers = cfg->n_layers;
   int n_experts = cfg->n_experts;
@@ -69,11 +69,11 @@ static void upload_weights(TransformerWeights *w, DeviceTransformerWeights *dev_
   HIP_CHECK(hipSetDevice(device_index));
 
   if (device_index == 0) {
-    HIP_CHECK(hipMalloc(_dev_data, ((weights_size - experts_size) / sizeof(float)) * sizeof(__hip_bfloat16)));
-    // HIP_CHECK(hipMemcpy(*_dev_data, w->token_embedding_table, weights_size - experts_size, hipMemcpyHostToDevice));
-    getp_memcpy_fp32_to_bf16(*_dev_data, w->token_embedding_table, (weights_size - experts_size) / sizeof(float));
+    HIP_CHECK(hipMalloc(_dev_data, weights_size - experts_size));
+    HIP_CHECK(hipMemcpy(*_dev_data, w->token_embedding_table, weights_size - experts_size, hipMemcpyHostToDevice));
+    // getp_memcpy_fp32_to_bf16(*_dev_data, w->token_embedding_table, (weights_size - experts_size) / sizeof(float));
   
-    __hip_bfloat16 *ptr = *_dev_data;
+    float *ptr = *_dev_data;
     dev_w->token_embedding_table = ptr;
     ptr += 1ll * cfg->vocab_size * cfg->hidden_dim;
     dev_w->out = ptr; // unembedding
@@ -108,11 +108,6 @@ static void upload_weights(TransformerWeights *w, DeviceTransformerWeights *dev_
 
   dev_w->w_mlp1 = ptr;
   for (int l = 0; l < n_layers; ++l) {
-    // HIP_CHECK(hipMemcpy(ptr, w->w_mlp1 + 
-    //           1ll * l * n_experts * 2 * intermediate_dim * hidden_dim + 
-    //           1ll * device_index * (n_experts / NGPU) * 2 * intermediate_dim * hidden_dim,
-    //           (n_experts / NGPU) * 2 * intermediate_dim * hidden_dim * sizeof(float), 
-    //           hipMemcpyHostToDevice));
     getp_memcpy_fp32_to_bf16(ptr, w->w_mlp1 + 
               1ll * l * n_experts * 2 * intermediate_dim * hidden_dim + 
               1ll * device_index * (n_experts / NGPU) * 2 * intermediate_dim * hidden_dim, 
@@ -122,11 +117,6 @@ static void upload_weights(TransformerWeights *w, DeviceTransformerWeights *dev_
 
   dev_w->b_mlp1 = ptr;
   for (int l = 0; l < n_layers; ++l) {
-    // HIP_CHECK(hipMemcpy(ptr, w->b_mlp1 + 
-    //           1ll * l * n_experts * 2 * intermediate_dim + 
-    //           1ll * device_index * (n_experts / NGPU) * 2 * intermediate_dim,
-    //           (n_experts / NGPU) * 2 * intermediate_dim * sizeof(float), 
-    //           hipMemcpyHostToDevice));
     getp_memcpy_fp32_to_bf16(ptr, w->b_mlp1 + 
               1ll * l * n_experts * 2 * intermediate_dim + 
               1ll * device_index * (n_experts / NGPU) * 2 * intermediate_dim, 
@@ -136,11 +126,6 @@ static void upload_weights(TransformerWeights *w, DeviceTransformerWeights *dev_
 
   dev_w->w_mlp2 = ptr;
   for (int l = 0; l < n_layers; ++l) {
-    // HIP_CHECK(hipMemcpy(ptr, w->w_mlp2 + 
-    //           1ll * l * n_experts * hidden_dim * intermediate_dim + 
-    //           1ll * device_index * (n_experts / NGPU) * hidden_dim * intermediate_dim,
-    //           (n_experts / NGPU) * hidden_dim * intermediate_dim * sizeof(float), 
-    //           hipMemcpyHostToDevice));
     getp_memcpy_fp32_to_bf16(ptr, w->w_mlp2 + 
               1ll * l * n_experts * hidden_dim * intermediate_dim + 
               1ll * device_index * (n_experts / NGPU) * hidden_dim * intermediate_dim, 
@@ -150,11 +135,6 @@ static void upload_weights(TransformerWeights *w, DeviceTransformerWeights *dev_
 
   dev_w->b_mlp2 = ptr;
   for (int l = 0; l < n_layers; ++l) {
-    // HIP_CHECK(hipMemcpy(ptr, w->b_mlp2 + 
-    //           1ll * l * n_experts * hidden_dim + 
-    //           1ll * device_index * (n_experts / NGPU) * hidden_dim,
-    //           (n_experts / NGPU) * hidden_dim * sizeof(float), 
-    //           hipMemcpyHostToDevice));
     getp_memcpy_fp32_to_bf16(ptr, w->b_mlp2 + 
               1ll * l * n_experts * hidden_dim + 
               1ll * device_index * (n_experts / NGPU) * hidden_dim, 
