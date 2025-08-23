@@ -80,6 +80,7 @@ long long simple_getp_generate(Transformer *transformer, Tokenizer *tokenizer,
 
     // forward the transformer to get logits for the next token
     float *logits = getp_forward(transformer, dev_transformers, token, pos);
+    // float *logits = forward(transformer, token, pos);
 
     // advance the state machine
     pos++;

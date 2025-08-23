@@ -5,6 +5,7 @@
 #include <iostream>
 #include <cstdlib>
 #include <cstring>
+#include <malloc.h>
 
 #define MAX(x, y) (((x) > (y)) ? (x) : (y))
 #define MIN(x, y) (((x) < (y)) ? (x) : (y))
@@ -386,6 +387,115 @@ void getp_vecadd(float *x, float *y, int size) {
   vecadd_kernel<<<gridDim, blockDim>>>(x, y, size);
 }
 
+// MoE GPU kernels
+__global__ void topk_kernel(float *router_score, float *topk_values, int *topk_indices, 
+                           int n_experts, int experts_per_token) {
+  // Simple parallel top-k selection using sorting network approach
+  int tid = threadIdx.x;
+  if (tid >= experts_per_token) return;
+  
+  // Initialize with first experts_per_token experts
+  if (tid < n_experts) {
+    topk_values[tid] = router_score[tid];
+    topk_indices[tid] = tid;
+  } else {
+    topk_values[tid] = -INFINITY;
+    topk_indices[tid] = -1;
+  }
+  
+  __syncthreads();
+  
+  // For remaining experts, replace if larger
+  for (int i = experts_per_token; i < n_experts; i++) {
+    __syncthreads();
+    float current_score = router_score[i];
+    
+    // Find minimum in current top-k
+    if (tid == 0) {
+      int min_idx = 0;
+      float min_val = topk_values[0];
+      for (int j = 1; j < experts_per_token; j++) {
+        if (topk_values[j] < min_val) {
+          min_val = topk_values[j];
+          min_idx = j;
+        }
+      }
+      
+      // Replace if current score is larger
+      if (current_score > min_val) {
+        topk_values[min_idx] = current_score;
+        topk_indices[min_idx] = i;
+      }
+    }
+  }
+}
+
+__global__ void swiglu_kernel(float *gate_up, float *gate, float *up, 
+                             int intermediate_dim, float swiglu_limit) {
+  int i = blockDim.x * blockIdx.x + threadIdx.x;
+  if (i >= intermediate_dim) return;
+  
+  float val = gate[i];
+  float up_val = up[i];
+  const float alpha = 1.702f;
+  
+  // Clamping
+  if (val > swiglu_limit) val = swiglu_limit;
+  if (up_val > swiglu_limit) up_val = swiglu_limit;
+  if (up_val < -swiglu_limit) up_val = -swiglu_limit;
+  
+  // silu(x)=x*σ(x), where σ(x) is the logistic sigmoid
+  val *= (1.0f / (1.0f + expf(-alpha * val)));
+  // elementwise multiply with up + bias
+  val *= (up_val + 1.0f); // gpt-oss adds an extra bias of 1 to the up layer
+  
+  gate_up[i] = val;
+}
+
+__global__ void split_gate_up_kernel(float *mlp1_out, float *gate, float *up, 
+                                     int intermediate_dim) {
+  int i = blockDim.x * blockIdx.x + threadIdx.x;
+  if (i >= intermediate_dim) return;
+  
+  gate[i] = mlp1_out[2 * i];
+  up[i] = mlp1_out[2 * i + 1];
+}
+
+__global__ void weighted_aggregate_kernel(float *e_agg, float *expert_out, 
+                                         float expert_weight, int hidden_dim) {
+  int i = blockDim.x * blockIdx.x + threadIdx.x;
+  if (i >= hidden_dim) return;
+  
+  atomicAdd(&e_agg[i], expert_out[i] * expert_weight);
+}
+
+void getp_topk(float *topk_values, int *topk_indices, float *router_score, 
+               int n_experts, int experts_per_token) {
+  dim3 blockDim(experts_per_token); 
+  dim3 gridDim(1);
+  topk_kernel<<<gridDim, blockDim>>>(router_score, topk_values, topk_indices, 
+                                     n_experts, experts_per_token);
+}
+
+void getp_swiglu(float *gate_up, float *gate, float *up, 
+                 int intermediate_dim, float swiglu_limit) {
+  dim3 blockDim(256);
+  dim3 gridDim((intermediate_dim + blockDim.x - 1) / blockDim.x);
+  swiglu_kernel<<<gridDim, blockDim>>>(gate_up, gate, up, intermediate_dim, swiglu_limit);
+}
+
+void getp_split_gate_up(float *mlp1_out, float *gate, float *up, int intermediate_dim) {
+  dim3 blockDim(256);
+  dim3 gridDim((intermediate_dim + blockDim.x - 1) / blockDim.x);
+  split_gate_up_kernel<<<gridDim, blockDim>>>(mlp1_out, gate, up, intermediate_dim);
+}
+
+void getp_weighted_aggregate(float *e_agg, float *expert_out, float expert_weight, int hidden_dim) {
+  dim3 blockDim(256);
+  dim3 gridDim((hidden_dim + blockDim.x - 1) / blockDim.x);
+  weighted_aggregate_kernel<<<gridDim, blockDim>>>(e_agg, expert_out, expert_weight, hidden_dim);
+}
+
 float *getp_forward(Transformer *transformer, DeviceTransformer **dev_transformeres, int token, int pos) {
   Config *p = &transformer->config;
   TransformerWeights *w = &transformer->weights;
@@ -481,99 +591,115 @@ float *getp_forward(Transformer *transformer, DeviceTransformer **dev_transforme
     // ffn rmsnorm
     getp_rmsnorm(dev_s->t, dev_x, dev_w->rms_ffn_w + 1ll * l * hidden_dim, hidden_dim);
 
-    // Copy back to host
-    HIP_CHECK(hipMemcpy(s->t, dev_s->t, sizeof(float) * hidden_dim, hipMemcpyDeviceToHost));
-    HIP_CHECK(hipMemcpy(x, dev_x, sizeof(float) * hidden_dim, hipMemcpyDeviceToHost));
+    // MoE GPU implementation with multi-GPU expert sharding
+    // Compute router_score on device 0 (router weights are on device 0)
+    float *dev_w_router = dev_w->w_router + 1ll * l * hidden_dim * n_experts;
+    float *dev_b_router = dev_w->b_router + 1ll * l * n_experts;
+    getp_matmul(dev_s->router_score, dev_s->t, dev_w_router, dev_b_router, 
+                hidden_dim, n_experts);
+    
+    // Select top-k experts on GPU
+    getp_topk(dev_s->topk_v, dev_s->topk_i, dev_s->router_score, 
+              n_experts, p->experts_per_token);
+    
+    // Normalize selected experts using softmax
+    getp_softmax(dev_s->topk_v, p->experts_per_token);
+    
+    // Initialize aggregation buffer to zero on device 0
+    HIP_CHECK(hipMemset(dev_s->e_agg, 0, hidden_dim * sizeof(float)));
+    
+    // Copy topk results back to host to determine expert distribution
+    HIP_CHECK(hipMemcpy(s->topk_v, dev_s->topk_v, p->experts_per_token * sizeof(float), 
+                        hipMemcpyDeviceToHost));
+    HIP_CHECK(hipMemcpy(s->topk_i, dev_s->topk_i, p->experts_per_token * sizeof(int), 
+                        hipMemcpyDeviceToHost));
 
-    // MoE
-    // Compute router_score
-    float *w_router = w->w_router + 1ll * l * hidden_dim * n_experts;
-    float *b_router = w->b_router + 1ll * l * n_experts;
-    matmul(s->router_score, s->t, w_router, hidden_dim,
-           n_experts); // s->router_score now stores router_score (n_experts, )
-    // add bias b_router
-    for (int i = 0; i < n_experts; i++) {
-      s->router_score[i] += b_router[i];
-    }
-    // Select top-k experts
-    topk(s->topk_v, s->topk_i, s->router_score, n_experts,
-         p->experts_per_token);
-    // Normalize selected experts using softmax or sigmoid
-    softmax(s->topk_v, p->experts_per_token); // expert
-
-    // Route the tokens to their corresponding top-k experts
-    memset(s->e_agg, 0, hidden_dim * sizeof(float));
-    for (int e = 0; e < n_experts; e++) {
-      float expert_w = 0;
-      int in_topk = 0;
-      // Check if expert i is in top-k experts
+    // Process experts across multiple GPUs
+    for (int device_id = 0; device_id < NGPU; device_id++) {
+      HIP_CHECK(hipSetDevice(device_id));
+      
+      // Determine expert range for this device
+      int experts_per_device = n_experts / NGPU;
+      int expert_start = device_id * experts_per_device;
+      int expert_end = expert_start + experts_per_device;
+      
+      // Get device transformer for this GPU
+      TransformerWeights *curr_dev_w = &dev_transformeres[device_id]->weights;
+      RunState *curr_dev_s = &dev_transformeres[device_id]->state;
+      
+      // Copy normalized input to current device if not device 0
+      if (device_id != 0) {
+        // Copy through host memory for cross-device transfer
+        HIP_CHECK(hipSetDevice(0));
+        HIP_CHECK(hipMemcpy(s->t, dev_s->t, sizeof(float) * hidden_dim, hipMemcpyDeviceToHost));
+        HIP_CHECK(hipSetDevice(device_id));
+        HIP_CHECK(hipMemcpy(curr_dev_s->t, s->t, sizeof(float) * hidden_dim, hipMemcpyHostToDevice));
+      }
+      
+      // Initialize device aggregation buffer
+      HIP_CHECK(hipMemset(curr_dev_s->e_agg, 0, hidden_dim * sizeof(float)));
+      
+      // Process experts assigned to this device
       for (int idx = 0; idx < p->experts_per_token; idx++) {
-        if (s->topk_i[idx] == e) {
-          in_topk = 1;
-          expert_w = s->topk_v[idx];
-          break;
+        int expert_id = s->topk_i[idx];
+        float expert_weight = s->topk_v[idx];
+        
+        // Check if this expert belongs to current device
+        if (expert_id >= expert_start && expert_id < expert_end) {
+          // Local expert index within this device
+          int local_expert_id = expert_id - expert_start;
+          
+          // Get expert weights pointers (local indexing)
+          float *dev_w_mlp1 = curr_dev_w->w_mlp1 + 1ll * (l * experts_per_device + local_expert_id) *
+                                                      (2 * p->intermediate_dim) * hidden_dim;
+          float *dev_b_mlp1 = curr_dev_w->b_mlp1 + 1ll * (l * experts_per_device + local_expert_id) * 
+                                                      (2 * p->intermediate_dim);
+          
+          // MLP layer 1: gate_up projection
+          getp_matmul(curr_dev_s->mlp1_out, curr_dev_s->t, dev_w_mlp1, dev_b_mlp1, 
+                      hidden_dim, 2 * p->intermediate_dim);
+          
+          // Split into gate and up
+          getp_split_gate_up(curr_dev_s->mlp1_out, curr_dev_s->gate, curr_dev_s->up, 
+                             p->intermediate_dim);
+          
+          // SwiGLU non-linearity
+          getp_swiglu(curr_dev_s->gate_up, curr_dev_s->gate, curr_dev_s->up, 
+                      p->intermediate_dim, p->swiglu_limit);
+          
+          // MLP layer 2: down projection
+          float *dev_w_mlp2 = curr_dev_w->w_mlp2 + 1ll * (l * experts_per_device + local_expert_id) * 
+                                                      hidden_dim * p->intermediate_dim;
+          float *dev_b_mlp2 = curr_dev_w->b_mlp2 + 1ll * (l * experts_per_device + local_expert_id) * 
+                                                      hidden_dim;
+          getp_matmul(curr_dev_s->tb2, curr_dev_s->gate_up, dev_w_mlp2, dev_b_mlp2, 
+                      p->intermediate_dim, hidden_dim);
+          
+          // Aggregate expert output with weight on current device
+          getp_weighted_aggregate(curr_dev_s->e_agg, curr_dev_s->tb2, expert_weight, hidden_dim);
         }
       }
-
-      if (in_topk) {
-        float *w_mlp1 = w->w_mlp1 + 1ll * (l * n_experts + e) *
-                                        (2 * p->intermediate_dim) * hidden_dim;
-        float *b_mlp1 =
-            w->b_mlp1 + 1ll * (l * n_experts + e) * (2 * p->intermediate_dim);
-        matmul(s->mlp1_out, s->t, w_mlp1, hidden_dim,
-               2 * p->intermediate_dim); // (2 * intermediate_dim, )
-        for (int i = 0; i < 2 * p->intermediate_dim; i++) {
-          s->mlp1_out[i] += b_mlp1[i];
-        }
-        // Split mlp1_out into gate and up
-        for (int j = 0; j < p->intermediate_dim; j++) {
-          s->gate[j] = s->mlp1_out[2 * j];
-          s->up[j] = s->mlp1_out[2 * j + 1];
-        }
-
-        // SwiGLU non-linearity
-        const float alpha = 1.702f;
-        for (int i = 0; i < p->intermediate_dim; i++) {
-          float val = s->gate[i];
-          float up_val = s->up[i];
-          // Clamping
-          if (val > p->swiglu_limit)
-            val = p->swiglu_limit;
-          if (up_val > p->swiglu_limit)
-            up_val = p->swiglu_limit;
-          if (up_val < -p->swiglu_limit)
-            up_val = -p->swiglu_limit;
-          // silu(x)=x*σ(x), where σ(x) is the logistic sigmoid
-          val *= (1.0f / (1.0f + expf(-alpha * val)));
-          // elementwise multiply with w_gate(x)
-          val *= (up_val +
-                  1.0f); // gpt-oss adds an extra bias of 1 to the up layer
-          s->gate_up[i] = val;
-        }
-
-        // final matmul to get the output of the ffn
-        float *w_mlp2 =
-            w->w_mlp2 +
-            1ll * (l * n_experts + e) * hidden_dim *
-                p->intermediate_dim; // (out: hidden_dim, in: intermediate_dim)
-        float *b_mlp2 = w->b_mlp2 + 1ll * (l * n_experts + e) * hidden_dim;
-        matmul(s->tb2, s->gate_up, w_mlp2, p->intermediate_dim,
-               hidden_dim); // (hidden_dim, )
-        for (int i = 0; i < hidden_dim; i++) {
-          s->tb2[i] += b_mlp2[i];
-        }
-
-        // aggregate topk experts using weighted sum
-        for (int i = 0; i < hidden_dim; i++) {
-          s->e_agg[i] += s->tb2[i] * expert_w;
-        }
+      
+      // Copy results back to device 0 for final aggregation if not device 0
+      if (device_id != 0) {
+        // Copy device result to host, then add to device 0
+        float *temp_result = (float*)malloc(hidden_dim * sizeof(float));
+        HIP_CHECK(hipMemcpy(temp_result, curr_dev_s->e_agg, sizeof(float) * hidden_dim, hipMemcpyDeviceToHost));
+        HIP_CHECK(hipSetDevice(0));
+        HIP_CHECK(hipMemcpy(dev_s->tb2, temp_result, sizeof(float) * hidden_dim, hipMemcpyHostToDevice));
+        getp_vecadd(dev_s->e_agg, dev_s->tb2, hidden_dim);
+        free(temp_result);
       }
     }
-
-    // residual connection
-    for (int i = 0; i < hidden_dim; i++) {
-      x[i] += s->e_agg[i];
-    }
+    
+    // Ensure we're back on device 0
+    HIP_CHECK(hipSetDevice(0));
+    
+    // Residual connection on device 0
+    getp_vecadd(dev_x, dev_s->e_agg, hidden_dim);
+    
+    // Copy final result back to host
+    HIP_CHECK(hipMemcpy(x, dev_x, sizeof(float) * hidden_dim, hipMemcpyDeviceToHost));
   }
 
   // Deallocate precomputing sin, cos

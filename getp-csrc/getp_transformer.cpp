@@ -35,7 +35,7 @@ DeviceTransformer::~DeviceTransformer() {
     HIP_CHECK(hipFree(dev_data));
   }
   if (dev_experts) {
-    HIP_CHECK(hipFree(dev_experts))
+    HIP_CHECK(hipFree(dev_experts));
   }
   free_device_run_state(&state);
 }
@@ -157,7 +157,7 @@ void init_device_run_state(RunState *s, Config *p) {
   HIP_CHECK(hipMalloc(&s->topk_v, p->experts_per_token * sizeof(float)));
   // s->topk_i =
   //     reinterpret_cast<int *>(calloc(p->experts_per_token, sizeof(int)));
-  HIP_CHECK(hipMalloc(&s->topk_i, p->experts_per_token * sizeof(float)));
+  HIP_CHECK(hipMalloc(&s->topk_i, p->experts_per_token * sizeof(int)));
 
   // s->mlp1_out =
   //     reinterpret_cast<float *>(calloc(2 * p->intermediate_dim, sizeof(float)));
