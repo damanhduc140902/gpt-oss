@@ -3,7 +3,9 @@
 #include "getp_transformer.cpp"
 #include "getp_forward.cpp"
 #include "getp_transformer.hpp"
+#include "profiler.hpp"
 #include <hip/driver_types.h>
+#include <hip/hip_runtime.h>
 
 #ifndef GETP_RUN
 #define GETP_RUN
@@ -48,6 +50,7 @@ void finish(Transformer *transformer, Tokenizer *tokenizer) {
 long long simple_getp_generate(Transformer *transformer, Tokenizer *tokenizer,
                                Sampler *sampler, const char *input_seq,
                                int *output_tokens, int steps) {
+  PROFILE_FUNCTION();
   // <|start|>: 200006
   // <|end|>: 200007
   // <|return|>: 200002
@@ -132,6 +135,11 @@ long long simple_getp_generate(Transformer *transformer, Tokenizer *tokenizer,
 
 long long inference(Transformer *transformer, Tokenizer *tokenizer,
                     Sampler *sampler, Requests *requests) {
+  PROFILE_FUNCTION();
+  
+  // Reset timing at the start of inference
+  reset_timing_summary();
+  
   long long num_token_out = 0;
   for (int idx = 0; idx < requests->num_reqs; ++idx) {
     const char *input_seq = get_str_req_ptr(requests, idx);
@@ -140,6 +148,13 @@ long long inference(Transformer *transformer, Tokenizer *tokenizer,
         simple_getp_generate(transformer, tokenizer, sampler, input_seq,
                              output_tokens, requests->max_seq_len);
   }
+  
+  // Ensure all GPU work is completed before printing timing
+  HIP_CHECK(hipDeviceSynchronize());
+  
+  // Print timing summary at the end of inference
+  print_timing_summary();
+  
   return num_token_out;
 }
 

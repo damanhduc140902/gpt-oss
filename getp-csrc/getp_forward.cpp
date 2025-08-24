@@ -1,4 +1,5 @@
 #include "getp_transformer.hpp"
+#include "profiler.hpp"
 #include <cmath>
 #include <hip/driver_types.h>
 #include <hip/hip_runtime.h>
@@ -53,6 +54,7 @@ __global__ void rmsnorm_kernel(float *o, float *x, float *weight, float ss, int 
 }
 
 void getp_rmsnorm(float *o, float *x, float *weight, int size) {
+  PROFILE_FUNCTION();
   float ss;
   float *dev_ss;
   HIP_CHECK(hipMalloc(&dev_ss, sizeof(float)));
@@ -75,6 +77,7 @@ void getp_rmsnorm(float *o, float *x, float *weight, int size) {
     dim3 gridDim((size + blockDim.x - 1) / blockDim.x);
     rmsnorm_kernel<<<gridDim, blockDim>>>(o, x, weight, ss, size);
   }
+  HIP_CHECK(hipDeviceSynchronize());
   HIP_CHECK(hipFree(dev_ss));
 }
 
@@ -102,9 +105,11 @@ __global__ void matmul_kernel<__hip_bfloat16>(float *xout, float *x, __hip_bfloa
 
 template <typename T>
 void getp_matmul(float *xout, float *x, T *w, T *b, int n, int d) {
+  PROFILE_FUNCTION();
   dim3 blockDim(64);
   dim3 gridDim((d + blockDim.x - 1) / blockDim.x);
   matmul_kernel<T><<<gridDim, blockDim>>>(xout, x, w, b, n, d);
+  HIP_CHECK(hipDeviceSynchronize());
 }
 
 __global__ void compute_inv_freq_kernel(float base, int head_dim,
@@ -156,6 +161,7 @@ void getp_compute_cos_sin(int pos, // position index
                           float *cos_out, // shape: head_dim/2
                           float *sin_out  // shape: head_dim/2
 ) {
+  PROFILE_FUNCTION();
   int d_half = head_dim / 2;
   
   float concentration = scaling_factor > 1.0f ? 
@@ -178,7 +184,8 @@ void getp_compute_cos_sin(int pos, // position index
     compute_cos_sin_kernel<<<gridDim, blockDim>>>
       (cos_out, sin_out, inv_freq, concentration, pos, head_dim / 2);
   }
-
+  
+  HIP_CHECK(hipDeviceSynchronize());
   HIP_CHECK(hipFree(inv_freq));
 }
 
@@ -205,10 +212,12 @@ __global__ void apply_rotary_emb_kernel(float *x, float *cos, float *sin, int n_
 
 void getp_apply_rotary_emb(float *x, float *cos, float *sin, int n_heads,
                            int head_dim) {
+  PROFILE_FUNCTION();
   dim3 blockDim(16, 16); // arbitrary
   dim3 gridDim((head_dim / 2 + blockDim.x - 1) / blockDim.x, 
                (n_heads + blockDim.y - 1) / blockDim.y);
   apply_rotary_emb_kernel<<<gridDim, blockDim>>>(x, cos, sin, n_heads, head_dim);
+  HIP_CHECK(hipDeviceSynchronize());
 }
 
 __global__ void multihead_attention_kernel(float *key_cache, float *value_cache, float *query, float *mask, float *attn_sinks, float *attn, 
@@ -244,6 +253,7 @@ __global__ void multihead_attention_kernel(float *key_cache, float *value_cache,
 
 void getp_multihead_attention(float *key_cache, float *value_cache, float *query, float *mask, float *attn_sinks, float *attn,
                               int l, int head_dim, int n_attn_heads, int n_kv_heads, int pos, int seq_len, int sliding_window) {
+  PROFILE_FUNCTION();
   int apply_mask = (sliding_window > 0 && (l % 2 == 0) ? 1 : 0);
   dim3 blockDim(16, 16); // arbitrary
   dim3 gridDim((pos + 2 + blockDim.x - 1) / blockDim.x, 
@@ -251,6 +261,7 @@ void getp_multihead_attention(float *key_cache, float *value_cache, float *query
   multihead_attention_kernel<<<gridDim, blockDim>>>
     (key_cache, value_cache, query, mask, attn_sinks, attn, 
      l, head_dim, n_attn_heads, n_kv_heads, pos, seq_len, apply_mask);
+  HIP_CHECK(hipDeviceSynchronize());
 }
 
 __global__ void weighted_sum_kernel(float *tb, float *value_cache, float *attn, 
@@ -276,11 +287,13 @@ __global__ void weighted_sum_kernel(float *tb, float *value_cache, float *attn,
 void getp_weighted_sum(float *tb, float *value_cache, float *attn, 
                        int seq_len, int n_attn_heads, int n_kv_heads, int pos, int head_dim
 ) {
+  PROFILE_FUNCTION();
   dim3 blockDim(16, 16);
   dim3 gridDim((head_dim + blockDim.x - 1) / blockDim.x, 
                (n_attn_heads + blockDim.y - 1) / blockDim.y);
   weighted_sum_kernel<<<gridDim, blockDim>>>
     (tb, value_cache, attn, seq_len, n_attn_heads, n_kv_heads, pos, head_dim);
+  HIP_CHECK(hipDeviceSynchronize());
 }
 
 __global__ void max_reduction_kernel(float *in, float *max_in, int size) {
@@ -350,6 +363,7 @@ __global__ void softmax_normalize_kernel(float *x, float sum, int size) {
 }
 
 void getp_softmax(float *x, int size) {
+  PROFILE_FUNCTION();
   float max_val, sum;
   float *dev_max_val, *dev_sum;
   float *dev_data;
@@ -385,6 +399,7 @@ void getp_softmax(float *x, int size) {
     softmax_normalize_kernel<<<gridDim, blockDim>>>(x, sum, size);
   }
 
+  HIP_CHECK(hipDeviceSynchronize());
   HIP_CHECK(hipFree(dev_data));
 }
 
@@ -395,9 +410,11 @@ __global__ void vecadd_kernel(float *x, float *y, int size) {
 }
 
 void getp_vecadd(float *x, float *y, int size) {
+  PROFILE_FUNCTION();
   dim3 blockDim(1024); // arbitrary
   dim3 gridDim((size + blockDim.x - 1) / blockDim.x);
   vecadd_kernel<<<gridDim, blockDim>>>(x, y, size);
+  HIP_CHECK(hipDeviceSynchronize());
 }
 
 // MoE GPU kernels
@@ -484,32 +501,41 @@ __global__ void weighted_aggregate_kernel(float *e_agg, float *expert_out,
 
 void getp_topk(float *topk_values, int *topk_indices, float *router_score, 
                int n_experts, int experts_per_token) {
+  PROFILE_FUNCTION();
   dim3 blockDim(experts_per_token); 
   dim3 gridDim(1);
   topk_kernel<<<gridDim, blockDim>>>(router_score, topk_values, topk_indices, 
                                      n_experts, experts_per_token);
+  HIP_CHECK(hipDeviceSynchronize());
 }
 
 void getp_swiglu(float *gate_up, float *gate, float *up, 
                  int intermediate_dim, float swiglu_limit) {
+  PROFILE_FUNCTION();
   dim3 blockDim(256);
   dim3 gridDim((intermediate_dim + blockDim.x - 1) / blockDim.x);
   swiglu_kernel<<<gridDim, blockDim>>>(gate_up, gate, up, intermediate_dim, swiglu_limit);
+  HIP_CHECK(hipDeviceSynchronize());
 }
 
 void getp_split_gate_up(float *mlp1_out, float *gate, float *up, int intermediate_dim) {
+  PROFILE_FUNCTION();
   dim3 blockDim(256);
   dim3 gridDim((intermediate_dim + blockDim.x - 1) / blockDim.x);
   split_gate_up_kernel<<<gridDim, blockDim>>>(mlp1_out, gate, up, intermediate_dim);
+  HIP_CHECK(hipDeviceSynchronize());
 }
 
 void getp_weighted_aggregate(float *e_agg, float *expert_out, float expert_weight, int hidden_dim) {
+  PROFILE_FUNCTION();
   dim3 blockDim(256);
   dim3 gridDim((hidden_dim + blockDim.x - 1) / blockDim.x);
   weighted_aggregate_kernel<<<gridDim, blockDim>>>(e_agg, expert_out, expert_weight, hidden_dim);
+  HIP_CHECK(hipDeviceSynchronize());
 }
 
 float *getp_forward(Transformer *transformer, DeviceTransformer **dev_transformeres, int token, int pos) {
+  PROFILE_FUNCTION();
   Config *p = &transformer->config;
   TransformerWeights *w = &transformer->weights;
   RunState *s = &transformer->state;
@@ -727,5 +753,9 @@ float *getp_forward(Transformer *transformer, DeviceTransformer **dev_transforme
 
   // classifier into logits
   matmul(s->logits, x, w->out, hidden_dim, p->vocab_size);
+  
+  // Ensure all GPU work is complete before returning
+  HIP_CHECK(hipDeviceSynchronize());
+  
   return s->logits;
 }
