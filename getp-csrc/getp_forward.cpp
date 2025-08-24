@@ -77,8 +77,9 @@ void getp_rmsnorm(float *o, float *x, float *weight, int size) {
     dim3 gridDim((size + blockDim.x - 1) / blockDim.x);
     rmsnorm_kernel<<<gridDim, blockDim>>>(o, x, weight, ss, size);
   }
-  HIP_CHECK(hipDeviceSynchronize());
+  
   HIP_CHECK(hipFree(dev_ss));
+  HIP_CHECK(hipDeviceSynchronize());
 }
 
 template <typename T>
@@ -185,8 +186,9 @@ void getp_compute_cos_sin(int pos, // position index
       (cos_out, sin_out, inv_freq, concentration, pos, head_dim / 2);
   }
   
-  HIP_CHECK(hipDeviceSynchronize());
+  
   HIP_CHECK(hipFree(inv_freq));
+  HIP_CHECK(hipDeviceSynchronize());
 }
 
 __global__ void apply_rotary_emb_kernel(float *x, float *cos, float *sin, int n_heads, int head_dim) {
@@ -399,8 +401,8 @@ void getp_softmax(float *x, int size) {
     softmax_normalize_kernel<<<gridDim, blockDim>>>(x, sum, size);
   }
 
-  HIP_CHECK(hipDeviceSynchronize());
   HIP_CHECK(hipFree(dev_data));
+  HIP_CHECK(hipDeviceSynchronize());
 }
 
 __global__ void vecadd_kernel(float *x, float *y, int size) {

@@ -129,6 +129,7 @@ long long simple_getp_generate(Transformer *transformer, Tokenizer *tokenizer,
   output_tokens[pos - num_prompt_tokens + 1] = -1;
 
   free(prompt_tokens);
+  HIP_CHECK(hipDeviceSynchronize());
 
   return pos - num_prompt_tokens + 1;
 }
