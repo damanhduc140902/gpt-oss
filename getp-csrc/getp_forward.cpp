@@ -147,6 +147,90 @@ void getp_matmul(float *xout, float *x, T *w, T *b, int n, int d) {
   HIP_CHECK(hipDeviceSynchronize());
 }
 
+template <int TILE_N = 256, int WARPS_PER_BLOCK = 4>
+__global__ void gemv_qkv_rowmajor_cachex_kernel(
+    float *__restrict__ q_out,  // [q_len]
+    float *__restrict__ k_out,  // [k_len] -> points into key_cache layer,pos
+    float *__restrict__ v_out,  // [v_len] -> points into value_cache layer,pos
+    const float *__restrict__ x,  // [n]
+    const float *__restrict__ W,  // [d_total, n] row-major
+    const float *__restrict__ B,  // [d_total] (may be null)
+    int n, int q_len, int k_len, int v_len) {
+  extern __shared__ float sX[];  // size = TILE_N
+  const int lane = threadIdx.x;  // 0..warpSize-1
+  const int warp = threadIdx.y;  // 0..WARPS_PER_BLOCK-1
+  const int out_row = blockIdx.x * WARPS_PER_BLOCK + warp;
+  const int d_total = q_len + k_len + v_len;
+
+  float acc = 0.f;
+
+  for (int tile = 0; tile < n; tile += TILE_N) {
+    const int tile_len = min(TILE_N, n - tile);
+
+    // Cooperative load x tile into LDS
+    for (int t = warp * warpSize + lane; t < tile_len;
+         t += WARPS_PER_BLOCK * warpSize) {
+      sX[t] = x[tile + t];
+    }
+    __syncthreads();
+
+    if (out_row < d_total) {
+      const float *__restrict__ wrow = W + (size_t)out_row * n + tile;
+      float partial = 0.f;
+
+#pragma unroll 4
+      for (int k = lane; k < tile_len; k += warpSize) {
+        partial += wrow[k] * sX[k];
+      }
+
+// warp reduce
+#pragma unroll
+      for (int off = warpSize >> 1; off > 0; off >>= 1) {
+        partial += __shfl_down(partial, off);
+      }
+      acc += partial;
+    }
+    __syncthreads();
+  }
+
+  if (out_row < d_total && lane == 0) {
+    const float bias = (B ? B[out_row] : 0.f);
+    float *dst = nullptr;
+    int idx = 0;
+    if (out_row < q_len) {
+      dst = q_out;
+      idx = out_row;
+    } else if (out_row < q_len + k_len) {
+      dst = k_out;
+      idx = out_row - q_len;
+    } else {
+      dst = v_out;
+      idx = out_row - q_len - k_len;
+    }
+    dst[idx] = acc + bias;
+  }
+}
+
+void getp_matmul_qkv_fused(float *q, float *k, float *v, float *x,
+                           const float *w_qkv, const float *b_qkv, int n,
+                           int head_dim, int n_attn_heads, int n_kv_heads) {
+  PROFILE_FUNCTION();
+  const int q_len = head_dim * n_attn_heads;
+  const int k_len = head_dim * n_kv_heads;
+  const int v_len = head_dim * n_kv_heads;
+  const int d_total = q_len + k_len + v_len;
+
+  constexpr int WARPS = 4;
+  constexpr int TILE_N = 256;
+  dim3 block(64, WARPS);
+  dim3 grid((d_total + WARPS - 1) / WARPS);
+  size_t shmem = TILE_N * sizeof(float);
+
+  gemv_qkv_rowmajor_cachex_kernel<TILE_N, WARPS><<<grid, block, shmem>>>(
+      q, k, v, x, w_qkv, b_qkv, n, q_len, k_len, v_len);
+  HIP_CHECK(hipDeviceSynchronize());
+}
+
 __global__ void compute_inv_freq_kernel(
     float base, int head_dim, float scaling_factor,
     float initial_context_length, float ntk_beta, float ntk_alpha,
@@ -427,7 +511,6 @@ void getp_vecadd(float *x, float *y, int size) {
   HIP_CHECK(hipDeviceSynchronize());
 }
 
-// MoE GPU kernels
 __global__ void topk_kernel(float *router_score, float *topk_values,
                             int *topk_indices, int n_experts,
                             int experts_per_token) {
@@ -586,6 +669,11 @@ float *getp_forward(Transformer *transformer,
   float *dev_cos_vals, *dev_sin_vals;
   HIP_CHECK(hipMalloc(&dev_cos_vals, sizeof(float) * (head_dim / 2)));
   HIP_CHECK(hipMalloc(&dev_sin_vals, sizeof(float) * (head_dim / 2)));
+  float ntk_beta = 32.0f;
+  float ntk_alpha = 1.0f;
+  getp_compute_cos_sin(pos, p->rope_theta, head_dim, p->rope_scaling_factor,
+                       p->initial_context_length, ntk_beta, ntk_alpha,
+                       dev_cos_vals, dev_sin_vals);
 
   // forward all the layers
   for (unsigned long long l = 0; l < p->n_layers; l++) {
@@ -593,43 +681,21 @@ float *getp_forward(Transformer *transformer,
     // s->t (hidden_dim, )
     getp_rmsnorm(dev_s->t, dev_x, dev_w->rms_attn_w + 1ll * l * hidden_dim,
                  hidden_dim);
-    // key and value point to the kv cache
-    int loff =
-        l * p->seq_len * kv_dim;  // kv cache layer offset for convenience
+    int loff = l * p->seq_len * kv_dim;
     dev_s->k = dev_s->key_cache + loff + pos * kv_dim;
     dev_s->v = dev_s->value_cache + loff + pos * kv_dim;
 
-    // s->qkv = w->w_qkv * s->t = (head_dim * (n_attn_heads + 2 * n_kv_heads),
-    // hidden_dim) * (hidden_dim, ) = head_dim * (n_attn_heads + 2 * n_kv_heads)
+    // fused QKV projection: write directly into q / k_cache[pos] / v_cache[pos]
     float *dev_w_qkv = dev_w->w_qkv + 1ll * l * hidden_dim *
                                           (head_dim * p->n_attn_heads +
                                            2 * head_dim * p->n_kv_heads);
     float *dev_b_qkv =
         dev_w->b_qkv +
         1ll * l * (head_dim * p->n_attn_heads + 2 * head_dim * p->n_kv_heads);
-    getp_matmul<float>(dev_s->qkv, dev_s->t, dev_w_qkv, dev_b_qkv, hidden_dim,
-                       (p->n_attn_heads + 2 * p->n_kv_heads) * head_dim);
-    // Separate q, k, v
-    HIP_CHECK(hipMemcpy(dev_s->q, dev_s->qkv,
-                        head_dim * p->n_attn_heads * sizeof(float),
-                        hipMemcpyDeviceToDevice));
-    HIP_CHECK(hipMemcpy(dev_s->k, dev_s->qkv + head_dim * p->n_attn_heads,
-                        head_dim * p->n_kv_heads * sizeof(float),
-                        hipMemcpyDeviceToDevice));
-    HIP_CHECK(hipMemcpy(
-        dev_s->v,
-        dev_s->qkv + head_dim * p->n_attn_heads + head_dim * p->n_kv_heads,
-        head_dim * p->n_kv_heads * sizeof(float), hipMemcpyDeviceToDevice));
+    getp_matmul_qkv_fused(dev_s->q, dev_s->k, dev_s->v, dev_s->t, dev_w_qkv,
+                          dev_b_qkv, hidden_dim, head_dim, p->n_attn_heads,
+                          p->n_kv_heads);
 
-    // RoPE relative positional encoding: complex-valued rotate q and k in each
-    // head Adapted from
-    // https://github.com/openai/gpt-oss/blob/main/gpt_oss/torch/model.py#L85
-    // RoPE with YaRN scaling adapted from Python code
-    float ntk_beta = 32.0f;
-    float ntk_alpha = 1.0f;
-    getp_compute_cos_sin(pos, p->rope_theta, head_dim, p->rope_scaling_factor,
-                         p->initial_context_length, ntk_beta, ntk_alpha,
-                         dev_cos_vals, dev_sin_vals);
     getp_apply_rotary_emb(dev_s->q, dev_cos_vals, dev_sin_vals, p->n_attn_heads,
                           head_dim);
     getp_apply_rotary_emb(dev_s->k, dev_cos_vals, dev_sin_vals, p->n_kv_heads,
@@ -698,15 +764,6 @@ float *getp_forward(Transformer *transformer,
           &dev_transformeres[device_id]->weights;
       RunState *curr_dev_s = &dev_transformeres[device_id]->state;
 
-      // Copy normalized input to current device if not device 0
-      // if (device_id != 0) {
-      //   // Copy through host memory for cross-device transfer
-      //   HIP_CHECK(hipSetDevice(0));
-      //   HIP_CHECK(hipMemcpy(s->t, dev_s->t, sizeof(float) * hidden_dim,
-      //   hipMemcpyDeviceToHost)); HIP_CHECK(hipSetDevice(device_id));
-      //   HIP_CHECK(hipMemcpy(curr_dev_s->t, s->t, sizeof(float) * hidden_dim,
-      //   hipMemcpyHostToDevice));
-      // }
       // P2P copy normalized input to current device (no-op if device_id==0)
       if (device_id != 0) {
         HIP_CHECK(hipMemcpyPeer(curr_dev_s->t, device_id, dev_s->t, 0,
@@ -767,16 +824,6 @@ float *getp_forward(Transformer *transformer,
         }
       }
 
-      // Copy results back to device 0 for final aggregation if not device 0
-      // if (device_id != 0) {
-      //   // Copy device result to host, then add to device 0
-      //   float *temp_result = (float*)malloc(hidden_dim * sizeof(float));
-      //   HIP_CHECK(hipMemcpy(temp_result, curr_dev_s->e_agg, sizeof(float) *
-      //   hidden_dim, hipMemcpyDeviceToHost)); HIP_CHECK(hipSetDevice(0));
-      //   HIP_CHECK(hipMemcpy(dev_s->tb2, temp_result, sizeof(float) *
-      //   hidden_dim, hipMemcpyHostToDevice)); getp_vecadd(dev_s->e_agg,
-      //   dev_s->tb2, hidden_dim); free(temp_result);
-      // }
       // P2P gather to device 0 and accumulate
       if (device_id != 0) {
         HIP_CHECK(hipMemcpyPeer(dev_s->tb2, 0, curr_dev_s->e_agg, device_id,
