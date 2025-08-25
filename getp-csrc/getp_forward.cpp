@@ -298,110 +298,77 @@ void getp_weighted_sum(float *tb, float *value_cache, float *attn,
   HIP_CHECK(hipDeviceSynchronize());
 }
 
-__global__ void max_reduction_kernel(float *in, float *max_in, int size) {
-  extern __shared__ float L[];
+__global__ void softmax_kernel(float *A, int M, int N, int lda) {
+  extern __shared__ float smem[];
+  float *max_ptr = &smem[blockDim.x];
+  float *sum_ptr = &smem[blockDim.x + 1];
+
+  A += blockIdx.y * lda; // offset to the row assigned to the corresponding block
 
   int tid = threadIdx.x;
   int offset = 2 * blockDim.x * blockIdx.x;
   int stride = blockDim.x;
 
-  L[tid] = -INFINITY;
-  if (tid + offset < size) {
-    float t = in[tid + offset];
-    L[tid] = MAX(L[tid], t);
-  }
-  if (tid + offset + stride < size) {
-    float t = in[tid + offset + stride];
-    L[tid] = MAX(L[tid], t);
+  smem[tid] = -INFINITY;
+  for (int offset = 0; offset < N; offset += blockDim.x) {
+    if (tid + offset < N) {
+      float t = A[tid + offset];
+      if (t > smem[tid]) smem[tid] = t;
+    }
   }
   __syncthreads();
 
   for (stride = stride / 2; stride > 0; stride /= 2) {
-    if (tid < stride) L[tid] = MAX(L[tid], L[tid + stride]);
+    if (tid < stride) {
+      float t = smem[tid + stride];
+      if (t > smem[tid]) smem[tid] = t;
+    }
     __syncthreads();
   }
 
   if (tid == 0) {
-    atomicMax(max_in, L[0]);
-  }
-}
-
-__global__ void compute_exp_and_sum(float *x, float *sum, float max_val, int size) {
-  extern __shared__ float L[];
-
-  int tid = threadIdx.x;
-  int offset = 2 * blockDim.x * blockIdx.x;
-  int stride = blockDim.x;
-
-  L[tid] = 0;
-  if (tid + offset < size) {
-    float t = x[tid + offset];
-    t = expf(t - max_val);
-    L[tid] += t;
-    x[tid + offset] = t;
-  }
-  if (tid + offset + stride < size) {
-    float t = x[tid + offset + stride];
-    t = expf(t - max_val);
-    L[tid] += t;
-    x[tid + offset + stride] = t;
+    *max_ptr = smem[0];
   }
   __syncthreads();
 
-  for (stride = stride / 2; stride > 0; stride /= 2) {
-    if (tid < stride) L[tid] += L[tid + stride];
+  float max_val = *max_ptr;
+  smem[tid] = 0;
+  for (int offset = 0; offset < N; offset += blockDim.x) {
+    if (tid + offset < N) {
+      smem[tid] += expf(A[tid + offset] - max_val);
+    }
+  }
+  __syncthreads();
+
+  for (stride = blockDim.x / 2; stride > 0; stride /= 2) {
+    if (tid < stride) smem[tid] += smem[tid + stride];
     __syncthreads();
   }
 
   if (tid == 0) {
-    atomicAdd(sum, L[0]);
+    *sum_ptr = smem[0];
+  }
+  __syncthreads();
+
+  float sum = *sum_ptr;
+  for (int offset = 0; offset < N; offset += blockDim.x) {
+    if (tid + offset < N) {
+      float x = A[tid + offset];
+      x = expf(x - max_val) / sum;
+      A[tid + offset] = x;
+    }
   }
 }
 
-__global__ void softmax_normalize_kernel(float *x, float sum, int size) {
-  int i = blockDim.x * blockIdx.x + threadIdx.x;
-  if (i >= size) return;
-  x[i] /= sum;
-}
-
-void getp_softmax(float *x, int size) {
+// softmax matrix with shape MxN by row, and matrix A has leading dimension equal lda
+void getp_softmax(float *A, int M, int N, int lda) {
   PROFILE_FUNCTION();
-  float max_val, sum;
-  float *dev_max_val, *dev_sum;
-  float *dev_data;
-
-  HIP_CHECK(hipMalloc(&dev_data, sizeof(float) * 2));
-  dev_max_val = dev_data;
-  dev_sum = dev_data + 1;
-
-  max_val = -INFINITY;
-  HIP_CHECK(hipMemcpy(dev_max_val, &max_val, sizeof(float), hipMemcpyHostToDevice));
-  HIP_CHECK(hipMemset(dev_sum, 0, sizeof(float)));
-
-  // Get max
-  {
-    dim3 blockDim(1024); // arbitrary
-    dim3 gridDim((size + 2 * blockDim.x - 1) / (2 * blockDim.x));
-    max_reduction_kernel<<<gridDim, blockDim, sizeof(float) * blockDim.x>>>
-      (x, dev_max_val, size);
-  }
-  HIP_CHECK(hipMemcpy(&max_val, dev_max_val, sizeof(float), hipMemcpyDeviceToHost));
-  // Compute exp and sum
-  {
-    dim3 blockDim(1024); // arbitrary
-    dim3 gridDim((size + 2 * blockDim.x - 1) / (2 * blockDim.x));
-    compute_exp_and_sum<<<gridDim, blockDim, sizeof(float) * blockDim.x>>>
-      (x, dev_sum, max_val, size);
-  }
-  HIP_CHECK(hipMemcpy(&sum, dev_sum, sizeof(float), hipMemcpyDeviceToHost));
-  // Normalize
-  {
-    dim3 blockDim(1024); // arbitrary
-    dim3 gridDim((size + blockDim.x - 1) / blockDim.x);
-    softmax_normalize_kernel<<<gridDim, blockDim>>>(x, sum, size);
-  }
-
-  HIP_CHECK(hipFree(dev_data));
+  
+  dim3 blockDim(1024); // arbitray
+  dim3 gridDim(1, M);
+  softmax_kernel<<<gridDim, blockDim, sizeof(float) * (blockDim.x + 2)>>>
+    (A, M, N, lda);
+  
   HIP_CHECK(hipDeviceSynchronize());
 }
 
@@ -616,9 +583,7 @@ float *getp_forward(Transformer *transformer, DeviceTransformer **dev_transforme
     // multihead attention
     getp_multihead_attention(dev_s->key_cache + loff, dev_s->value_cache + loff, dev_s->q, dev_s->mask, dev_w->attn_sinks, dev_s->att, 
                              l, head_dim, p->n_attn_heads, p->n_kv_heads, pos, p->seq_len, p->sliding_window);
-    for (int h = 0; h < p->n_attn_heads; ++h) {
-      getp_softmax(dev_s->att + h * p->seq_len, pos + 2);
-    }
+    getp_softmax(dev_s->att, p->n_attn_heads, pos + 2, p->seq_len);
     getp_weighted_sum(dev_s->tb, dev_s->value_cache + loff, dev_s->att, 
                       p->seq_len, p->n_attn_heads, p->n_kv_heads, pos, head_dim);
 
@@ -645,7 +610,7 @@ float *getp_forward(Transformer *transformer, DeviceTransformer **dev_transforme
               n_experts, p->experts_per_token);
     
     // Normalize selected experts using softmax
-    getp_softmax(dev_s->topk_v, p->experts_per_token);
+    getp_softmax(dev_s->topk_v, 1, p->experts_per_token, p->experts_per_token);
     
     // Initialize aggregation buffer to zero on device 0
     HIP_CHECK(hipMemset(dev_s->e_agg, 0, hidden_dim * sizeof(float)));
