@@ -68,10 +68,43 @@ static void upload_weights(TransformerWeights *w, DeviceTransformerWeights *dev_
 
   HIP_CHECK(hipSetDevice(device_index));
 
-  if (device_index == 0) {
+  // if (device_index == 0) {
+  //   HIP_CHECK(hipMalloc(_dev_data, weights_size - experts_size));
+  //   HIP_CHECK(hipMemcpy(*_dev_data, w->token_embedding_table, weights_size - experts_size, hipMemcpyHostToDevice));
+  //   // getp_memcpy_fp32_to_bf16(*_dev_data, w->token_embedding_table, (weights_size - experts_size) / sizeof(float));
+  
+  //   float *ptr = *_dev_data;
+  //   dev_w->token_embedding_table = ptr;
+  //   ptr += 1ll * cfg->vocab_size * cfg->hidden_dim;
+  //   dev_w->out = ptr; // unembedding
+  //   ptr += 1ll * cfg->vocab_size * cfg->hidden_dim;
+  //   dev_w->rms_attn_w = ptr;
+  //   ptr += 1ll * n_layers * cfg->hidden_dim;
+  //   dev_w->rms_ffn_w = ptr;
+  //   ptr += 1ll * n_layers * cfg->hidden_dim;
+  //   dev_w->rms_out_w = ptr;
+  //   ptr += 1ll * cfg->hidden_dim;
+  //   // hey it's qkvqkv, not qqkkvv
+  //   dev_w->w_qkv = ptr;
+  //   ptr += 1ll * n_layers * cfg->hidden_dim *
+  //          (head_dim * cfg->n_attn_heads + 2 * head_dim * cfg->n_kv_heads);
+  //   dev_w->b_qkv = ptr;
+  //   ptr += 1ll * n_layers *
+  //          (head_dim * cfg->n_attn_heads + 2 * head_dim * cfg->n_kv_heads);
+  //   dev_w->w_o = ptr;
+  //   ptr += 1ll * n_layers * (head_dim * cfg->n_attn_heads) * cfg->hidden_dim;
+  //   dev_w->b_o = ptr;
+  //   ptr += 1ll * n_layers * cfg->hidden_dim;
+  //   dev_w->attn_sinks = ptr;
+  //   ptr += 1ll * n_layers * cfg->n_attn_heads;
+  //   dev_w->w_router = ptr;
+  //   ptr += 1ll * n_layers * cfg->hidden_dim * n_experts;
+  //   dev_w->b_router = ptr;
+  //   ptr += 1ll * n_layers * n_experts;
+  // }
+  { // replicate non-expert weights to every device (TP=1 base; shard later when TP>1)
     HIP_CHECK(hipMalloc(_dev_data, weights_size - experts_size));
     HIP_CHECK(hipMemcpy(*_dev_data, w->token_embedding_table, weights_size - experts_size, hipMemcpyHostToDevice));
-    // getp_memcpy_fp32_to_bf16(*_dev_data, w->token_embedding_table, (weights_size - experts_size) / sizeof(float));
   
     float *ptr = *_dev_data;
     dev_w->token_embedding_table = ptr;
@@ -84,7 +117,7 @@ static void upload_weights(TransformerWeights *w, DeviceTransformerWeights *dev_
     ptr += 1ll * n_layers * cfg->hidden_dim;
     dev_w->rms_out_w = ptr;
     ptr += 1ll * cfg->hidden_dim;
-    // hey it's qkvqkv, not qqkkvv
+    // qkvqkv layout
     dev_w->w_qkv = ptr;
     ptr += 1ll * n_layers * cfg->hidden_dim *
            (head_dim * cfg->n_attn_heads + 2 * head_dim * cfg->n_kv_heads);
@@ -102,6 +135,7 @@ static void upload_weights(TransformerWeights *w, DeviceTransformerWeights *dev_
     dev_w->b_router = ptr;
     ptr += 1ll * n_layers * n_experts;
   }
+  
 
   int n_devices;
   HIP_CHECK(hipGetDeviceCount(&n_devices));

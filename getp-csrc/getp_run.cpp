@@ -7,8 +7,13 @@
 #include <hip/driver_types.h>
 #include <hip/hip_runtime.h>
 
+#include "collectives.cpp"
+#include <vector>
+
 #ifndef GETP_RUN
 #define GETP_RUN
+
+CollectiveGroup g_world;
 
 DeviceTransformer **dev_transformers;
 
@@ -29,6 +34,11 @@ void warm_up(Transformer *transformer, Tokenizer *tokenizer) {
     dev_transformers[i]->device_index = i;
     upload_transformer(transformer, dev_transformers[i]);
   }
+
+  std::vector<int> devices(n_devices);
+  for (int i = 0; i < n_devices; ++i) devices[i] = i;
+  cgCreate(g_world, devices);
+
 }
 
 void finish(Transformer *transformer, Tokenizer *tokenizer) {
@@ -45,6 +55,7 @@ void finish(Transformer *transformer, Tokenizer *tokenizer) {
     free(dev_transformers[i]);
   }
   free(dev_transformers);
+  cgDestroy(g_world);
 }
 
 long long simple_getp_generate(Transformer *transformer, Tokenizer *tokenizer,
