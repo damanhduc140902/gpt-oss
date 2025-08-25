@@ -15,15 +15,6 @@ extern CollectiveGroup g_world;
 #define MAX(x, y) (((x) > (y)) ? (x) : (y))
 #define MIN(x, y) (((x) < (y)) ? (x) : (y))
 
-#define HIP_CHECK(expression)                                                  \
-  {                                                                            \
-    const hipError_t status = expression;                                      \
-    if (status != hipSuccess) {                                                \
-      std::cerr << "HIP error " << status << ": " << hipGetErrorString(status) \
-                << " at " << __FILE__ << ":" << __LINE__ << std::endl;         \
-    }                                                                          \
-  }
-
 __global__ void rmsnorm_kernel(float *o, float *x, float *weight, int size) {
   extern __shared__ float smem[];
   float *ss_ptr = &smem[blockDim.x];
@@ -82,26 +73,77 @@ __global__ void matmul_kernel(float *xout, float *x, T *w, T *b, int n, int d) {
   xout[i] = val;
 }
 
+template <typename T>
+__device__ inline float to_float_dev(T v) {
+  return static_cast<float>(v);
+}
 template <>
-__global__ void matmul_kernel<__hip_bfloat16>(float *xout, float *x,
-                                              __hip_bfloat16 *w,
-                                              __hip_bfloat16 *b, int n, int d) {
-  int i = blockDim.x * blockIdx.x + threadIdx.x;
-  if (i >= d) return;
-  float val = 0.f;
-  for (int j = 0; j < n; ++j) {
-    val += __bfloat162float(w[1ll * i * n + j]) * x[j];
+__device__ inline float to_float_dev<__hip_bfloat16>(__hip_bfloat16 v) {
+  return __bfloat162float(v);
+}
+
+__device__ inline float warp_sum(float v) {
+#pragma unroll
+  for (int off = warpSize >> 1; off > 0; off >>= 1) {
+    v += __shfl_down(v, off);
   }
-  if (b != NULL) val += __bfloat162float(b[i]);
-  xout[i] = val;
+  return v;
+}
+
+template <typename T, int TILE_N = 256, int WARPS_PER_BLOCK = 4>
+__global__ void gemv_rowmajor_cachex_kernel(float *__restrict__ y,
+                                            const float *__restrict__ x,
+                                            const T *__restrict__ W,
+                                            const T *__restrict__ B, int n,
+                                            int d) {
+  extern __shared__ float sX[];
+
+  const int lane = threadIdx.x;
+  const int warp = threadIdx.y;
+  const int out_row = blockIdx.x * WARPS_PER_BLOCK + warp;
+
+  float acc = 0.f;
+
+  for (int tile = 0; tile < n; tile += TILE_N) {
+    const int tile_len = min(TILE_N, n - tile);
+
+    // Cooperative load x[tile : tile+tile_len) into shared
+    for (int t = warp * warpSize + lane; t < tile_len;
+         t += WARPS_PER_BLOCK * warpSize) {
+      sX[t] = x[tile + t];
+    }
+    __syncthreads();
+
+    if (out_row < d) {
+      const T *__restrict__ wrow = W + (size_t)out_row * n + tile;
+      float partial = 0.f;
+
+// Each lane accumulates a strided subset of the tile
+#pragma unroll 4
+      for (int k = lane; k < tile_len; k += warpSize) {
+        partial += to_float_dev<T>(wrow[k]) * sX[k];
+      }
+      acc += warp_sum(partial);
+    }
+    __syncthreads();
+  }
+
+  if (out_row < d && lane == 0) {
+    const float bias = (B ? to_float_dev<T>(B[out_row]) : 0.f);
+    y[out_row] = acc + bias;
+  }
 }
 
 template <typename T>
 void getp_matmul(float *xout, float *x, T *w, T *b, int n, int d) {
   PROFILE_FUNCTION();
-  dim3 blockDim(64);
-  dim3 gridDim((d + blockDim.x - 1) / blockDim.x);
-  matmul_kernel<T><<<gridDim, blockDim>>>(xout, x, w, b, n, d);
+  constexpr int WARPS = 4;     // number of outputs per block
+  constexpr int TILE_N = 256;  // elements of x cached per tile
+  dim3 block(64, WARPS);
+  dim3 grid((d + WARPS - 1) / WARPS);
+  size_t shmem = TILE_N * sizeof(float);
+  gemv_rowmajor_cachex_kernel<T, TILE_N, WARPS>
+      <<<grid, block, shmem>>>(xout, x, w, b, n, d);
   HIP_CHECK(hipDeviceSynchronize());
 }
 
