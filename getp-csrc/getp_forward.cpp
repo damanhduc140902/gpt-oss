@@ -90,7 +90,8 @@ __global__ void matmul_kernel(float *xout, float *x, T *w, T *b, int n, int d) {
   for (int j = 0; j < n; ++j) {
     val += w[1ll * i * n + j] * x[j];
   }
-  xout[i] = val + b[i];
+  if (b != NULL) val += b[i];
+  xout[i] = val;
 }
 
 template <>
@@ -101,7 +102,8 @@ __global__ void matmul_kernel<__hip_bfloat16>(float *xout, float *x, __hip_bfloa
   for (int j = 0; j < n; ++j) {
     val += __bfloat162float(w[1ll * i * n + j]) * x[j];
   }
-  xout[i] = val + __bfloat162float(b[i]);
+  if (b != NULL) val +=  __bfloat162float(b[i]);
+  xout[i] = val;
 }
 
 template <typename T>
@@ -710,16 +712,14 @@ float *getp_forward(Transformer *transformer, DeviceTransformer **dev_transforme
   HIP_CHECK(hipFree(dev_cos_vals));
   HIP_CHECK(hipFree(dev_sin_vals));
 
-  // Copy output result to host
-  HIP_CHECK(hipMemcpy(x, dev_x, sizeof(float) * hidden_dim, hipMemcpyDeviceToHost));
-
-  // TODO: put 2 remaining below operations to GPU
-
   // final rmsnorm
-  rmsnorm(x, x, w->rms_out_w, hidden_dim);
+  getp_rmsnorm(dev_x, dev_x, dev_w->rms_out_w, hidden_dim);
 
   // classifier into logits
-  matmul(s->logits, x, w->out, hidden_dim, p->vocab_size);
+  getp_matmul(dev_s->logits, dev_x, dev_w->out, (float *)NULL, hidden_dim, p->vocab_size);
+  
+  // Copy output result to host
+  HIP_CHECK(hipMemcpy(s->logits, dev_s->logits, sizeof(float) * p->vocab_size, hipMemcpyDeviceToHost));
   
   // Ensure all GPU work is complete before returning
   HIP_CHECK(hipDeviceSynchronize());
