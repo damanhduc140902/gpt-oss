@@ -1,7 +1,6 @@
 #include "getp_transformer.hpp"
 #include "profiler.hpp"
 #include <cmath>
-#include <hip/driver_types.h>
 #include <hip/hip_runtime.h>
 #include <iostream>
 #include <cstdlib>
@@ -23,62 +22,49 @@
     }                                          \
 }
 
-__global__ void square_reduction_kernel(float *x, float *sum, int size) {
-  extern __shared__ float L[];
+__global__ void rmsnorm_kernel(float *o, float *x, float *weight, int size) {
+  extern __shared__ float smem[];
+  float *ss_ptr = &smem[blockDim.x];
+
   int tid = threadIdx.x;
-  int offset = 2 * blockDim.x * blockIdx.x;
-  int stride = blockDim.x;
-  L[tid] = 0;
-  if (tid + offset < size) {
-    float t = x[tid + offset];
-    L[tid] += t * t;
-  }
-  if (tid + offset + stride < size) {
-    float t = x[tid + offset + stride];
-    L[tid] += t * t;
+  smem[tid] = 0;
+  for (int offset = 0; offset < size; offset += blockDim.x) {
+    if (tid + offset < size) {
+      float t = x[tid + offset];
+      smem[tid] += t * t;
+    }
   }
   __syncthreads();
-  for (stride = stride / 2; stride > 0; stride /= 2) {
-    if (tid < stride) L[tid] += L[tid + stride];
+  for (int stride = blockDim.x / 2; stride > 0; stride /= 2) {
+    if (tid < stride) smem[tid] += smem[tid + stride];
     __syncthreads();
   }
-  if (tid == 0) {
-    atomicAdd(sum, L[0]);
-  }
-}
 
-__global__ void rmsnorm_kernel(float *o, float *x, float *weight, float ss, int size) {
-  int i = blockDim.x * blockIdx.x + threadIdx.x;
-  if (i >= size) return;
-  o[i] = weight[i] * (ss * x[i]);
+  if (tid == 0) {
+    *ss_ptr = smem[0];
+  }
+  __syncthreads();
+
+  float ss = *ss_ptr;
+  ss /= size;
+  ss += 1e-5f;
+  ss = 1.0f / sqrtf(ss);
+
+  for (int offset = 0; offset < size; offset += blockDim.x) {
+    if (tid + offset < size) {
+      o[tid + offset] = weight[tid + offset] * (ss * x[tid + offset]);
+    }
+  }
 }
 
 void getp_rmsnorm(float *o, float *x, float *weight, int size) {
   PROFILE_FUNCTION();
-  float ss;
-  float *dev_ss;
-  HIP_CHECK(hipMalloc(&dev_ss, sizeof(float)));
-  HIP_CHECK(hipMemset(dev_ss, 0, sizeof(float)));
-
-  // calculate sum of squares
-  {
-    dim3 blockDim(1024); // arbitrary
-    dim3 gridDim((size + 2 * blockDim.x - 1) / (2 * blockDim.x));
-    square_reduction_kernel<<<gridDim, blockDim, sizeof(float) * blockDim.x>>>
-      (x, dev_ss, size);
-  }
-  HIP_CHECK(hipMemcpy(&ss, dev_ss, sizeof(float), hipMemcpyDeviceToHost));
-  ss /= size;
-  ss += 1e-5f;
-  ss = 1.0f / sqrtf(ss);
-  // normalize and scale
-  {
-    dim3 blockDim(1024); // arbitrary
-    dim3 gridDim((size + blockDim.x - 1) / blockDim.x);
-    rmsnorm_kernel<<<gridDim, blockDim>>>(o, x, weight, ss, size);
-  }
   
-  HIP_CHECK(hipFree(dev_ss));
+  dim3 blockDim(1024);
+  dim3 gridDim(1);
+  rmsnorm_kernel<<<gridDim, blockDim, sizeof(float) * (blockDim.x + 1)>>>
+    (o, x, weight, size);
+
   HIP_CHECK(hipDeviceSynchronize());
 }
 
