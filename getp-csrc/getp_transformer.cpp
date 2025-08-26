@@ -209,6 +209,7 @@ void init_device_run_state(RunState *s, Config *p) {
   HIP_CHECK(
       hipMalloc(&s->att, p->n_attn_heads * (p->seq_len + 1) * sizeof(float)));
   HIP_CHECK(hipMalloc(&s->logits, p->vocab_size * sizeof(float)));
+  
   if (p->sliding_window > 0) {
     HIP_CHECK(hipMalloc(&s->mask, p->seq_len * p->seq_len * sizeof(float)));
     dim3 blockDim(32, 32);
