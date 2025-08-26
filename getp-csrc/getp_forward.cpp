@@ -783,19 +783,6 @@ void getp_topk(float *topk_values, int *topk_indices, float *router_score,
   HIP_CHECK(hipDeviceSynchronize());
 }
 
-__global__ void gather_embedding_kernel(float *dst, const float *emb, int row, int hidden_dim) {
-  int i = blockDim.x * blockIdx.x + threadIdx.x;
-  if (i < hidden_dim) dst[i] = emb[1ll * row * hidden_dim + i];
-}
-
-static inline void getp_gather_embedding(float *dst, const float *emb_dev,
-                                         int token, int hidden_dim) {
-  PROFILE_FUNCTION();
-  const int BLK = 256;
-  dim3 block(BLK), grid((hidden_dim + BLK - 1) / BLK);
-  gather_embedding_kernel<<<grid, block>>>(dst, emb_dev, token, hidden_dim);
-}
-
 float *getp_forward(Transformer *transformer,
                     DeviceTransformer **dev_transformeres, int token, int pos) {
   PROFILE_FUNCTION();
@@ -815,11 +802,10 @@ float *getp_forward(Transformer *transformer,
   int intermediate_dim = p->intermediate_dim;
   int n_experts = p->n_experts;
 
-  // float *content_row = w->token_embedding_table + token * hidden_dim;
-  // HIP_CHECK(hipSetDevice(0));
-  // HIP_CHECK(hipMemcpy(dev_x, content_row, hidden_dim * sizeof(*x),
-  //                     hipMemcpyHostToDevice));
-  getp_gather_embedding(dev_s->x, dev_w->token_embedding_table, token, hidden_dim);
+  float *content_row = w->token_embedding_table + token * hidden_dim;
+  HIP_CHECK(hipSetDevice(0));
+  HIP_CHECK(hipMemcpy(dev_x, content_row, hidden_dim * sizeof(*x),
+                      hipMemcpyHostToDevice));
 
   float *dev_cos_vals, *dev_sin_vals;
   HIP_CHECK(hipMalloc(&dev_cos_vals, sizeof(float) * (head_dim / 2)));
