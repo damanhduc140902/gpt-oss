@@ -196,7 +196,7 @@ void init_device_run_state(RunState *s, Config *p) {
   HIP_CHECK(hipMalloc(&s->mlp1_out, 2 * p->intermediate_dim * sizeof(float)));
   HIP_CHECK(hipMalloc(&s->gate, p->intermediate_dim * sizeof(float)));  // no used?
   HIP_CHECK(hipMalloc(&s->up, p->intermediate_dim * sizeof(float))); // no used?
-  HIP_CHECK(hipMalloc(&s->gate_up, p->intermediate_dim * sizeof(float)));
+  HIP_CHECK(hipMalloc(&s->gate_up, p->experts_per_token * p->intermediate_dim * sizeof(float)));
   HIP_CHECK(hipMalloc(&s->e_agg, BATCH_SIZE * p->hidden_dim * sizeof(float))); // (batch, hidden_dim)
   HIP_CHECK(hipMalloc(&s->qkv, p->head_dim * (p->n_attn_heads + 2 * p->n_kv_heads) * sizeof(float))); // no used
   HIP_CHECK(hipMalloc(&s->q, BATCH_SIZE * p->n_attn_heads * p->head_dim * sizeof(float))); // (batch, n_attn_heads, head_dim)
