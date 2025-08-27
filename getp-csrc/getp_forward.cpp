@@ -13,7 +13,7 @@
 #define GEMV_TILE_N 512
 #endif
 #ifndef GEMV_WARPS_PER_BLOCK
-#define GEMV_WARPS_PER_BLOCK 8
+#define GEMV_WARPS_PER_BLOCK 4
 #endif
 extern CollectiveGroup g_world;
 
@@ -290,24 +290,31 @@ void getp_matmul(float *xout, float *x, T *w, T *b, int n, int d) {
   HIP_CHECK(hipDeviceSynchronize());
 }
 
-template <int TILE_N, int WARPS_PER_BLOCK>
-__global__ void mlp1_swiglu_bf16_kernel(
-    float *__restrict__ gate_up,
-    const float *__restrict__ x,           // hidden_dim
-    const __hip_bfloat16 *__restrict__ W,  // (2*intermediate_dim, hidden_dim)
-    const __hip_bfloat16 *__restrict__ B,  // (2*intermediate_dim)
-    int hidden_dim, int intermediate_dim, float swiglu_limit) {
-  extern __shared__ float sX[];
+template <int TILE_N, int WARPS_PER_BLOCK, int MAX_E = 4>
+__global__ void mlp1_swiglu_bf16_kernel_batch(
+    float *__restrict__ gate_up_all,             // [n_active, intermediate_dim]
+    const float *__restrict__ x,                 // [hidden_dim]
+    const __hip_bfloat16 *__restrict__ W_layer,  // layer-base: [E_dev, 2D, H]
+    const __hip_bfloat16 *__restrict__ B_layer,  // layer-base: [E_dev, 2D]
+    int hidden_dim, int intermediate_dim, int experts_per_device,
+    int4 expert_local_ids, int n_active, float swiglu_limit) {
+  extern __shared__ float sX[];  // TILE_N floats
   const int lane = threadIdx.x;  // 0..63
   const int warp = threadIdx.y;  // 0..WARPS_PER_BLOCK-1
-  const int j = blockIdx.x * WARPS_PER_BLOCK +
-                warp;  // output idx in [0, intermediate_dim)
+  const int j = blockIdx.x * WARPS_PER_BLOCK + warp;
 
-  float g_tot = 0.f, u_tot = 0.f;
+  float g_tot[MAX_E], u_tot[MAX_E];
+#pragma unroll
+  for (int e = 0; e < MAX_E; ++e) {
+    g_tot[e] = 0.f;
+    u_tot[e] = 0.f;
+  }
 
+  // tile theo K=hidden_dim
   for (int tile = 0; tile < hidden_dim; tile += TILE_N) {
     const int tlen = min(TILE_N, hidden_dim - tile);
-    // x -> shared (vector 16B)
+
+    // nạp x -> shared (vector 16B)
     for (int t = warp * warpSize * 4 + lane * 4; t < tlen;
          t += WARPS_PER_BLOCK * warpSize * 4) {
       if (t + 3 < tlen)
@@ -319,186 +326,285 @@ __global__ void mlp1_swiglu_bf16_kernel(
     __syncthreads();
 
     if (j < intermediate_dim) {
-      const __hip_bfloat16 *wg = W + (size_t)(2 * j + 0) * hidden_dim + tile;
-      const __hip_bfloat16 *wu = W + (size_t)(2 * j + 1) * hidden_dim + tile;
-      const uint4 *wg8 = reinterpret_cast<const uint4 *>(wg);  // 8 bf16/load
-      const uint4 *wu8 = reinterpret_cast<const uint4 *>(wu);
       const float4 *x4 = reinterpret_cast<const float4 *>(sX);
+      const int it8 = tlen >> 3;  // 8 bf16 per 128-bit
 
-      float g = 0.f, u = 0.f;
-      const int it8 = tlen >> 3;
+#pragma unroll
+      for (int ee = 0; ee < MAX_E; ++ee) {
+        if (ee >= n_active) break;
+        const int local_id =
+            ((const int *)&expert_local_ids)[ee];  // 0..E_dev-1
+        if (local_id < 0) continue;
+
+        // offset tới expert ee trong layer hiện tại
+        const size_t row_stride = (size_t)hidden_dim;
+        const size_t expert_base = (size_t)local_id *
+                                   (size_t)(2 * intermediate_dim) *
+                                   (size_t)hidden_dim;
+        const __hip_bfloat16 *wg =
+            W_layer + expert_base + (size_t)(2 * j + 0) * row_stride + tile;
+        const __hip_bfloat16 *wu =
+            W_layer + expert_base + (size_t)(2 * j + 1) * row_stride + tile;
+
+        const uint4 *wg8 = reinterpret_cast<const uint4 *>(wg);
+        const uint4 *wu8 = reinterpret_cast<const uint4 *>(wu);
+
+        float g = 0.f, u = 0.f;
 #pragma unroll 4
-      for (int k8 = lane; k8 < it8; k8 += warpSize) {
-        uint4 ag = wg8[k8], au = wu8[k8];
-        // unpack 8 bf16 for g
-        unsigned short g01 = (unsigned short)(ag.x & 0xFFFF);
-        unsigned short g02 = (unsigned short)(ag.x >> 16);
-        unsigned short g11 = (unsigned short)(ag.y & 0xFFFF);
-        unsigned short g12 = (unsigned short)(ag.y >> 16);
-        unsigned short g21 = (unsigned short)(ag.z & 0xFFFF);
-        unsigned short g22 = (unsigned short)(ag.z >> 16);
-        unsigned short g31 = (unsigned short)(ag.w & 0xFFFF);
-        unsigned short g32 = (unsigned short)(ag.w >> 16);
-        // unpack 8 bf16 for u
-        unsigned short u01 = (unsigned short)(au.x & 0xFFFF);
-        unsigned short u02 = (unsigned short)(au.x >> 16);
-        unsigned short u11 = (unsigned short)(au.y & 0xFFFF);
-        unsigned short u12 = (unsigned short)(au.y >> 16);
-        unsigned short u21 = (unsigned short)(au.z & 0xFFFF);
-        unsigned short u22 = (unsigned short)(au.z >> 16);
-        unsigned short u31 = (unsigned short)(au.w & 0xFFFF);
-        unsigned short u32 = (unsigned short)(au.w >> 16);
+        for (int k8 = lane; k8 < it8; k8 += warpSize) {
+          uint4 ag = wg8[k8], au = wu8[k8];
+          // unpack 8 bf16/gói 128-bit
+          unsigned short g01 = (unsigned short)(ag.x & 0xFFFF);
+          unsigned short g02 = (unsigned short)(ag.x >> 16);
+          unsigned short g11 = (unsigned short)(ag.y & 0xFFFF);
+          unsigned short g12 = (unsigned short)(ag.y >> 16);
+          unsigned short g21 = (unsigned short)(ag.z & 0xFFFF);
+          unsigned short g22 = (unsigned short)(ag.z >> 16);
+          unsigned short g31 = (unsigned short)(ag.w & 0xFFFF);
+          unsigned short g32 = (unsigned short)(ag.w >> 16);
 
-        float4 xb0 = x4[(k8 << 1) + 0];
-        float4 xb1 = x4[(k8 << 1) + 1];
+          unsigned short u01 = (unsigned short)(au.x & 0xFFFF);
+          unsigned short u02 = (unsigned short)(au.x >> 16);
+          unsigned short u11 = (unsigned short)(au.y & 0xFFFF);
+          unsigned short u12 = (unsigned short)(au.y >> 16);
+          unsigned short u21 = (unsigned short)(au.z & 0xFFFF);
+          unsigned short u22 = (unsigned short)(au.z >> 16);
+          unsigned short u31 = (unsigned short)(au.w & 0xFFFF);
+          unsigned short u32 = (unsigned short)(au.w >> 16);
 
-        g += bf16bits_to_f32(g01) * xb0.x + bf16bits_to_f32(g02) * xb0.y +
-             bf16bits_to_f32(g11) * xb0.z + bf16bits_to_f32(g12) * xb0.w +
-             bf16bits_to_f32(g21) * xb1.x + bf16bits_to_f32(g22) * xb1.y +
-             bf16bits_to_f32(g31) * xb1.z + bf16bits_to_f32(g32) * xb1.w;
+          float4 xb0 = x4[(k8 << 1) + 0];
+          float4 xb1 = x4[(k8 << 1) + 1];
 
-        u += bf16bits_to_f32(u01) * xb0.x + bf16bits_to_f32(u02) * xb0.y +
-             bf16bits_to_f32(u11) * xb0.z + bf16bits_to_f32(u12) * xb0.w +
-             bf16bits_to_f32(u21) * xb1.x + bf16bits_to_f32(u22) * xb1.y +
-             bf16bits_to_f32(u31) * xb1.z + bf16bits_to_f32(u32) * xb1.w;
-      }
-      for (int k = (it8 << 3) + lane; k < tlen; k += warpSize) {
-        __bf16_bits_u bg, bu;
-        bg.b = wg[k];
-        bu.b = wu[k];
-        float xv = sX[k];
-        g += __bfloat162float(bg.b) * xv;
-        u += __bfloat162float(bu.b) * xv;
-      }
-      g_tot += g;
-      u_tot += u;
+          g += __bfloat162float(*reinterpret_cast<__hip_bfloat16 *>(&g01)) *
+                   xb0.x +
+               __bfloat162float(*reinterpret_cast<__hip_bfloat16 *>(&g02)) *
+                   xb0.y +
+               __bfloat162float(*reinterpret_cast<__hip_bfloat16 *>(&g11)) *
+                   xb0.z +
+               __bfloat162float(*reinterpret_cast<__hip_bfloat16 *>(&g12)) *
+                   xb0.w +
+               __bfloat162float(*reinterpret_cast<__hip_bfloat16 *>(&g21)) *
+                   xb1.x +
+               __bfloat162float(*reinterpret_cast<__hip_bfloat16 *>(&g22)) *
+                   xb1.y +
+               __bfloat162float(*reinterpret_cast<__hip_bfloat16 *>(&g31)) *
+                   xb1.z +
+               __bfloat162float(*reinterpret_cast<__hip_bfloat16 *>(&g32)) *
+                   xb1.w;
+
+          u += __bfloat162float(*reinterpret_cast<__hip_bfloat16 *>(&u01)) *
+                   xb0.x +
+               __bfloat162float(*reinterpret_cast<__hip_bfloat16 *>(&u02)) *
+                   xb0.y +
+               __bfloat162float(*reinterpret_cast<__hip_bfloat16 *>(&u11)) *
+                   xb0.z +
+               __bfloat162float(*reinterpret_cast<__hip_bfloat16 *>(&u12)) *
+                   xb0.w +
+               __bfloat162float(*reinterpret_cast<__hip_bfloat16 *>(&u21)) *
+                   xb1.x +
+               __bfloat162float(*reinterpret_cast<__hip_bfloat16 *>(&u22)) *
+                   xb1.y +
+               __bfloat162float(*reinterpret_cast<__hip_bfloat16 *>(&u31)) *
+                   xb1.z +
+               __bfloat162float(*reinterpret_cast<__hip_bfloat16 *>(&u32)) *
+                   xb1.w;
+        }
+        for (int k = (it8 << 3) + lane; k < tlen; k += warpSize) {
+          g += __bfloat162float(wg[k]) * sX[k];
+          u += __bfloat162float(wu[k]) * sX[k];
+        }
+        g_tot[ee] += g;
+        u_tot[ee] += u;
+      }  // end loop expert
     }
     __syncthreads();
   }
 
   if (j < intermediate_dim) {
-    float g = warp_sum_f32(g_tot);
-    float u = warp_sum_f32(u_tot);
-    if (threadIdx.x == 0) {
-      // add bias
-      float bg = B ? __bfloat162float(B[2 * j + 0]) : 0.f;
-      float bu = B ? __bfloat162float(B[2 * j + 1]) : 0.f;
-      g += bg;
-      u += bu;
+#pragma unroll
+    for (int ee = 0; ee < MAX_E; ++ee) {
+      if (ee >= n_active) break;
+      const int local_id = ((const int *)&expert_local_ids)[ee];
+      if (local_id < 0) continue;
 
-      if (g > swiglu_limit) g = swiglu_limit;
-      if (u > swiglu_limit) u = swiglu_limit;
-      if (u < -swiglu_limit) u = -swiglu_limit;
-      const float a = 1.702f;
-      float s = 1.f / (1.f + expf(-a * g));
-      float v = (g * s) * (u + 1.f);
-      gate_up[j] = v;
+      float g = g_tot[ee], u = u_tot[ee];
+      // reduce trong warp
+#pragma unroll
+      for (int off = warpSize >> 1; off > 0; off >>= 1) {
+        g += __shfl_down(g, off);
+        u += __shfl_down(u, off);
+      }
+      if (lane == 0) {
+        const size_t b_off = (size_t)local_id * (size_t)(2 * intermediate_dim);
+        float bg =
+            B_layer ? __bfloat162float(B_layer[b_off + (2 * j + 0)]) : 0.f;
+        float bu =
+            B_layer ? __bfloat162float(B_layer[b_off + (2 * j + 1)]) : 0.f;
+        g += bg;
+        u += bu;
+
+        if (g > swiglu_limit) g = swiglu_limit;
+        if (u > swiglu_limit) u = swiglu_limit;
+        if (u < -swiglu_limit) u = -swiglu_limit;
+
+        const float a = 1.702f;
+        float s = 1.f / (1.f + expf(-a * g));
+        gate_up_all[(size_t)ee * (size_t)intermediate_dim + j] =
+            (g * s) * (u + 1.f);
+      }
     }
   }
 }
 
-static inline void getp_mlp1_swiglu_bf16(float *gate_up, float *x,
-                                         const __hip_bfloat16 *w_mlp1,
-                                         const __hip_bfloat16 *b_mlp1,
-                                         int hidden_dim, int intermediate_dim,
-                                         float swiglu_limit) {
+static inline void getp_mlp1_swiglu_bf16_batch(
+    float *gate_up_all, float *x, const __hip_bfloat16 *w_mlp1_layer_base,
+    const __hip_bfloat16 *b_mlp1_layer_base, int hidden_dim,
+    int intermediate_dim, int experts_per_device, int4 expert_local_ids,
+    int n_active, float swiglu_limit) {
   PROFILE_FUNCTION();
   constexpr int WARPS = GEMV_WARPS_PER_BLOCK;
   constexpr int TILE = GEMV_TILE_N;
   dim3 block(64, WARPS);
   dim3 grid((intermediate_dim + WARPS - 1) / WARPS);
   size_t shmem = TILE * sizeof(float);
-  mlp1_swiglu_bf16_kernel<TILE, WARPS><<<grid, block, shmem>>>(
-      gate_up, x, w_mlp1, b_mlp1, hidden_dim, intermediate_dim, swiglu_limit);
+
+  mlp1_swiglu_bf16_kernel_batch<TILE, WARPS><<<grid, block, shmem>>>(
+      gate_up_all, x, w_mlp1_layer_base, b_mlp1_layer_base, hidden_dim,
+      intermediate_dim, experts_per_device, expert_local_ids, n_active,
+      swiglu_limit);
   HIP_CHECK(hipDeviceSynchronize());
 }
 
-template <int TILE_N, int WARPS_PER_BLOCK>
-__global__ void mlp2_accum_bf16_kernel(
-    float *__restrict__ e_agg,             // in-place +=
-    const float *__restrict__ gate_up,     // intermediate_dim
-    const __hip_bfloat16 *__restrict__ W,  // (hidden_dim, intermediate_dim)
-    const __hip_bfloat16 *__restrict__ B,  // (hidden_dim)
-    float expert_weight, int intermediate_dim, int hidden_dim) {
-  extern __shared__ float sX[];
-  const int lane = threadIdx.x;
-  const int warp = threadIdx.y;
-  const int out_row = blockIdx.x * WARPS_PER_BLOCK + warp;  // 0..hidden_dim-1
+template <int TILE_N, int WARPS_PER_BLOCK, int MAX_E = 4>
+__global__ void mlp2_accum_bf16_kernel_batch(
+    float *__restrict__ e_agg,                   // += combined
+    const float *__restrict__ gate_up_all,       // [n_active, intermediate_dim]
+    const __hip_bfloat16 *__restrict__ W_layer,  // base of layer: [E_dev, H, I]
+    const __hip_bfloat16 *__restrict__ B_layer,  // base of layer: [E_dev, H]
+    float4 expert_weights4,                      // packed weights (<=4)
+    int intermediate_dim, int hidden_dim, int /*experts_per_device*/,
+    int4 expert_local_ids, int n_active) {
+  extern __shared__ float sX[];  // size = MAX_E * TILE_N
+  const int lane = threadIdx.x;  // 0..63
+  const int warp = threadIdx.y;  // 0..WARPS_PER_BLOCK-1
+  const int out_row = blockIdx.x * WARPS_PER_BLOCK + warp;
 
-  float acc_tot = 0.f;
+  // unpack weights to registers
+  float wts[MAX_E] = {expert_weights4.x, expert_weights4.y, expert_weights4.z,
+                      expert_weights4.w};
+  float acc[MAX_E];
+#pragma unroll
+  for (int e = 0; e < MAX_E; ++e) acc[e] = 0.f;
 
   for (int tile = 0; tile < intermediate_dim; tile += TILE_N) {
     const int tlen = min(TILE_N, intermediate_dim - tile);
-    for (int t = warp * warpSize * 4 + lane * 4; t < tlen;
-         t += WARPS_PER_BLOCK * warpSize * 4) {
-      if (t + 3 < tlen)
-        reinterpret_cast<float4 &>(sX[t]) =
-            *reinterpret_cast<const float4 *>(&gate_up[tile + t]);
-      else
-        for (int k = 0; k < 4 && t + k < tlen; ++k)
-          sX[t + k] = gate_up[tile + t + k];
+
+#pragma unroll
+    for (int ee = 0; ee < MAX_E; ++ee) {
+      if (ee >= n_active) break;
+      const float *src =
+          gate_up_all + (size_t)ee * (size_t)intermediate_dim + tile;
+      float *dst = sX + ee * TILE_N;
+      for (int t = warp * warpSize * 4 + lane * 4; t < tlen;
+           t += WARPS_PER_BLOCK * warpSize * 4) {
+        if (t + 3 < tlen) {
+          reinterpret_cast<float4 &>(dst[t]) =
+              *reinterpret_cast<const float4 *>(&src[t]);
+        } else {
+          for (int k = 0; k < 4 && t + k < tlen; ++k) dst[t + k] = src[t + k];
+        }
+      }
     }
     __syncthreads();
 
     if (out_row < hidden_dim) {
-      const __hip_bfloat16 *wrow =
-          W + (size_t)out_row * intermediate_dim + tile;
-      const uint4 *w8 = reinterpret_cast<const uint4 *>(wrow);
-      const float4 *x4 = reinterpret_cast<const float4 *>(sX);
-
-      float part = 0.f;
       const int it8 = tlen >> 3;
+#pragma unroll 1
+      for (int ee = 0; ee < n_active; ++ee) {
+        const int local_id = ((const int *)&expert_local_ids)[ee];
+        if (local_id < 0) continue;
+
+        const size_t expert_base =
+            (size_t)local_id * (size_t)hidden_dim * (size_t)intermediate_dim;
+        const __hip_bfloat16 *wrow =
+            W_layer + expert_base + (size_t)out_row * (size_t)intermediate_dim +
+            tile;
+
+        const uint4 *w8 = reinterpret_cast<const uint4 *>(wrow);
+        const float4 *x4 = reinterpret_cast<const float4 *>(sX + ee * TILE_N);
+
+        float part = 0.f;
 #pragma unroll 4
-      for (int k8 = lane; k8 < it8; k8 += warpSize) {
-        uint4 wb = w8[k8];
-        unsigned short w01 = (unsigned short)(wb.x & 0xFFFF);
-        unsigned short w02 = (unsigned short)(wb.x >> 16);
-        unsigned short w11 = (unsigned short)(wb.y & 0xFFFF);
-        unsigned short w12 = (unsigned short)(wb.y >> 16);
-        unsigned short w21 = (unsigned short)(wb.z & 0xFFFF);
-        unsigned short w22 = (unsigned short)(wb.z >> 16);
-        unsigned short w31 = (unsigned short)(wb.w & 0xFFFF);
-        unsigned short w32 = (unsigned short)(wb.w >> 16);
-        float4 xb0 = x4[(k8 << 1) + 0], xb1 = x4[(k8 << 1) + 1];
-        part += bf16bits_to_f32(w01) * xb0.x + bf16bits_to_f32(w02) * xb0.y +
-                bf16bits_to_f32(w11) * xb0.z + bf16bits_to_f32(w12) * xb0.w +
-                bf16bits_to_f32(w21) * xb1.x + bf16bits_to_f32(w22) * xb1.y +
-                bf16bits_to_f32(w31) * xb1.z + bf16bits_to_f32(w32) * xb1.w;
-      }
-      for (int k = (it8 << 3) + lane; k < tlen; k += warpSize) {
-        __bf16_bits_u u;
-        u.b = wrow[k];
-        part += __bfloat162float(u.b) * sX[k];
-      }
-      acc_tot += part;
+        for (int k8 = lane; k8 < it8; k8 += warpSize) {
+          uint4 wb = w8[k8];
+          unsigned short w01 = (unsigned short)(wb.x & 0xFFFF);
+          unsigned short w02 = (unsigned short)(wb.x >> 16);
+          unsigned short w11 = (unsigned short)(wb.y & 0xFFFF);
+          unsigned short w12 = (unsigned short)(wb.y >> 16);
+          unsigned short w21 = (unsigned short)(wb.z & 0xFFFF);
+          unsigned short w22 = (unsigned short)(wb.z >> 16);
+          unsigned short w31 = (unsigned short)(wb.w & 0xFFFF);
+          unsigned short w32 = (unsigned short)(wb.w >> 16);
+
+          float4 xb0 = x4[(k8 << 1) + 0];
+          float4 xb1 = x4[(k8 << 1) + 1];
+
+          part += bf16bits_to_f32(w01) * xb0.x + bf16bits_to_f32(w02) * xb0.y +
+                  bf16bits_to_f32(w11) * xb0.z + bf16bits_to_f32(w12) * xb0.w +
+                  bf16bits_to_f32(w21) * xb1.x + bf16bits_to_f32(w22) * xb1.y +
+                  bf16bits_to_f32(w31) * xb1.z + bf16bits_to_f32(w32) * xb1.w;
+        }
+        for (int k = (it8 << 3) + lane; k < tlen; k += warpSize) {
+          __bf16_bits_u u;
+          u.b = wrow[k];
+          part += __bfloat162float(u.b) * (sX[ee * TILE_N + k]);
+        }
+        acc[ee] += part;
+      }  // end loop experts
     }
     __syncthreads();
-  }
+  }  // end tile loop
 
   if (out_row < hidden_dim) {
-    float acc = warp_sum_f32(acc_tot);
+#pragma unroll
+    for (int ee = 0; ee < MAX_E; ++ee)
+      if (ee < n_active) acc[ee] = warp_sum_f32(acc[ee]);
+
     if (threadIdx.x == 0) {
-      float bias = B ? __bfloat162float(B[out_row]) : 0.f;
-      e_agg[out_row] += expert_weight * (acc + bias);
+      float sum = 0.f;
+#pragma unroll
+      for (int ee = 0; ee < MAX_E; ++ee) {
+        if (ee >= n_active) break;
+        const int local_id = ((const int *)&expert_local_ids)[ee];
+        if (local_id < 0) continue;
+        float bias = 0.f;
+        if (B_layer) {
+          bias = __bfloat162float(
+              B_layer[(size_t)local_id * (size_t)hidden_dim + out_row]);
+        }
+        sum += wts[ee] * (acc[ee] + bias);
+      }
+      e_agg[out_row] += sum;  // write once per row
     }
   }
 }
 
-static inline void getp_mlp2_accum_bf16(float *e_agg, const float *gate_up,
-                                        const __hip_bfloat16 *w_mlp2,
-                                        const __hip_bfloat16 *b_mlp2,
-                                        float expert_weight,
-                                        int intermediate_dim, int hidden_dim) {
+static inline void getp_mlp2_accum_bf16_batch(
+    float *e_agg, const float *gate_up_all, const __hip_bfloat16 *w2_layer_base,
+    const __hip_bfloat16 *b2_layer_base, int experts_per_device,
+    int4 expert_local_ids, int n_active, float4 expert_weights4,
+    int intermediate_dim, int hidden_dim) {
   PROFILE_FUNCTION();
   constexpr int WARPS = GEMV_WARPS_PER_BLOCK;
   constexpr int TILE = GEMV_TILE_N;
   dim3 block(64, WARPS);
   dim3 grid((hidden_dim + WARPS - 1) / WARPS);
-  size_t shmem = TILE * sizeof(float);
-  mlp2_accum_bf16_kernel<TILE, WARPS>
-      <<<grid, block, shmem>>>(e_agg, gate_up, w_mlp2, b_mlp2, expert_weight,
-                               intermediate_dim, hidden_dim);
-  HIP_CHECK(hipDeviceSynchronize());
+  size_t shmem = (size_t)TILE * 4 * sizeof(float);  // 4 expert * TILE_N
+  mlp2_accum_bf16_kernel_batch<TILE, WARPS>
+      <<<grid, block, shmem>>>(e_agg, gate_up_all, w2_layer_base, b2_layer_base,
+                               expert_weights4, intermediate_dim, hidden_dim,
+                               experts_per_device, expert_local_ids, n_active);
+  HIP_CHECK(hipDeviceSynchronize());  // giữ khi đang profile
 }
 
 __global__ void compute_inv_freq_kernel(float base, int head_dim,
@@ -530,6 +636,7 @@ __global__ void compute_inv_freq_kernel(float base, int head_dim,
   }
   inv_freq_out[i] = inv_freq;
 }
+
 __global__ void compute_cos_sin_kernel(float *cos_out, float *sin_out,
                                        float *inv_freq, float concentration,
                                        int pos, int d_half) {
@@ -892,34 +999,48 @@ float *getp_forward(Transformer *transformer,
         HIP_CHECK(hipMemcpyPeer(curr_dev_s->t, device_id, dev_s->t, 0,
                                 sizeof(float) * hidden_dim));
       HIP_CHECK(hipMemset(curr_dev_s->e_agg, 0, hidden_dim * sizeof(float)));
-      for (int idx = 0; idx < p->experts_per_token; idx++) {
-        int expert_id = s->topk_i[idx];
-        float expert_weight = s->topk_v[idx];
-        if (expert_id >= expert_start && expert_id < expert_end) {
-          int local_expert_id = expert_id - expert_start;
-          __hip_bfloat16 *dev_w_mlp1 =
-              curr_dev_w->w_mlp1 +
-              1ll * (l * experts_per_device + local_expert_id) *
-                  (2 * p->intermediate_dim) * hidden_dim;
-          __hip_bfloat16 *dev_b_mlp1 =
-              curr_dev_w->b_mlp1 +
-              1ll * (l * experts_per_device + local_expert_id) *
-                  (2 * p->intermediate_dim);
-          getp_mlp1_swiglu_bf16(curr_dev_s->gate_up, curr_dev_s->t, dev_w_mlp1,
-                                dev_b_mlp1, hidden_dim, p->intermediate_dim,
-                                p->swiglu_limit);
-
-          __hip_bfloat16 *dev_w_mlp2 =
-              curr_dev_w->w_mlp2 +
-              1ll * (l * experts_per_device + local_expert_id) * hidden_dim *
-                  p->intermediate_dim;
-          __hip_bfloat16 *dev_b_mlp2 =
-              curr_dev_w->b_mlp2 +
-              1ll * (l * experts_per_device + local_expert_id) * hidden_dim;
-          getp_mlp2_accum_bf16(curr_dev_s->e_agg, curr_dev_s->gate_up,
-                               dev_w_mlp2, dev_b_mlp2, expert_weight,
-                               p->intermediate_dim, hidden_dim);
+      int local_ids[4] = {-1, -1, -1, -1};
+      float local_wts[4] = {0, 0, 0, 0};
+      int n_local = 0;
+      for (int idx = 0; idx < p->experts_per_token; ++idx) {
+        int e_global = s->topk_i[idx];
+        if (e_global >= expert_start && e_global < expert_end) {
+          local_ids[n_local] = e_global - expert_start;  // local index
+          local_wts[n_local] = s->topk_v[idx];
+          ++n_local;
         }
+      }
+      if (n_local > 0) {
+        // base pointer của layer hiện tại
+        __hip_bfloat16 *w1_base =
+            curr_dev_w->w_mlp1 +
+            1ll * l * experts_per_device * 2 * p->intermediate_dim * hidden_dim;
+        __hip_bfloat16 *b1_base =
+            curr_dev_w->b_mlp1 +
+            1ll * l * experts_per_device * 2 * p->intermediate_dim;
+
+        int4 ids = {local_ids[0], local_ids[1], local_ids[2], local_ids[3]};
+        // gate_up_all buffer: [n_local, intermediate_dim]
+        getp_mlp1_swiglu_bf16_batch(curr_dev_s->gate_up, curr_dev_s->t, w1_base,
+                                    b1_base, hidden_dim, p->intermediate_dim,
+                                    experts_per_device, ids, n_local,
+                                    p->swiglu_limit);
+
+        __hip_bfloat16 *w2_layer_base =
+            curr_dev_w->w_mlp2 +
+            1ll * l * experts_per_device * hidden_dim * p->intermediate_dim;
+        __hip_bfloat16 *b2_layer_base =
+            curr_dev_w->b_mlp2 + 1ll * l * experts_per_device * hidden_dim;
+        float4 wpack = {0.f, 0.f, 0.f, 0.f};
+        if (n_local > 0) wpack.x = local_wts[0];
+        if (n_local > 1) wpack.y = local_wts[1];
+        if (n_local > 2) wpack.z = local_wts[2];
+        if (n_local > 3) wpack.w = local_wts[3];
+
+        getp_mlp2_accum_bf16_batch(curr_dev_s->e_agg, curr_dev_s->gate_up,
+                                   w2_layer_base, b2_layer_base,
+                                   experts_per_device, ids, n_local, wpack,
+                                   p->intermediate_dim, hidden_dim);
       }
       if (device_id != 0) {
         HIP_CHECK(hipMemcpyPeer(dev_s->tb2, 0, curr_dev_s->e_agg, device_id,
