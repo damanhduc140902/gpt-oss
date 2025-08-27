@@ -54,7 +54,7 @@ void getp_rmsnorm(float *o, float *x, float *weight, int size) {
   dim3 gridDim(1);
   rmsnorm_kernel<<<gridDim, blockDim, sizeof(float) * (blockDim.x + 1)>>>(
       o, x, weight, size);
-  HIP_CHECK(hipDeviceSynchronize());
+  // HIP_CHECK(hipDeviceSynchronize());
 }
 
 // Warp reduce sum (HIP wavefront = 64)
@@ -188,7 +188,7 @@ static inline void getp_matmul_qkv_fused_bf16(
   size_t shmem = TILE * sizeof(float);
   gemv_qkv_bf16_vec<TILE, WARPS><<<grid, block, shmem>>>(
       q, k, v, x, w_qkv_bf16, b_qkv_bf16, n, q_len, k_len, v_len);
-  HIP_CHECK(hipDeviceSynchronize());
+  // HIP_CHECK(hipDeviceSynchronize());
 }
 
 template <int TILE_N, int WARPS_PER_BLOCK>
@@ -287,7 +287,7 @@ void getp_matmul(float *xout, float *x, T *w, T *b, int n, int d) {
   gemv_bf16_vec_v2<TILE_N, WARPS><<<grid, block, shmem>>>(
       xout, x, (const __hip_bfloat16 *)w, (const __hip_bfloat16 *)b, n, d);
 
-  HIP_CHECK(hipDeviceSynchronize());
+  // HIP_CHECK(hipDeviceSynchronize());
 }
 
 template <int TILE_N, int WARPS_PER_BLOCK, int MAX_E = 4>
@@ -375,39 +375,23 @@ __global__ void mlp1_swiglu_bf16_kernel_batch(
           float4 xb0 = x4[(k8 << 1) + 0];
           float4 xb1 = x4[(k8 << 1) + 1];
 
-          g += __bfloat162float(*reinterpret_cast<__hip_bfloat16 *>(&g01)) *
-                   xb0.x +
-               __bfloat162float(*reinterpret_cast<__hip_bfloat16 *>(&g02)) *
-                   xb0.y +
-               __bfloat162float(*reinterpret_cast<__hip_bfloat16 *>(&g11)) *
-                   xb0.z +
-               __bfloat162float(*reinterpret_cast<__hip_bfloat16 *>(&g12)) *
-                   xb0.w +
-               __bfloat162float(*reinterpret_cast<__hip_bfloat16 *>(&g21)) *
-                   xb1.x +
-               __bfloat162float(*reinterpret_cast<__hip_bfloat16 *>(&g22)) *
-                   xb1.y +
-               __bfloat162float(*reinterpret_cast<__hip_bfloat16 *>(&g31)) *
-                   xb1.z +
-               __bfloat162float(*reinterpret_cast<__hip_bfloat16 *>(&g32)) *
-                   xb1.w;
+          g = fmaf(bf16bits_to_f32(g01), xb0.x, g);
+          g = fmaf(bf16bits_to_f32(g02), xb0.y, g);
+          g = fmaf(bf16bits_to_f32(g11), xb0.z, g);
+          g = fmaf(bf16bits_to_f32(g12), xb0.w, g);
+          g = fmaf(bf16bits_to_f32(g21), xb1.x, g);
+          g = fmaf(bf16bits_to_f32(g22), xb1.y, g);
+          g = fmaf(bf16bits_to_f32(g31), xb1.z, g);
+          g = fmaf(bf16bits_to_f32(g32), xb1.w, g);
 
-          u += __bfloat162float(*reinterpret_cast<__hip_bfloat16 *>(&u01)) *
-                   xb0.x +
-               __bfloat162float(*reinterpret_cast<__hip_bfloat16 *>(&u02)) *
-                   xb0.y +
-               __bfloat162float(*reinterpret_cast<__hip_bfloat16 *>(&u11)) *
-                   xb0.z +
-               __bfloat162float(*reinterpret_cast<__hip_bfloat16 *>(&u12)) *
-                   xb0.w +
-               __bfloat162float(*reinterpret_cast<__hip_bfloat16 *>(&u21)) *
-                   xb1.x +
-               __bfloat162float(*reinterpret_cast<__hip_bfloat16 *>(&u22)) *
-                   xb1.y +
-               __bfloat162float(*reinterpret_cast<__hip_bfloat16 *>(&u31)) *
-                   xb1.z +
-               __bfloat162float(*reinterpret_cast<__hip_bfloat16 *>(&u32)) *
-                   xb1.w;
+          u = fmaf(bf16bits_to_f32(u01), xb0.x, u);
+          u = fmaf(bf16bits_to_f32(u02), xb0.y, u);
+          u = fmaf(bf16bits_to_f32(u11), xb0.z, u);
+          u = fmaf(bf16bits_to_f32(u12), xb0.w, u);
+          u = fmaf(bf16bits_to_f32(u21), xb1.x, u);
+          u = fmaf(bf16bits_to_f32(u22), xb1.y, u);
+          u = fmaf(bf16bits_to_f32(u31), xb1.z, u);
+          u = fmaf(bf16bits_to_f32(u32), xb1.w, u);
         }
         for (int k = (it8 << 3) + lane; k < tlen; k += warpSize) {
           g += __bfloat162float(wg[k]) * sX[k];
@@ -472,7 +456,7 @@ static inline void getp_mlp1_swiglu_bf16_batch(
       gate_up_all, x, w_mlp1_layer_base, b_mlp1_layer_base, hidden_dim,
       intermediate_dim, experts_per_device, expert_local_ids, n_active,
       swiglu_limit);
-  HIP_CHECK(hipDeviceSynchronize());
+  // HIP_CHECK(hipDeviceSynchronize());
 }
 
 template <int TILE_N, int WARPS_PER_BLOCK, int MAX_E = 4>
@@ -549,10 +533,14 @@ __global__ void mlp2_accum_bf16_kernel_batch(
           float4 xb0 = x4[(k8 << 1) + 0];
           float4 xb1 = x4[(k8 << 1) + 1];
 
-          part += bf16bits_to_f32(w01) * xb0.x + bf16bits_to_f32(w02) * xb0.y +
-                  bf16bits_to_f32(w11) * xb0.z + bf16bits_to_f32(w12) * xb0.w +
-                  bf16bits_to_f32(w21) * xb1.x + bf16bits_to_f32(w22) * xb1.y +
-                  bf16bits_to_f32(w31) * xb1.z + bf16bits_to_f32(w32) * xb1.w;
+          part = fmaf(bf16bits_to_f32(w01), xb0.x, part);
+          part = fmaf(bf16bits_to_f32(w02), xb0.y, part);
+          part = fmaf(bf16bits_to_f32(w11), xb0.z, part);
+          part = fmaf(bf16bits_to_f32(w12), xb0.w, part);
+          part = fmaf(bf16bits_to_f32(w21), xb1.x, part);
+          part = fmaf(bf16bits_to_f32(w22), xb1.y, part);
+          part = fmaf(bf16bits_to_f32(w31), xb1.z, part);
+          part = fmaf(bf16bits_to_f32(w32), xb1.w, part);
         }
         for (int k = (it8 << 3) + lane; k < tlen; k += warpSize) {
           __bf16_bits_u u;
@@ -604,7 +592,7 @@ static inline void getp_mlp2_accum_bf16_batch(
       <<<grid, block, shmem>>>(e_agg, gate_up_all, w2_layer_base, b2_layer_base,
                                expert_weights4, intermediate_dim, hidden_dim,
                                experts_per_device, expert_local_ids, n_active);
-  HIP_CHECK(hipDeviceSynchronize());  // giữ khi đang profile
+  // HIP_CHECK(hipDeviceSynchronize());
 }
 
 __global__ void compute_inv_freq_kernel(float base, int head_dim,
@@ -670,7 +658,7 @@ void getp_compute_cos_sin(int pos, float base, int head_dim,
         cos_out, sin_out, inv_freq, concentration, pos, head_dim / 2);
   }
   HIP_CHECK(hipFree(inv_freq));
-  HIP_CHECK(hipDeviceSynchronize());
+  // HIP_CHECK(hipDeviceSynchronize());
 }
 
 __global__ void apply_rotary_emb_kernel(float *x, float *cos, float *sin,
@@ -696,7 +684,7 @@ void getp_apply_rotary_emb(float *x, float *cos, float *sin, int n_heads,
                (n_heads + blockDim.y - 1) / blockDim.y);
   apply_rotary_emb_kernel<<<gridDim, blockDim>>>(x, cos, sin, n_heads,
                                                  head_dim);
-  HIP_CHECK(hipDeviceSynchronize());
+  // HIP_CHECK(hipDeviceSynchronize());
 }
 
 __global__ void multihead_attention_kernel(
@@ -733,7 +721,7 @@ void getp_multihead_attention(float *key_cache, float *value_cache,
   multihead_attention_kernel<<<gridDim, blockDim>>>(
       key_cache, value_cache, query, mask, attn_sinks, attn, l, head_dim,
       n_attn_heads, n_kv_heads, pos, att_lda, mask_lda, apply_mask);
-  HIP_CHECK(hipDeviceSynchronize());
+  // HIP_CHECK(hipDeviceSynchronize());
 }
 
 template <int TILE_T = 128>
@@ -769,6 +757,7 @@ __global__ void weighted_sum_tiled_kernel(float *__restrict__ tb,
   }
   if (i < head_dim) tb[h * head_dim + i] = acc;
 }
+
 void getp_weighted_sum(float *tb, float *value_cache, float *att, int seq_len,
                        int n_attn_heads, int n_kv_heads, int pos,
                        int head_dim) {
@@ -779,7 +768,7 @@ void getp_weighted_sum(float *tb, float *value_cache, float *att, int seq_len,
   const size_t shmem = (size_t)min(128, pos + 1) * sizeof(float);
   weighted_sum_tiled_kernel<128><<<grid, block, shmem>>>(
       tb, value_cache, att, seq_len, n_attn_heads, n_kv_heads, pos, head_dim);
-  HIP_CHECK(hipDeviceSynchronize());
+  // HIP_CHECK(hipDeviceSynchronize());
 }
 
 __global__ void softmax_kernel(float *A, int M, int N, int lda) {
@@ -832,7 +821,7 @@ void getp_softmax(float *A, int M, int N, int lda) {
   dim3 gridDim(1, M);
   softmax_kernel<<<gridDim, blockDim, sizeof(float) * (blockDim.x + 2)>>>(
       A, M, N, lda);
-  HIP_CHECK(hipDeviceSynchronize());
+  // HIP_CHECK(hipDeviceSynchronize());
 }
 
 __global__ void vecadd_kernel(float *x, float *y, int size) {
@@ -845,7 +834,7 @@ void getp_vecadd(float *x, float *y, int size) {
   dim3 blockDim(1024);
   dim3 gridDim((size + blockDim.x - 1) / blockDim.x);
   vecadd_kernel<<<gridDim, blockDim>>>(x, y, size);
-  HIP_CHECK(hipDeviceSynchronize());
+  // HIP_CHECK(hipDeviceSynchronize());
 }
 
 __global__ void topk_kernel(float *router_score, float *topk_values,
@@ -887,7 +876,7 @@ void getp_topk(float *topk_values, int *topk_indices, float *router_score,
   dim3 gridDim(1);
   topk_kernel<<<gridDim, blockDim>>>(router_score, topk_values, topk_indices,
                                      n_experts, experts_per_token);
-  HIP_CHECK(hipDeviceSynchronize());
+  // HIP_CHECK(hipDeviceSynchronize());
 }
 
 float *getp_forward(Transformer *transformer,
@@ -1062,6 +1051,6 @@ float *getp_forward(Transformer *transformer,
 
   HIP_CHECK(hipMemcpy(s->logits, dev_s->logits, sizeof(float) * p->vocab_size,
                       hipMemcpyDeviceToHost));
-  HIP_CHECK(hipDeviceSynchronize());
+  // HIP_CHECK(hipDeviceSynchronize());
   return s->logits;
 }
