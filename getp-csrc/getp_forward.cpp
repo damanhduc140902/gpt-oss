@@ -54,7 +54,7 @@ void getp_rmsnorm(float *o, float *x, float *weight, int size) {
   dim3 gridDim(1);
   rmsnorm_kernel<<<gridDim, blockDim, sizeof(float) * (blockDim.x + 1)>>>(
       o, x, weight, size);
-  // HIP_CHECK(hipDeviceSynchronize());
+  HIP_CHECK(hipDeviceSynchronize());
 }
 
 // Warp reduce sum (HIP wavefront = 64)
@@ -130,10 +130,18 @@ __global__ void gemv_qkv_bf16_vec(float *__restrict__ q_out,
         float4 xb0 = x4[(k8 << 1) + 0];
         float4 xb1 = x4[(k8 << 1) + 1];
 
-        partial += bf16bits_to_f32(w01) * xb0.x + bf16bits_to_f32(w02) * xb0.y +
-                   bf16bits_to_f32(w11) * xb0.z + bf16bits_to_f32(w12) * xb0.w +
-                   bf16bits_to_f32(w21) * xb1.x + bf16bits_to_f32(w22) * xb1.y +
-                   bf16bits_to_f32(w31) * xb1.z + bf16bits_to_f32(w32) * xb1.w;
+        // partial += bf16bits_to_f32(w01) * xb0.x + bf16bits_to_f32(w02) * xb0.y +
+        //            bf16bits_to_f32(w11) * xb0.z + bf16bits_to_f32(w12) * xb0.w +
+        //            bf16bits_to_f32(w21) * xb1.x + bf16bits_to_f32(w22) * xb1.y +
+        //            bf16bits_to_f32(w31) * xb1.z + bf16bits_to_f32(w32) * xb1.w;
+        partial = fmaf(bf16bits_to_f32(w01), xb0.x, partial);
+        partial = fmaf(bf16bits_to_f32(w02), xb0.y, partial);
+        partial = fmaf(bf16bits_to_f32(w11), xb0.z, partial);
+        partial = fmaf(bf16bits_to_f32(w12), xb0.w, partial);
+        partial = fmaf(bf16bits_to_f32(w21), xb1.x, partial);
+        partial = fmaf(bf16bits_to_f32(w22), xb1.y, partial);
+        partial = fmaf(bf16bits_to_f32(w31), xb1.z, partial);
+        partial = fmaf(bf16bits_to_f32(w32), xb1.w, partial);
       }
       for (int k = (it8 << 3) + lane; k < tile_len; k += warpSize) {
         __bf16_bits_u u;
@@ -188,7 +196,7 @@ static inline void getp_matmul_qkv_fused_bf16(
   size_t shmem = TILE * sizeof(float);
   gemv_qkv_bf16_vec<TILE, WARPS><<<grid, block, shmem>>>(
       q, k, v, x, w_qkv_bf16, b_qkv_bf16, n, q_len, k_len, v_len);
-  // HIP_CHECK(hipDeviceSynchronize());
+  HIP_CHECK(hipDeviceSynchronize());
 }
 
 template <int TILE_N, int WARPS_PER_BLOCK>
@@ -287,7 +295,7 @@ void getp_matmul(float *xout, float *x, T *w, T *b, int n, int d) {
   gemv_bf16_vec_v2<TILE_N, WARPS><<<grid, block, shmem>>>(
       xout, x, (const __hip_bfloat16 *)w, (const __hip_bfloat16 *)b, n, d);
 
-  // HIP_CHECK(hipDeviceSynchronize());
+  HIP_CHECK(hipDeviceSynchronize());
 }
 
 template <int TILE_N, int WARPS_PER_BLOCK, int MAX_E = 4>
@@ -456,7 +464,7 @@ static inline void getp_mlp1_swiglu_bf16_batch(
       gate_up_all, x, w_mlp1_layer_base, b_mlp1_layer_base, hidden_dim,
       intermediate_dim, experts_per_device, expert_local_ids, n_active,
       swiglu_limit);
-  // HIP_CHECK(hipDeviceSynchronize());
+  HIP_CHECK(hipDeviceSynchronize());
 }
 
 template <int TILE_N, int WARPS_PER_BLOCK, int MAX_E = 4>
@@ -592,7 +600,7 @@ static inline void getp_mlp2_accum_bf16_batch(
       <<<grid, block, shmem>>>(e_agg, gate_up_all, w2_layer_base, b2_layer_base,
                                expert_weights4, intermediate_dim, hidden_dim,
                                experts_per_device, expert_local_ids, n_active);
-  // HIP_CHECK(hipDeviceSynchronize());
+  HIP_CHECK(hipDeviceSynchronize());
 }
 
 __global__ void compute_inv_freq_kernel(float base, int head_dim,
@@ -658,7 +666,7 @@ void getp_compute_cos_sin(int pos, float base, int head_dim,
         cos_out, sin_out, inv_freq, concentration, pos, head_dim / 2);
   }
   HIP_CHECK(hipFree(inv_freq));
-  // HIP_CHECK(hipDeviceSynchronize());
+  HIP_CHECK(hipDeviceSynchronize());
 }
 
 __global__ void apply_rotary_emb_kernel(float *x, float *cos, float *sin,
@@ -684,7 +692,7 @@ void getp_apply_rotary_emb(float *x, float *cos, float *sin, int n_heads,
                (n_heads + blockDim.y - 1) / blockDim.y);
   apply_rotary_emb_kernel<<<gridDim, blockDim>>>(x, cos, sin, n_heads,
                                                  head_dim);
-  // HIP_CHECK(hipDeviceSynchronize());
+  HIP_CHECK(hipDeviceSynchronize());
 }
 
 __global__ void multihead_attention_kernel(
@@ -721,7 +729,7 @@ void getp_multihead_attention(float *key_cache, float *value_cache,
   multihead_attention_kernel<<<gridDim, blockDim>>>(
       key_cache, value_cache, query, mask, attn_sinks, attn, l, head_dim,
       n_attn_heads, n_kv_heads, pos, att_lda, mask_lda, apply_mask);
-  // HIP_CHECK(hipDeviceSynchronize());
+  HIP_CHECK(hipDeviceSynchronize());
 }
 
 template <int TILE_T = 128>
@@ -768,7 +776,7 @@ void getp_weighted_sum(float *tb, float *value_cache, float *att, int seq_len,
   const size_t shmem = (size_t)min(128, pos + 1) * sizeof(float);
   weighted_sum_tiled_kernel<128><<<grid, block, shmem>>>(
       tb, value_cache, att, seq_len, n_attn_heads, n_kv_heads, pos, head_dim);
-  // HIP_CHECK(hipDeviceSynchronize());
+  HIP_CHECK(hipDeviceSynchronize());
 }
 
 __global__ void softmax_kernel(float *A, int M, int N, int lda) {
@@ -821,7 +829,7 @@ void getp_softmax(float *A, int M, int N, int lda) {
   dim3 gridDim(1, M);
   softmax_kernel<<<gridDim, blockDim, sizeof(float) * (blockDim.x + 2)>>>(
       A, M, N, lda);
-  // HIP_CHECK(hipDeviceSynchronize());
+  HIP_CHECK(hipDeviceSynchronize());
 }
 
 __global__ void vecadd_kernel(float *x, float *y, int size) {
@@ -834,7 +842,7 @@ void getp_vecadd(float *x, float *y, int size) {
   dim3 blockDim(1024);
   dim3 gridDim((size + blockDim.x - 1) / blockDim.x);
   vecadd_kernel<<<gridDim, blockDim>>>(x, y, size);
-  // HIP_CHECK(hipDeviceSynchronize());
+  HIP_CHECK(hipDeviceSynchronize());
 }
 
 __global__ void topk_kernel(float *router_score, float *topk_values,
@@ -876,7 +884,7 @@ void getp_topk(float *topk_values, int *topk_indices, float *router_score,
   dim3 gridDim(1);
   topk_kernel<<<gridDim, blockDim>>>(router_score, topk_values, topk_indices,
                                      n_experts, experts_per_token);
-  // HIP_CHECK(hipDeviceSynchronize());
+  HIP_CHECK(hipDeviceSynchronize());
 }
 
 float *getp_forward(Transformer *transformer,
@@ -1051,6 +1059,6 @@ float *getp_forward(Transformer *transformer,
 
   HIP_CHECK(hipMemcpy(s->logits, dev_s->logits, sizeof(float) * p->vocab_size,
                       hipMemcpyDeviceToHost));
-  // HIP_CHECK(hipDeviceSynchronize());
+  HIP_CHECK(hipDeviceSynchronize());
   return s->logits;
 }
