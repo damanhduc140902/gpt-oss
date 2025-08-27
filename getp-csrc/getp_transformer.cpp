@@ -191,12 +191,12 @@ void init_device_run_state(RunState *s, Config *p) {
   HIP_CHECK(hipMalloc(&s->tb, BATCH_SIZE * p->head_dim * p->n_attn_heads * sizeof(float))); // (batch, n_attn_heads, head_dim)
   HIP_CHECK(hipMalloc(&s->tb2, BATCH_SIZE * p->hidden_dim * sizeof(float)));  // (batch, hidden_dim)
   HIP_CHECK(hipMalloc(&s->router_score, BATCH_SIZE * p->n_experts * sizeof(float))); // (batch, n_experts)
-  HIP_CHECK(hipMalloc(&s->topk_v, p->experts_per_token * sizeof(float)));
-  HIP_CHECK(hipMalloc(&s->topk_i, p->experts_per_token * sizeof(int)));
-  HIP_CHECK(hipMalloc(&s->mlp1_out, 2 * p->intermediate_dim * sizeof(float)));
+  HIP_CHECK(hipMalloc(&s->topk_v, BATCH_SIZE * p->experts_per_token * sizeof(float))); // (batch, experts_per_token)
+  HIP_CHECK(hipMalloc(&s->topk_i, BATCH_SIZE * p->experts_per_token * sizeof(int))); // (batch, experts_per_token)
+  HIP_CHECK(hipMalloc(&s->mlp1_out, 2 * p->intermediate_dim * sizeof(float))); // no used?
   HIP_CHECK(hipMalloc(&s->gate, p->intermediate_dim * sizeof(float)));  // no used?
   HIP_CHECK(hipMalloc(&s->up, p->intermediate_dim * sizeof(float))); // no used?
-  HIP_CHECK(hipMalloc(&s->gate_up, p->experts_per_token * p->intermediate_dim * sizeof(float)));
+  HIP_CHECK(hipMalloc(&s->gate_up, BATCH_SIZE * p->experts_per_token * p->intermediate_dim * sizeof(float)));
   HIP_CHECK(hipMalloc(&s->e_agg, BATCH_SIZE * p->hidden_dim * sizeof(float))); // (batch, hidden_dim)
   HIP_CHECK(hipMalloc(&s->qkv, p->head_dim * (p->n_attn_heads + 2 * p->n_kv_heads) * sizeof(float))); // no used
   HIP_CHECK(hipMalloc(&s->q, BATCH_SIZE * p->n_attn_heads * p->head_dim * sizeof(float))); // (batch, n_attn_heads, head_dim)
