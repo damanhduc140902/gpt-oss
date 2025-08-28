@@ -909,18 +909,16 @@ void getp_topk(float *topk_values, int *topk_indices, float *router_score,
   // HIP_CHECK(hipDeviceSynchronize());
 }
 
-float *getp_forward(Transformer *transformer,
-                    DeviceTransformer **dev_transformeres, int token[], int pos) {
+float *getp_forward(Transformer */*transformer*/,
+                    DeviceTransformer **dev_transformeres, GPUWorker *worker, int token[], int pos) {
   PROFILE_FUNCTION();
 
-  Config *p = &transformer->config;
-  TransformerWeights *w = &transformer->weights;
-  RunState *s = &transformer->state;
-  DeviceTransformerWeights *dev_w = &dev_transformeres[0]->weights;
-  RunState *dev_s = &dev_transformeres[0]->state;
-  int n_devices;
-  HIP_CHECK(hipGetDeviceCount(&n_devices));
-  float *x = s->x;
+  int device_index = worker->device_index;
+
+  Config *p = &dev_transformers[device_index]->config;
+  DeviceTransformerWeights *dev_w = &dev_transformeres[device_index]->weights;
+  RunState *dev_s = &dev_transformeres[device_index]->state;
+
   float *dev_x = dev_s->x;
   int head_dim = p->head_dim;
   int hidden_dim = p->hidden_dim;
@@ -929,10 +927,13 @@ float *getp_forward(Transformer *transformer,
   int intermediate_dim = p->intermediate_dim;
   int n_experts = p->n_experts;
 
-  HIP_CHECK(hipSetDevice(0));
+  HIP_CHECK(hipSetDevice(device_index));
+
   for (int b = 0; b < BATCH_SIZE; ++b) {
-    float *content_row = w->token_embedding_table + token[b] * hidden_dim;
-    HIP_CHECK(hipMemcpy(dev_x + b * hidden_dim, content_row, hidden_dim * sizeof(*x), hipMemcpyHostToDevice));
+    assert(token[b] < p->vocab_size);
+    float *content_row = dev_w->token_embedding_table + (size_t)token[b] * hidden_dim;
+    HIP_CHECK(hipMemcpy(dev_x + b * hidden_dim, content_row, 
+      hidden_dim * sizeof(float), hipMemcpyDeviceToDevice));
   }
 
   float *dev_cos_vals, *dev_sin_vals;
@@ -943,8 +944,10 @@ float *getp_forward(Transformer *transformer,
                        p->initial_context_length, ntk_beta, ntk_alpha,
                        dev_cos_vals, dev_sin_vals);
 
+  float *topk_v = reinterpret_cast<float *>(malloc(sizeof(float) * p->experts_per_token));
+  int *topk_i = reinterpret_cast<int *>(malloc(sizeof(int) * p->experts_per_token));
+
   for (unsigned long long l = 0; l < p->n_layers; l++) {
-    HIP_CHECK(hipSetDevice(0));
     getp_rmsnorm(dev_s->t, dev_x, dev_w->rms_attn_w + 1ll * l * hidden_dim, BATCH_SIZE, hidden_dim);
     int loff = l * p->seq_len * BATCH_SIZE * kv_dim;
     dev_s->k = dev_s->key_cache + loff + pos * BATCH_SIZE * kv_dim;
@@ -996,96 +999,87 @@ float *getp_forward(Transformer *transformer,
     HIP_CHECK(hipMemset(dev_s->e_agg, 0, hidden_dim * sizeof(float)));
     
     for (int b = 0; b < BATCH_SIZE; ++b) {
-      HIP_CHECK(hipSetDevice(0));
-
       getp_topk(dev_s->topk_v, dev_s->topk_i, dev_s->router_score + b * n_experts, n_experts,
                 p->experts_per_token);
       getp_softmax(dev_s->topk_v, 1, p->experts_per_token, p->experts_per_token, 1);
   
-      HIP_CHECK(hipMemcpy(s->topk_v, dev_s->topk_v,
+      HIP_CHECK(hipMemcpy(topk_v, dev_s->topk_v,
                           p->experts_per_token * sizeof(float),
                           hipMemcpyDeviceToHost));
-      HIP_CHECK(hipMemcpy(s->topk_i, dev_s->topk_i,
+      HIP_CHECK(hipMemcpy(topk_i, dev_s->topk_i,
                           p->experts_per_token * sizeof(int),
                           hipMemcpyDeviceToHost));
-      for (int device_id = 0; device_id < n_devices; device_id++) {
-        HIP_CHECK(hipSetDevice(device_id));
-        int experts_per_device = n_experts / n_devices;
-        int expert_start = device_id * experts_per_device;
-        int expert_end = expert_start + experts_per_device;
-        DeviceTransformerWeights *curr_dev_w =
-            &dev_transformeres[device_id]->weights;
-        RunState *curr_dev_s = &dev_transformeres[device_id]->state;
-        if (device_id != 0)
-          HIP_CHECK(hipMemcpyPeer(curr_dev_s->t + b * hidden_dim, device_id, dev_s->t + b * hidden_dim, 0,
-                                  sizeof(float) * hidden_dim));
-        HIP_CHECK(hipMemset(curr_dev_s->e_agg + b * hidden_dim, 0, hidden_dim * sizeof(float)));
-        int local_ids[4] = {-1, -1, -1, -1};
-        float local_wts[4] = {0, 0, 0, 0};
-        int n_local = 0;
-        for (int idx = 0; idx < p->experts_per_token; ++idx) {
-          int e_global = s->topk_i[idx];
-          if (e_global >= expert_start && e_global < expert_end) {
-            local_ids[n_local] = e_global - expert_start;  // local index
-            local_wts[n_local] = s->topk_v[idx];
-            ++n_local;
-          }
+      
+      int expert_start = worker->expert_start;
+      int expert_end = worker->expert_end;
+      int experts_per_device = worker->expert_end - worker->expert_start;
+
+      DeviceTransformerWeights *curr_dev_w =
+          &dev_transformeres[device_index]->weights;
+      RunState *curr_dev_s = &dev_transformeres[device_index]->state;
+      
+      HIP_CHECK(hipMemset(curr_dev_s->e_agg + b * hidden_dim, 0, hidden_dim * sizeof(float)));
+
+      int local_ids[4] = {-1, -1, -1, -1};
+      float local_wts[4] = {0, 0, 0, 0};
+      int n_local = 0;
+      for (int idx = 0; idx < p->experts_per_token; ++idx) {
+        int e_global = topk_i[idx];
+        if (e_global >= expert_start && e_global < expert_end) {
+          local_ids[n_local] = e_global - expert_start;  // local index
+          local_wts[n_local] = topk_v[idx];
+          ++n_local;
         }
-        if (n_local > 0) {
-          // base pointer của layer hiện tại
-          __hip_bfloat16 *w1_base =
-              curr_dev_w->w_mlp1 +
-              1ll * l * experts_per_device * 2 * p->intermediate_dim * hidden_dim;
-          __hip_bfloat16 *b1_base =
-              curr_dev_w->b_mlp1 +
-              1ll * l * experts_per_device * 2 * p->intermediate_dim;
-  
-          int4 ids = {local_ids[0], local_ids[1], local_ids[2], local_ids[3]};
-          // gate_up_all buffer: [n_local, intermediate_dim]
-          getp_mlp1_swiglu_bf16_batch(curr_dev_s->gate_up, curr_dev_s->t + b * hidden_dim, w1_base,
-                                      b1_base, hidden_dim, p->intermediate_dim,
-                                      experts_per_device, ids, n_local,
-                                      p->swiglu_limit);
-  
-          __hip_bfloat16 *w2_layer_base =
-              curr_dev_w->w_mlp2 +
-              1ll * l * experts_per_device * hidden_dim * p->intermediate_dim;
-          __hip_bfloat16 *b2_layer_base =
-              curr_dev_w->b_mlp2 + 1ll * l * experts_per_device * hidden_dim;
-          float4 wpack = {0.f, 0.f, 0.f, 0.f};
-          if (n_local > 0) wpack.x = local_wts[0];
-          if (n_local > 1) wpack.y = local_wts[1];
-          if (n_local > 2) wpack.z = local_wts[2];
-          if (n_local > 3) wpack.w = local_wts[3];
-  
-          getp_mlp2_accum_bf16_batch(curr_dev_s->e_agg + b * hidden_dim, curr_dev_s->gate_up,
-                                     w2_layer_base, b2_layer_base,
-                                     experts_per_device, ids, n_local, wpack,
-                                     p->intermediate_dim, hidden_dim);
-        }
-        if (device_id != 0) {
-          HIP_CHECK(hipMemcpyPeer(dev_s->tb2 + b * hidden_dim, 0, curr_dev_s->e_agg + b * hidden_dim, device_id,
-                                  sizeof(float) * hidden_dim));
-          HIP_CHECK(hipSetDevice(0));
-          getp_vecadd(dev_s->e_agg + b * hidden_dim, dev_s->tb2 + b * hidden_dim, hidden_dim, 1);
-        }
-        // HIP_CHECK(hipSetDevice(0));
-        // getp_vecadd(dev_x + b * hidden_dim, dev_s->e_agg + b * hidden_dim, hidden_dim, 1);
+      }
+      if (n_local > 0) {
+        // base pointer của layer hiện tại
+        __hip_bfloat16 *w1_base =
+            curr_dev_w->w_mlp1 +
+            1ll * l * experts_per_device * 2 * p->intermediate_dim * hidden_dim;
+        __hip_bfloat16 *b1_base =
+            curr_dev_w->b_mlp1 +
+            1ll * l * experts_per_device * 2 * p->intermediate_dim;
+
+        int4 ids = {local_ids[0], local_ids[1], local_ids[2], local_ids[3]};
+        // gate_up_all buffer: [n_local, intermediate_dim]
+        getp_mlp1_swiglu_bf16_batch(curr_dev_s->gate_up, curr_dev_s->t + b * hidden_dim, w1_base,
+                                    b1_base, hidden_dim, p->intermediate_dim,
+                                    experts_per_device, ids, n_local,
+                                    p->swiglu_limit);
+
+        __hip_bfloat16 *w2_layer_base =
+            curr_dev_w->w_mlp2 +
+            1ll * l * experts_per_device * hidden_dim * p->intermediate_dim;
+        __hip_bfloat16 *b2_layer_base =
+            curr_dev_w->b_mlp2 + 1ll * l * experts_per_device * hidden_dim;
+        float4 wpack = {0.f, 0.f, 0.f, 0.f};
+        if (n_local > 0) wpack.x = local_wts[0];
+        if (n_local > 1) wpack.y = local_wts[1];
+        if (n_local > 2) wpack.z = local_wts[2];
+        if (n_local > 3) wpack.w = local_wts[3];
+
+        getp_mlp2_accum_bf16_batch(curr_dev_s->e_agg + b * hidden_dim, curr_dev_s->gate_up,
+                                    w2_layer_base, b2_layer_base,
+                                    experts_per_device, ids, n_local, wpack,
+                                    p->intermediate_dim, hidden_dim);
       }
     }
-    HIP_CHECK(hipSetDevice(0));
     getp_vecadd(dev_x, dev_s->e_agg, hidden_dim, BATCH_SIZE);
   }
 
-
   HIP_CHECK(hipFree(dev_cos_vals));
   HIP_CHECK(hipFree(dev_sin_vals));
+
+  free(topk_v);
+  free(topk_i);
+
   getp_rmsnorm(dev_x, dev_x, dev_w->rms_out_w, BATCH_SIZE, hidden_dim);
   getp_matmul<__hip_bfloat16>(dev_s->logits, dev_x, dev_w->out_bf16,
                               (__hip_bfloat16 *)NULL, hidden_dim,
                               p->vocab_size, BATCH_SIZE);
-  HIP_CHECK(hipMemcpy(logits_output, dev_s->logits, sizeof(float) * BATCH_SIZE * p->vocab_size,
+  float *logits_result = reinterpret_cast<float *>(malloc(sizeof(float) * BATCH_SIZE * p->vocab_size));
+  HIP_CHECK(hipMemcpy(logits_result, dev_s->logits, sizeof(float) * BATCH_SIZE * p->vocab_size,
                       hipMemcpyDeviceToHost));
   // HIP_CHECK(hipDeviceSynchronize());
-  return logits_output;
+  return logits_result;
 }

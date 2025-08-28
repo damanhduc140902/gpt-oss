@@ -48,7 +48,7 @@ static void upload_weights(TransformerWeights *w,
                            DeviceTransformerWeights *dev_w, Config *cfg,
                            float **_dev_data, __hip_bfloat16 **_dev_experts,
                            __hip_bfloat16 **_dev_linear_bf16,
-                           int device_index) {
+                           GPUWorker *worker, int device_index) {
   int head_dim = cfg->head_dim;
   int n_layers = cfg->n_layers;
   int n_experts = cfg->n_experts;
@@ -140,8 +140,10 @@ static void upload_weights(TransformerWeights *w,
 
   int n_devices;
   HIP_CHECK(hipGetDeviceCount(&n_devices));
+  int experts_per_device = worker->expert_end - worker->expert_start;
   HIP_CHECK(hipMalloc(_dev_experts, (experts_size / sizeof(float)) *
-                                        sizeof(__hip_bfloat16) / n_devices));
+                                        sizeof(__hip_bfloat16) / n_experts * 
+                                        experts_per_device));
   __hip_bfloat16 *ptr16 = *_dev_experts;
 
   dev_w->w_mlp1 = ptr16;
@@ -149,38 +151,38 @@ static void upload_weights(TransformerWeights *w,
     getp_memcpy_fp32_to_bf16(
         ptr16,
         w->w_mlp1 + 1ll * l * n_experts * 2 * intermediate_dim * hidden_dim +
-            1ll * device_index * (n_experts / n_devices) * 2 *
+            1ll * worker->expert_start * 2 *
                 intermediate_dim * hidden_dim,
-        (n_experts / n_devices) * 2 * intermediate_dim * hidden_dim);
-    ptr16 += (n_experts / n_devices) * 2 * intermediate_dim * hidden_dim;
+        experts_per_device * 2 * intermediate_dim * hidden_dim);
+    ptr16 += experts_per_device * 2 * intermediate_dim * hidden_dim;
   }
   dev_w->b_mlp1 = ptr16;
   for (int l = 0; l < n_layers; ++l) {
     getp_memcpy_fp32_to_bf16(
         ptr16,
         w->b_mlp1 + 1ll * l * n_experts * 2 * intermediate_dim +
-            1ll * device_index * (n_experts / n_devices) * 2 * intermediate_dim,
-        (n_experts / n_devices) * 2 * intermediate_dim);
-    ptr16 += (n_experts / n_devices) * 2 * intermediate_dim;
+            1ll * worker->expert_start * 2 * intermediate_dim,
+        experts_per_device * 2 * intermediate_dim);
+    ptr16 += experts_per_device * 2 * intermediate_dim;
   }
   dev_w->w_mlp2 = ptr16;
   for (int l = 0; l < n_layers; ++l) {
     getp_memcpy_fp32_to_bf16(
         ptr16,
         w->w_mlp2 + 1ll * l * n_experts * hidden_dim * intermediate_dim +
-            1ll * device_index * (n_experts / n_devices) * hidden_dim *
+            1ll * worker->expert_start * hidden_dim *
                 intermediate_dim,
-        (n_experts / n_devices) * hidden_dim * intermediate_dim);
-    ptr16 += (n_experts / n_devices) * hidden_dim * intermediate_dim;
+        experts_per_device * hidden_dim * intermediate_dim);
+    ptr16 += experts_per_device * hidden_dim * intermediate_dim;
   }
   dev_w->b_mlp2 = ptr16;
   for (int l = 0; l < n_layers; ++l) {
     getp_memcpy_fp32_to_bf16(
         ptr16,
         w->b_mlp2 + 1ll * l * n_experts * hidden_dim +
-            1ll * device_index * (n_experts / n_devices) * hidden_dim,
-        (n_experts / n_devices) * hidden_dim);
-    ptr16 += (n_experts / n_devices) * hidden_dim;
+            1ll * worker->expert_start * hidden_dim,
+        experts_per_device * hidden_dim);
+    ptr16 += experts_per_device * hidden_dim;
   }
 }
 
@@ -239,12 +241,14 @@ void free_device_run_state(RunState *s) {
 }
 
 void upload_transformer(Transformer *transformer,
-                        DeviceTransformer *dev_transformer) {
+                        DeviceTransformer *dev_transformer, 
+                        GPUWorker *worker) {
   dev_transformer->config = transformer->config;
   upload_weights(
       &transformer->weights, &dev_transformer->weights, &transformer->config,
       &dev_transformer->dev_data, &dev_transformer->dev_experts,
-      &dev_transformer->dev_linear_bf16, dev_transformer->device_index);
+      &dev_transformer->dev_linear_bf16, 
+      worker, dev_transformer->device_index);
   init_device_run_state(&dev_transformer->state, &dev_transformer->config);
 }
 

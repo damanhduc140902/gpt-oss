@@ -3,6 +3,7 @@
 #include "getp_transformer.cpp"
 #include "getp_transformer.hpp"
 #include "profiler.hpp"
+#include <cstddef>
 #include <cstring>
 #include <hip/driver_types.h>
 #include <hip/hip_runtime.h>
@@ -16,7 +17,7 @@
 CollectiveGroup g_world;
 
 DeviceTransformer **dev_transformers;
-float *logits_output;
+GPUWorker *workers;
 
 #include "getp_forward.cpp"
 
@@ -31,16 +32,23 @@ void warm_up(Transformer *transformer, Tokenizer *tokenizer) {
   HIP_CHECK(hipGetDeviceCount(&n_devices));
 
   dev_transformers = reinterpret_cast<DeviceTransformer **>(malloc(sizeof(DeviceTransformer *) * n_devices));
+  workers = reinterpret_cast<GPUWorker *>(malloc(sizeof(GPUWorker) * n_devices));
+
+  Config *p = &transformer->config;
+
+  for (int i = 0; i < n_devices; ++i) {
+    workers[i].device_index = i;
+
+    workers[i].expert_start = 0;
+    workers[i].expert_end = p->n_experts;
+
+  }
 
   for (int i = 0; i < n_devices; ++i) {
     dev_transformers[i] = new DeviceTransformer;
     dev_transformers[i]->device_index = i;
-    upload_transformer(transformer, dev_transformers[i]);
+    upload_transformer(transformer, dev_transformers[i], &workers[i]);
   }
-
-  int vocab_size = (transformer->config).vocab_size;
-  logits_output = reinterpret_cast<float *>
-    (malloc(sizeof(float) * BATCH_SIZE * vocab_size));
 
   std::vector<int> devices(n_devices);
   for (int i = 0; i < n_devices; ++i) devices[i] = i;
@@ -62,8 +70,6 @@ void finish(Transformer *transformer, Tokenizer *tokenizer) {
     free(dev_transformers[i]);
   }
 
-  free(logits_output);
-
   free(dev_transformers);
   cgDestroy(g_world);
 }
@@ -76,7 +82,7 @@ int is_all_zero(int *a, int size) {
 }
 
 long long simple_getp_generate(Transformer *transformer, Tokenizer *tokenizer,
-                               Sampler *sampler, const char *inputs_seq[],
+                               Sampler *sampler, GPUWorker *worker, const char *inputs_seq[],
                                int *outputs_tokens[], int steps) {
   PROFILE_FUNCTION();
   // <|start|>: 200006
@@ -141,7 +147,7 @@ long long simple_getp_generate(Transformer *transformer, Tokenizer *tokenizer,
   while (pos < steps) {
 
     // forward the transformer to get logits for the next token
-    float *logits = getp_forward(transformer, dev_transformers, token, pos);
+    float *logits = getp_forward(transformer, dev_transformers, worker, token, pos);
     // float *logits = forward(transformer, token, pos);
 
     // advance the state machine
@@ -183,7 +189,7 @@ long long simple_getp_generate(Transformer *transformer, Tokenizer *tokenizer,
       token[b] = next[b];
     }
 
-    // free(logits);
+    free(logits);
   }
 
   // should be removed
@@ -211,28 +217,74 @@ long long simple_getp_generate(Transformer *transformer, Tokenizer *tokenizer,
   return acc;
 }
 
+void single_thread_generate(Transformer *transformer, 
+                            Tokenizer *tokenizer, 
+                            Sampler *sampler, 
+                            Requests *requests,
+                            GPUWorker *worker,
+                            long long *num_token_out_ptr,
+                            int thread_idx
+) {
+  Sampler *local_sampler = 
+    reinterpret_cast<Sampler *>(malloc(sizeof(Sampler)));
+  build_sampler(local_sampler, sampler->vocab_size, 
+    sampler->temperature, sampler->topp, sampler->rng_state + thread_idx);
+
+  long long num_token_out = 0;
+  const char *inputs_seq[BATCH_SIZE];
+  int *outputs_tokens[BATCH_SIZE];
+
+  int idx0 = worker->request_start;
+  int requests_per_thread = worker->request_end - worker->request_start;
+  for (int idx = 0; idx < requests_per_thread; idx += BATCH_SIZE) {
+    for (int b = 0; b < BATCH_SIZE; ++b) {
+      inputs_seq[b] = get_str_req_ptr(requests, idx0 + idx + b);
+      outputs_tokens[b] = get_tok_gen_ptr(requests, idx0 + idx + b);
+    }
+    num_token_out +=
+        simple_getp_generate(transformer, tokenizer, local_sampler, worker, inputs_seq,
+                             outputs_tokens, requests->max_seq_len);
+  }
+
+  *num_token_out_ptr = num_token_out;
+}
+
 long long inference(Transformer *transformer, Tokenizer *tokenizer,
                     Sampler *sampler, Requests *requests) {
   PROFILE_FUNCTION();
   
   // Reset timing at the start of inference
   reset_timing_summary();
+
+  int n_devices;
+  HIP_CHECK(hipGetDeviceCount(&n_devices));
+
+  int num_reqs_per_device = requests->num_reqs / n_devices;
+  for (int i = 0; i < n_devices; ++i) {
+    workers[i].request_start = i * num_reqs_per_device;
+    workers[i].request_end = (i + 1) * num_reqs_per_device;
+    if (i == n_devices - 1) workers[i].request_end = requests->num_reqs;
+  }
   
-  long long num_token_out = 0;
-  const char *inputs_seq[BATCH_SIZE];
-  int *outputs_tokens[BATCH_SIZE];
-  for (int idx = 0; idx < requests->num_reqs; idx += BATCH_SIZE) {
-    for (int b = 0; b < BATCH_SIZE; ++b) {
-      inputs_seq[b] = get_str_req_ptr(requests, idx + b);
-      outputs_tokens[b] = get_tok_gen_ptr(requests, idx + b);
-    }
-    num_token_out +=
-        simple_getp_generate(transformer, tokenizer, sampler, inputs_seq,
-                             outputs_tokens, requests->max_seq_len);
+  std::vector<long long> nums_token_out(n_devices);
+  std::vector<std::thread> threads(n_devices);
+
+  for (int i = 0; i < n_devices; ++i) {
+    threads[i] = std::thread(single_thread_generate, 
+      transformer, tokenizer, sampler, requests, &workers[i], &nums_token_out[i], i);
+  }
+
+  for (int i = 0; i < n_devices; ++i) {
+    threads[i].join();
   }
   
   // Ensure all GPU work is completed before printing timing
   HIP_CHECK(hipDeviceSynchronize());
+
+  long long num_token_out = 0;
+  for (int i = 0; i < n_devices; ++i) {
+    num_token_out += nums_token_out[i];
+  }
   
   // Print timing summary at the end of inference
   print_timing_summary();

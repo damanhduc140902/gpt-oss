@@ -3,7 +3,17 @@
 #include <hip/hip_bf16.h>
 #include <hip/hip_runtime.h>
 
-#define BATCH_SIZE  (4)
+#define BATCH_SIZE  (32)
+
+struct GPUWorker {
+  int device_index;
+
+  int expert_start;
+  int expert_end;
+
+  int request_start;
+  int request_end;
+};
 
 struct DeviceTransformerWeights {
   // token_embedding_table - embedding.weight
