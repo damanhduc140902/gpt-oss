@@ -981,7 +981,7 @@ float *getp_forward(Transformer *transformer,
   for (unsigned long long l = 0; l < p->n_layers; l++) {
     HIP_CHECK(hipSetDevice(0));
     getp_rmsnorm(dev_s->t, dev_x, dev_w->rms_attn_w + 1ll * l * hidden_dim, BATCH_SIZE, hidden_dim);
-    int loff = l * p->seq_len * kv_dim;
+    int loff = l * p->seq_len * BATCH_SIZE * kv_dim;
     dev_s->k = dev_s->key_cache + loff + pos * BATCH_SIZE * kv_dim;
     dev_s->v = dev_s->value_cache + loff + pos * BATCH_SIZE * kv_dim;
 
@@ -1137,10 +1137,8 @@ float *getp_forward(Transformer *transformer,
   getp_matmul<__hip_bfloat16>(dev_s->logits, dev_x, dev_w->out_bf16,
                               (__hip_bfloat16 *)NULL, hidden_dim,
                               p->vocab_size, BATCH_SIZE);
-  float *logits_result = reinterpret_cast<float *>(malloc(sizeof(float) * BATCH_SIZE * p->vocab_size));
-
-  HIP_CHECK(hipMemcpy(logits_result, dev_s->logits, sizeof(float) * BATCH_SIZE * p->vocab_size,
+  HIP_CHECK(hipMemcpy(logits_output, dev_s->logits, sizeof(float) * BATCH_SIZE * p->vocab_size,
                       hipMemcpyDeviceToHost));
   // HIP_CHECK(hipDeviceSynchronize());
-  return logits_result;
+  return logits_output;
 }

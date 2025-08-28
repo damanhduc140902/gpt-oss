@@ -3,7 +3,7 @@
 #include <hip/hip_bf16.h>
 #include <hip/hip_runtime.h>
 
-#define BATCH_SIZE  (2)
+#define BATCH_SIZE  (4)
 
 struct DeviceTransformerWeights {
   // token_embedding_table - embedding.weight
