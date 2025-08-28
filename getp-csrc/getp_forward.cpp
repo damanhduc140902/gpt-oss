@@ -699,19 +699,29 @@ __global__ void multihead_attention_kernel(
     float *key_cache, float *value_cache, float *query, float *mask,
     float *attn_sinks, float *attn, int l, int head_dim, int n_attn_heads,
     int n_kv_heads, int pos, int att_lda, int mask_lda, int apply_mask) {
+  extern __shared__ float smem[];
+
   int h = blockDim.y * blockIdx.y + threadIdx.y;
   int t = blockDim.x * blockIdx.x + threadIdx.x;
-  if (h >= n_attn_heads || t > pos + 1) return;
-  if (t == pos + 1) {
-    if (t < att_lda) attn[h * att_lda + t] = attn_sinks[l * n_attn_heads + h];
-    return;
-  }
+  if (h >= n_attn_heads) return;
+
   const int kv_dim = head_dim * n_kv_heads;
   const int kv_mul = n_attn_heads / n_kv_heads;
   const float *q = query + h * head_dim;
   const float *k = key_cache + t * kv_dim + (h / kv_mul) * head_dim;
+
+  assert(head_dim == blockDim.x);
+
+  int tid = threadIdx.x;
+  smem[tid] = q[tid];
+  __syncthreads();
+  if (t > pos + 1) return;
+  if (t == pos + 1) {
+    if (t < att_lda) attn[h * att_lda + t] = attn_sinks[l * n_attn_heads + h];
+    return;
+  }
   float score = 0;
-  for (int i = 0; i < head_dim; ++i) score += q[i] * k[i];
+  for (int i = 0; i < head_dim; ++i) score += smem[i] * k[i];
   score = score / sqrtf((float)head_dim);
   if (apply_mask && t <= pos) score += mask[pos * mask_lda + t];
   attn[h * att_lda + t] = score;
@@ -723,10 +733,10 @@ void getp_multihead_attention(float *key_cache, float *value_cache,
                               int att_lda, int mask_lda, int sliding_window) {
   PROFILE_FUNCTION();
   int apply_mask = (sliding_window > 0 && (l % 2 == 0) ? 1 : 0);
-  dim3 blockDim(16, 16);
+  dim3 blockDim(64, 1);
   dim3 gridDim((pos + 2 + blockDim.x - 1) / blockDim.x,
                (n_attn_heads + blockDim.y - 1) / blockDim.y);
-  multihead_attention_kernel<<<gridDim, blockDim>>>(
+  multihead_attention_kernel<<<gridDim, blockDim, sizeof(float) * blockDim.x>>>(
       key_cache, value_cache, query, mask, attn_sinks, attn, l, head_dim,
       n_attn_heads, n_kv_heads, pos, att_lda, mask_lda, apply_mask);
   HIP_CHECK(hipDeviceSynchronize());
