@@ -140,10 +140,18 @@ __global__ void gemv_qkv_bf16_vec(float *__restrict__ q_out,
         float4 xb0 = x4[(k8 << 1) + 0];
         float4 xb1 = x4[(k8 << 1) + 1];
 
-        partial += bf16bits_to_f32(w01) * xb0.x + bf16bits_to_f32(w02) * xb0.y +
-                   bf16bits_to_f32(w11) * xb0.z + bf16bits_to_f32(w12) * xb0.w +
-                   bf16bits_to_f32(w21) * xb1.x + bf16bits_to_f32(w22) * xb1.y +
-                   bf16bits_to_f32(w31) * xb1.z + bf16bits_to_f32(w32) * xb1.w;
+        // partial += bf16bits_to_f32(w01) * xb0.x + bf16bits_to_f32(w02) * xb0.y +
+        //            bf16bits_to_f32(w11) * xb0.z + bf16bits_to_f32(w12) * xb0.w +
+        //            bf16bits_to_f32(w21) * xb1.x + bf16bits_to_f32(w22) * xb1.y +
+        //            bf16bits_to_f32(w31) * xb1.z + bf16bits_to_f32(w32) * xb1.w;
+        partial = fmaf(bf16bits_to_f32(w01), xb0.x, partial);
+        partial = fmaf(bf16bits_to_f32(w02), xb0.y, partial);
+        partial = fmaf(bf16bits_to_f32(w11), xb0.z, partial);
+        partial = fmaf(bf16bits_to_f32(w12), xb0.w, partial);
+        partial = fmaf(bf16bits_to_f32(w21), xb1.x, partial);
+        partial = fmaf(bf16bits_to_f32(w22), xb1.y, partial);
+        partial = fmaf(bf16bits_to_f32(w31), xb1.z, partial);
+        partial = fmaf(bf16bits_to_f32(w32), xb1.w, partial);
       }
       for (int k = (it8 << 3) + lane; k < tile_len; k += warpSize) {
         __bf16_bits_u u;
@@ -198,7 +206,7 @@ static inline void getp_matmul_qkv_fused_bf16(
   size_t shmem = TILE * sizeof(float);
   gemv_qkv_bf16_vec<TILE, WARPS><<<grid, block, shmem>>>(
       q, k, v, x, w_qkv_bf16, b_qkv_bf16, n, q_len, k_len, v_len);
-  // HIP_CHECK(hipDeviceSynchronize());
+  HIP_CHECK(hipDeviceSynchronize());
 }
 
 template <int TILE_N, int WARPS_PER_BLOCK>
@@ -301,7 +309,7 @@ void getp_matmul(float *xout, float *x, T *w, T *b, int n, int d, int batch_size
   gemv_bf16_vec_v2<TILE_N, WARPS><<<grid, block, shmem>>>(
       xout, x, (const __hip_bfloat16 *)w, (const __hip_bfloat16 *)b, n, d);
 
-  // HIP_CHECK(hipDeviceSynchronize());
+  HIP_CHECK(hipDeviceSynchronize());
 }
 
 template <int TILE_N, int WARPS_PER_BLOCK, int MAX_E = 4>
@@ -482,7 +490,7 @@ static inline void getp_mlp1_swiglu_bf16_batch(
       expert_local_ids_0, n_active_0,
       expert_local_ids_1, n_active_1,
       swiglu_limit);
-  // HIP_CHECK(hipDeviceSynchronize());
+  HIP_CHECK(hipDeviceSynchronize());
 }
 
 template <int TILE_N, int WARPS_PER_BLOCK, int MAX_E = 4>
@@ -698,7 +706,7 @@ void getp_compute_cos_sin(int pos, float base, int head_dim,
         cos_out, sin_out, inv_freq, concentration, pos, head_dim / 2);
   }
   HIP_CHECK(hipFree(inv_freq));
-  // HIP_CHECK(hipDeviceSynchronize());
+  HIP_CHECK(hipDeviceSynchronize());
 }
 
 __global__ void apply_rotary_emb_kernel(float *x, float *cos, float *sin,
@@ -883,7 +891,7 @@ void getp_vecadd(float *x, float *y, int size, int batch_size) {
   dim3 blockDim(1024);
   dim3 gridDim((size + blockDim.x - 1) / blockDim.x, batch_size);
   vecadd_kernel<<<gridDim, blockDim>>>(x, y, size);
-  // HIP_CHECK(hipDeviceSynchronize());
+  HIP_CHECK(hipDeviceSynchronize());
 }
 
 __global__ void topk_kernel(float *router_score, float *topk_values,
@@ -928,7 +936,7 @@ void getp_topk(float *topk_values, int *topk_indices, float *router_score,
   dim3 gridDim(batch_size);
   topk_kernel<<<gridDim, blockDim>>>(router_score, topk_values, topk_indices,
                                      n_experts, experts_per_token);
-  // HIP_CHECK(hipDeviceSynchronize());
+  HIP_CHECK(hipDeviceSynchronize());
 }
 
 float *getp_forward(Transformer *transformer,
