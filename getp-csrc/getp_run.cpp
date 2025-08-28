@@ -1,7 +1,6 @@
 // TODO: Modify this file to optimize end-to-end throughput
 #include "getp_eval.cpp"
 #include "getp_transformer.cpp"
-#include "getp_forward.cpp"
 #include "getp_transformer.hpp"
 #include "profiler.hpp"
 #include <cstring>
@@ -17,6 +16,9 @@
 CollectiveGroup g_world;
 
 DeviceTransformer **dev_transformers;
+float *logits_output;
+
+#include "getp_forward.cpp"
 
 void warm_up(Transformer *transformer, Tokenizer *tokenizer) {
   // Do not inference here
@@ -35,6 +37,10 @@ void warm_up(Transformer *transformer, Tokenizer *tokenizer) {
     dev_transformers[i]->device_index = i;
     upload_transformer(transformer, dev_transformers[i]);
   }
+
+  int vocab_size = (transformer->config).vocab_size;
+  logits_output = reinterpret_cast<float *>
+    (malloc(sizeof(float) * BATCH_SIZE * vocab_size));
 
   std::vector<int> devices(n_devices);
   for (int i = 0; i < n_devices; ++i) devices[i] = i;
@@ -55,6 +61,9 @@ void finish(Transformer *transformer, Tokenizer *tokenizer) {
     // cleanup(transformer, dev_transformers[i]);
     free(dev_transformers[i]);
   }
+
+  free(logits_output);
+
   free(dev_transformers);
   cgDestroy(g_world);
 }
@@ -174,7 +183,7 @@ long long simple_getp_generate(Transformer *transformer, Tokenizer *tokenizer,
       token[b] = next[b];
     }
 
-    free(logits);
+    // free(logits);
   }
 
   // should be removed
