@@ -9,6 +9,7 @@
 #include <hip/hip_runtime.h>
 
 #include "collectives.cpp"
+#include "getp_state_ext.cpp"
 #include <vector>
 
 #ifndef GETP_RUN
@@ -52,6 +53,12 @@ void warm_up(Transformer *transformer, Tokenizer *tokenizer) {
 
   std::vector<int> devices(n_devices);
   for (int i = 0; i < n_devices; ++i) devices[i] = i;
+  // Allocate on-device MoE extension state per device
+ext_create(n_devices);
+for (int i = 0; i < n_devices; ++i) {
+  ext_alloc_device(i, BATCH_SIZE, p->experts_per_token);
+}
+
   cgCreate(g_world, devices);
 
 }
@@ -69,7 +76,7 @@ void finish(Transformer *transformer, Tokenizer *tokenizer) {
     // cleanup(transformer, dev_transformers[i]);
     free(dev_transformers[i]);
   }
-
+  ext_free_all(n_devices);
   free(dev_transformers);
   cgDestroy(g_world);
 }
