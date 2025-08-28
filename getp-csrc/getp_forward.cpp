@@ -1,4 +1,3 @@
-#include <hip/amd_detail/amd_hip_runtime.h>
 #include <hip/hip_runtime.h>
 #include <malloc.h>
 
@@ -206,7 +205,7 @@ static inline void getp_matmul_qkv_fused_bf16(
   size_t shmem = TILE * sizeof(float);
   gemv_qkv_bf16_vec<TILE, WARPS><<<grid, block, shmem>>>(
       q, k, v, x, w_qkv_bf16, b_qkv_bf16, n, q_len, k_len, v_len);
-  HIP_CHECK(hipDeviceSynchronize());
+  // HIP_CHECK(hipDeviceSynchronize());
 }
 
 template <int TILE_N, int WARPS_PER_BLOCK>
@@ -309,7 +308,7 @@ void getp_matmul(float *xout, float *x, T *w, T *b, int n, int d, int batch_size
   gemv_bf16_vec_v2<TILE_N, WARPS><<<grid, block, shmem>>>(
       xout, x, (const __hip_bfloat16 *)w, (const __hip_bfloat16 *)b, n, d);
 
-  HIP_CHECK(hipDeviceSynchronize());
+  // HIP_CHECK(hipDeviceSynchronize());
 }
 
 template <int TILE_N, int WARPS_PER_BLOCK, int MAX_E = 4>
@@ -318,20 +317,12 @@ __global__ void mlp1_swiglu_bf16_kernel_batch(
     const float *__restrict__ x,                 // [hidden_dim]
     const __hip_bfloat16 *__restrict__ W_layer,  // layer-base: [E_dev, 2D, H]
     const __hip_bfloat16 *__restrict__ B_layer,  // layer-base: [E_dev, 2D]
-    int hidden_dim, int intermediate_dim, int experts_per_token,
-    int4 expert_local_ids_0, int n_active_0, 
-    int4 expert_local_ids_1, int n_active_1, 
-    float swiglu_limit) {
+    int hidden_dim, int intermediate_dim, int experts_per_device,
+    int4 expert_local_ids, int n_active, float swiglu_limit) {
   extern __shared__ float sX[];  // TILE_N floats
   const int lane = threadIdx.x;  // 0..63
   const int warp = threadIdx.y;  // 0..WARPS_PER_BLOCK-1
   const int j = blockIdx.x * WARPS_PER_BLOCK + warp;
-
-  int4 expert_local_ids = blockIdx.y == 0 ? expert_local_ids_0 : expert_local_ids_1;
-  int n_active = blockIdx.y == 0 ? n_active_0 : n_active_1;
-
-  gate_up_all += blockIdx.y * experts_per_token * intermediate_dim;
-  x           += blockIdx.y * hidden_dim;
 
   float g_tot[MAX_E], u_tot[MAX_E];
 #pragma unroll
@@ -473,24 +464,20 @@ __global__ void mlp1_swiglu_bf16_kernel_batch(
 static inline void getp_mlp1_swiglu_bf16_batch(
     float *gate_up_all, float *x, const __hip_bfloat16 *w_mlp1_layer_base,
     const __hip_bfloat16 *b_mlp1_layer_base, int hidden_dim,
-    int intermediate_dim, int experts_per_token, 
-    int4 expert_local_ids_0, int n_active_0, 
-    int4 expert_local_ids_1, int n_active_1,
-    float swiglu_limit, int batch_size) {
+    int intermediate_dim, int experts_per_device, int4 expert_local_ids,
+    int n_active, float swiglu_limit) {
   PROFILE_FUNCTION();
   constexpr int WARPS = GEMV_WARPS_PER_BLOCK;
   constexpr int TILE = GEMV_TILE_N;
   dim3 block(64, WARPS);
-  dim3 grid((intermediate_dim + WARPS - 1) / WARPS, batch_size);
+  dim3 grid((intermediate_dim + WARPS - 1) / WARPS);
   size_t shmem = TILE * sizeof(float);
 
   mlp1_swiglu_bf16_kernel_batch<TILE, WARPS><<<grid, block, shmem>>>(
       gate_up_all, x, w_mlp1_layer_base, b_mlp1_layer_base, hidden_dim,
-      intermediate_dim, experts_per_token, 
-      expert_local_ids_0, n_active_0,
-      expert_local_ids_1, n_active_1,
+      intermediate_dim, experts_per_device, expert_local_ids, n_active,
       swiglu_limit);
-  HIP_CHECK(hipDeviceSynchronize());
+  // HIP_CHECK(hipDeviceSynchronize());
 }
 
 template <int TILE_N, int WARPS_PER_BLOCK, int MAX_E = 4>
@@ -499,23 +486,13 @@ __global__ void mlp2_accum_bf16_kernel_batch(
     const float *__restrict__ gate_up_all,       // [n_active, intermediate_dim]
     const __hip_bfloat16 *__restrict__ W_layer,  // base of layer: [E_dev, H, I]
     const __hip_bfloat16 *__restrict__ B_layer,  // base of layer: [E_dev, H]
-    float4 expert_weights4_0,                    // packed weights (<=4)
-    int4 expert_local_ids_0, int n_active_0,
-    float4 expert_weights4_1,                    // packed weights (<=4)
-    int4 expert_local_ids_1, int n_active_1,
-    int intermediate_dim, int hidden_dim, int experts_per_token
-) {
+    float4 expert_weights4,                      // packed weights (<=4)
+    int intermediate_dim, int hidden_dim, int /*experts_per_device*/,
+    int4 expert_local_ids, int n_active) {
   extern __shared__ float sX[];  // size = MAX_E * TILE_N
   const int lane = threadIdx.x;  // 0..63
   const int warp = threadIdx.y;  // 0..WARPS_PER_BLOCK-1
   const int out_row = blockIdx.x * WARPS_PER_BLOCK + warp;
-
-  float4 expert_weights4 = blockIdx.y == 0 ? expert_weights4_0 : expert_weights4_1;
-  int4 expert_local_ids = blockIdx.y == 0 ? expert_local_ids_0 : expert_local_ids_1;
-  int n_active = blockIdx.y == 0 ? n_active_0 : n_active_1;
-
-  e_agg += blockIdx.y * hidden_dim;
-  gate_up_all += blockIdx.y * experts_per_token * intermediate_dim;
 
   // unpack weights to registers
   float wts[MAX_E] = {expert_weights4.x, expert_weights4.y, expert_weights4.z,
@@ -623,23 +600,19 @@ __global__ void mlp2_accum_bf16_kernel_batch(
 
 static inline void getp_mlp2_accum_bf16_batch(
     float *e_agg, const float *gate_up_all, const __hip_bfloat16 *w2_layer_base,
-    const __hip_bfloat16 *b2_layer_base, int experts_per_token,
-    int4 expert_local_ids_0, int n_active_0, float4 expert_weights4_0,
-    int4 expert_local_ids_1, int n_active_1, float4 expert_weights4_1,
-    int intermediate_dim, int hidden_dim, int batch_size) {
+    const __hip_bfloat16 *b2_layer_base, int experts_per_device,
+    int4 expert_local_ids, int n_active, float4 expert_weights4,
+    int intermediate_dim, int hidden_dim) {
   PROFILE_FUNCTION();
   constexpr int WARPS = GEMV_WARPS_PER_BLOCK;
   constexpr int TILE = GEMV_TILE_N;
   dim3 block(64, WARPS);
-  dim3 grid((hidden_dim + WARPS - 1) / WARPS, batch_size);
+  dim3 grid((hidden_dim + WARPS - 1) / WARPS);
   size_t shmem = (size_t)TILE * 4 * sizeof(float);  // 4 expert * TILE_N
   mlp2_accum_bf16_kernel_batch<TILE, WARPS>
       <<<grid, block, shmem>>>(e_agg, gate_up_all, w2_layer_base, b2_layer_base,
-                               expert_weights4_0, 
-                               expert_local_ids_0, n_active_0,
-                               expert_weights4_1, 
-                               expert_local_ids_1, n_active_1,
-                               intermediate_dim, hidden_dim, experts_per_token);
+                               expert_weights4, intermediate_dim, hidden_dim,
+                               experts_per_device, expert_local_ids, n_active);
   // HIP_CHECK(hipDeviceSynchronize());
 }
 
@@ -706,7 +679,7 @@ void getp_compute_cos_sin(int pos, float base, int head_dim,
         cos_out, sin_out, inv_freq, concentration, pos, head_dim / 2);
   }
   HIP_CHECK(hipFree(inv_freq));
-  HIP_CHECK(hipDeviceSynchronize());
+  // HIP_CHECK(hipDeviceSynchronize());
 }
 
 __global__ void apply_rotary_emb_kernel(float *x, float *cos, float *sin,
@@ -891,16 +864,13 @@ void getp_vecadd(float *x, float *y, int size, int batch_size) {
   dim3 blockDim(1024);
   dim3 gridDim((size + blockDim.x - 1) / blockDim.x, batch_size);
   vecadd_kernel<<<gridDim, blockDim>>>(x, y, size);
-  HIP_CHECK(hipDeviceSynchronize());
+  // HIP_CHECK(hipDeviceSynchronize());
 }
 
 __global__ void topk_kernel(float *router_score, float *topk_values,
                             int *topk_indices, int n_experts,
                             int experts_per_token) {
   int tid = threadIdx.x;
-  router_score += blockIdx.x * n_experts;
-  topk_values  += blockIdx.x * experts_per_token;
-  topk_indices += blockIdx.x * experts_per_token;
   if (tid >= experts_per_token) return;
   if (tid < n_experts) {
     topk_values[tid] = router_score[tid];
@@ -930,13 +900,13 @@ __global__ void topk_kernel(float *router_score, float *topk_values,
 }
 
 void getp_topk(float *topk_values, int *topk_indices, float *router_score,
-               int n_experts, int experts_per_token, int batch_size) {
+               int n_experts, int experts_per_token) {
   PROFILE_FUNCTION();
   dim3 blockDim(experts_per_token);
-  dim3 gridDim(batch_size);
+  dim3 gridDim(1);
   topk_kernel<<<gridDim, blockDim>>>(router_score, topk_values, topk_indices,
                                      n_experts, experts_per_token);
-  HIP_CHECK(hipDeviceSynchronize());
+  // HIP_CHECK(hipDeviceSynchronize());
 }
 
 float *getp_forward(Transformer *transformer,
@@ -958,11 +928,6 @@ float *getp_forward(Transformer *transformer,
   int kv_mul = p->n_attn_heads / p->n_kv_heads;
   int intermediate_dim = p->intermediate_dim;
   int n_experts = p->n_experts;
-
-  float *topk_v = 
-    reinterpret_cast<float *>(malloc(sizeof(float) * BATCH_SIZE * p->experts_per_token));
-  int *topk_i = 
-    reinterpret_cast<int *>(malloc(sizeof(int) * BATCH_SIZE * p->experts_per_token));
 
   HIP_CHECK(hipSetDevice(0));
   for (int b = 0; b < BATCH_SIZE; ++b) {
@@ -1030,99 +995,84 @@ float *getp_forward(Transformer *transformer,
 
     HIP_CHECK(hipMemset(dev_s->e_agg, 0, hidden_dim * sizeof(float)));
     
-    getp_topk(dev_s->topk_v, dev_s->topk_i, dev_s->router_score, n_experts,
-                p->experts_per_token, BATCH_SIZE);
-    getp_softmax(dev_s->topk_v, 1, p->experts_per_token, p->experts_per_token, BATCH_SIZE);
+    for (int b = 0; b < BATCH_SIZE; ++b) {
+      HIP_CHECK(hipSetDevice(0));
 
-    HIP_CHECK(hipMemcpy(topk_v, dev_s->topk_v,
-                        BATCH_SIZE * p->experts_per_token * sizeof(float),
-                        hipMemcpyDeviceToHost));
-    HIP_CHECK(hipMemcpy(topk_i, dev_s->topk_i,
-                        BATCH_SIZE * p->experts_per_token * sizeof(int),
-                        hipMemcpyDeviceToHost));
-
-    for (int device_id = 0; device_id < n_devices; ++device_id) {
-      HIP_CHECK(hipSetDevice(device_id));
-
-      int experts_per_device = n_experts / n_devices;
-      int expert_start = device_id * experts_per_device;
-      int expert_end = expert_start + experts_per_device;
-      
-      DeviceTransformerWeights *curr_dev_w =
+      getp_topk(dev_s->topk_v, dev_s->topk_i, dev_s->router_score + b * n_experts, n_experts,
+                p->experts_per_token);
+      getp_softmax(dev_s->topk_v, 1, p->experts_per_token, p->experts_per_token, 1);
+  
+      HIP_CHECK(hipMemcpy(s->topk_v, dev_s->topk_v,
+                          p->experts_per_token * sizeof(float),
+                          hipMemcpyDeviceToHost));
+      HIP_CHECK(hipMemcpy(s->topk_i, dev_s->topk_i,
+                          p->experts_per_token * sizeof(int),
+                          hipMemcpyDeviceToHost));
+      for (int device_id = 0; device_id < n_devices; device_id++) {
+        HIP_CHECK(hipSetDevice(device_id));
+        int experts_per_device = n_experts / n_devices;
+        int expert_start = device_id * experts_per_device;
+        int expert_end = expert_start + experts_per_device;
+        DeviceTransformerWeights *curr_dev_w =
             &dev_transformeres[device_id]->weights;
-      RunState *curr_dev_s = &dev_transformeres[device_id]->state;
-
-      if (device_id != 0)
-          HIP_CHECK(hipMemcpyPeer(curr_dev_s->t, device_id, dev_s->t, 0,
-                                  sizeof(float) * BATCH_SIZE * hidden_dim));
-      HIP_CHECK(hipMemset(curr_dev_s->e_agg, 0, BATCH_SIZE * hidden_dim * sizeof(float)));
-
-      int local_ids[BATCH_SIZE * 4] = {-1, -1, -1, -1, 
-                                       -1, -1, -1, -1};
-      float local_wts[BATCH_SIZE * 4] = {0, 0, 0, 0,
-                                         0, 0, 0, 0};
-      int n_local[BATCH_SIZE];
-      for (int b = 0; b < BATCH_SIZE; ++b) {
-        n_local[b] = 0;
+        RunState *curr_dev_s = &dev_transformeres[device_id]->state;
+        if (device_id != 0)
+          HIP_CHECK(hipMemcpyPeer(curr_dev_s->t + b * hidden_dim, device_id, dev_s->t + b * hidden_dim, 0,
+                                  sizeof(float) * hidden_dim));
+        HIP_CHECK(hipMemset(curr_dev_s->e_agg + b * hidden_dim, 0, hidden_dim * sizeof(float)));
+        int local_ids[4] = {-1, -1, -1, -1};
+        float local_wts[4] = {0, 0, 0, 0};
+        int n_local = 0;
         for (int idx = 0; idx < p->experts_per_token; ++idx) {
-          int e_global = topk_i[b * p->experts_per_token + idx];
+          int e_global = s->topk_i[idx];
           if (e_global >= expert_start && e_global < expert_end) {
-            local_ids[b * 4 + n_local[b]] = e_global - expert_start;  // local index
-            local_wts[b * 4 + n_local[b]] = topk_v[b * p->experts_per_token + idx];
-            ++n_local[b];
+            local_ids[n_local] = e_global - expert_start;  // local index
+            local_wts[n_local] = s->topk_v[idx];
+            ++n_local;
           }
         }
-      }
-
-      if (n_local[0] + n_local[1] > 0) {
-        // base pointer của layer hiện tại
-        __hip_bfloat16 *w1_base =
-            curr_dev_w->w_mlp1 +
-            1ll * l * experts_per_device * 2 * p->intermediate_dim * hidden_dim;
-        __hip_bfloat16 *b1_base =
-            curr_dev_w->b_mlp1 +
-            1ll * l * experts_per_device * 2 * p->intermediate_dim;
-
-        int4 ids0 = {local_ids[0], local_ids[1], local_ids[2], local_ids[3]};
-        int4 ids1 = {local_ids[4], local_ids[5], local_ids[6], local_ids[7]};
-        // gate_up_all buffer: [n_local, intermediate_dim]
-        getp_mlp1_swiglu_bf16_batch(curr_dev_s->gate_up, curr_dev_s->t, w1_base,
-                                    b1_base, hidden_dim, 
-                                    p->intermediate_dim, p->experts_per_token, 
-                                    ids0, n_local[0],
-                                    ids1, n_local[1],
-                                    p->swiglu_limit, BATCH_SIZE);
-
-        __hip_bfloat16 *w2_layer_base =
-            curr_dev_w->w_mlp2 +
-            1ll * l * experts_per_device * hidden_dim * p->intermediate_dim;
-        __hip_bfloat16 *b2_layer_base =
-            curr_dev_w->b_mlp2 + 1ll * l * experts_per_device * hidden_dim;
-        float4 wpack0 = {0.f, 0.f, 0.f, 0.f};
-        if (n_local[0] > 0) wpack0.x = local_wts[0];
-        if (n_local[0] > 1) wpack0.y = local_wts[1];
-        if (n_local[0] > 2) wpack0.z = local_wts[2];
-        if (n_local[0] > 3) wpack0.w = local_wts[3];
-        float4 wpack1 = {0.f, 0.f, 0.f, 0.f};
-        if (n_local[1] > 0) wpack1.x = local_wts[4];
-        if (n_local[1] > 1) wpack1.y = local_wts[5];
-        if (n_local[1] > 2) wpack1.z = local_wts[6];
-        if (n_local[1] > 3) wpack1.w = local_wts[7];
-
-        getp_mlp2_accum_bf16_batch(curr_dev_s->e_agg, curr_dev_s->gate_up,
-                                    w2_layer_base, b2_layer_base, p->experts_per_token, 
-                                    ids0, n_local[0], wpack0,
-                                    ids1, n_local[1], wpack1,
-                                    p->intermediate_dim, hidden_dim, BATCH_SIZE);
-      }
-      if (device_id != 0) {
-        HIP_CHECK(hipMemcpyPeer(dev_s->tb2, 0, curr_dev_s->e_agg, device_id,
-                                sizeof(float) * BATCH_SIZE * hidden_dim));
-        HIP_CHECK(hipSetDevice(0));
-        getp_vecadd(dev_s->e_agg, dev_s->tb2, hidden_dim, BATCH_SIZE);
+        if (n_local > 0) {
+          // base pointer của layer hiện tại
+          __hip_bfloat16 *w1_base =
+              curr_dev_w->w_mlp1 +
+              1ll * l * experts_per_device * 2 * p->intermediate_dim * hidden_dim;
+          __hip_bfloat16 *b1_base =
+              curr_dev_w->b_mlp1 +
+              1ll * l * experts_per_device * 2 * p->intermediate_dim;
+  
+          int4 ids = {local_ids[0], local_ids[1], local_ids[2], local_ids[3]};
+          // gate_up_all buffer: [n_local, intermediate_dim]
+          getp_mlp1_swiglu_bf16_batch(curr_dev_s->gate_up, curr_dev_s->t + b * hidden_dim, w1_base,
+                                      b1_base, hidden_dim, p->intermediate_dim,
+                                      experts_per_device, ids, n_local,
+                                      p->swiglu_limit);
+  
+          __hip_bfloat16 *w2_layer_base =
+              curr_dev_w->w_mlp2 +
+              1ll * l * experts_per_device * hidden_dim * p->intermediate_dim;
+          __hip_bfloat16 *b2_layer_base =
+              curr_dev_w->b_mlp2 + 1ll * l * experts_per_device * hidden_dim;
+          float4 wpack = {0.f, 0.f, 0.f, 0.f};
+          if (n_local > 0) wpack.x = local_wts[0];
+          if (n_local > 1) wpack.y = local_wts[1];
+          if (n_local > 2) wpack.z = local_wts[2];
+          if (n_local > 3) wpack.w = local_wts[3];
+  
+          getp_mlp2_accum_bf16_batch(curr_dev_s->e_agg + b * hidden_dim, curr_dev_s->gate_up,
+                                     w2_layer_base, b2_layer_base,
+                                     experts_per_device, ids, n_local, wpack,
+                                     p->intermediate_dim, hidden_dim);
+        }
+        if (device_id != 0) {
+          HIP_CHECK(hipMemcpyPeer(dev_s->tb2 + b * hidden_dim, 0, curr_dev_s->e_agg + b * hidden_dim, device_id,
+                                  sizeof(float) * hidden_dim));
+          HIP_CHECK(hipSetDevice(0));
+          getp_vecadd(dev_s->e_agg + b * hidden_dim, dev_s->tb2 + b * hidden_dim, hidden_dim, 1);
+        }
+        // HIP_CHECK(hipSetDevice(0));
+        // getp_vecadd(dev_x + b * hidden_dim, dev_s->e_agg + b * hidden_dim, hidden_dim, 1);
       }
     }
-
     HIP_CHECK(hipSetDevice(0));
     getp_vecadd(dev_x, dev_s->e_agg, hidden_dim, BATCH_SIZE);
   }
@@ -1130,9 +1080,6 @@ float *getp_forward(Transformer *transformer,
 
   HIP_CHECK(hipFree(dev_cos_vals));
   HIP_CHECK(hipFree(dev_sin_vals));
-  free(topk_v);
-  free(topk_i);
-
   getp_rmsnorm(dev_x, dev_x, dev_w->rms_out_w, BATCH_SIZE, hidden_dim);
   getp_matmul<__hip_bfloat16>(dev_s->logits, dev_x, dev_w->out_bf16,
                               (__hip_bfloat16 *)NULL, hidden_dim,
