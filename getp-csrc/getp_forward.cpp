@@ -28,7 +28,7 @@ __global__ void rmsnorm_kernel(float *o, float *x, float *weight, int size) {
   // blockIdx.y equal to batch index
   // shift o,x to the corresponding batch
   o += blockIdx.y * size;
-  x += blockIdx.y * size; 
+  x += blockIdx.y * size;
   smem[tid] = 0;
   for (int offset = 0; offset < size; offset += blockDim.x) {
     if (tid + offset < size) {
@@ -57,8 +57,9 @@ void getp_rmsnorm(float *o, float *x, float *weight, int batch_size, int dim) {
   PROFILE_FUNCTION();
   dim3 blockDim(1024);
   dim3 gridDim(1, batch_size);
-  rmsnorm_kernel<<<gridDim, blockDim, sizeof(float) * (blockDim.x + 1)>>>(o, x, weight, dim);
-  // HIP_CHECK(hipDeviceSynchronize());
+  rmsnorm_kernel<<<gridDim, blockDim, sizeof(float) * (blockDim.x + 1)>>>(
+      o, x, weight, dim);
+  //HIP_CHECK(hipDeviceSynchronize());
 }
 
 // Warp reduce sum (HIP wavefront = 64)
@@ -94,7 +95,7 @@ __global__ void gemv_qkv_bf16_vec(float *__restrict__ q_out,
   q_out += blockIdx.y * q_len;
   k_out += blockIdx.y * k_len;
   v_out += blockIdx.y * v_len;
-  x     += blockIdx.y * n;
+  x += blockIdx.y * n;
 
   float partial_total = 0.f;
 
@@ -139,10 +140,6 @@ __global__ void gemv_qkv_bf16_vec(float *__restrict__ q_out,
         float4 xb0 = x4[(k8 << 1) + 0];
         float4 xb1 = x4[(k8 << 1) + 1];
 
-        // partial += bf16bits_to_f32(w01) * xb0.x + bf16bits_to_f32(w02) * xb0.y +
-        //            bf16bits_to_f32(w11) * xb0.z + bf16bits_to_f32(w12) * xb0.w +
-        //            bf16bits_to_f32(w21) * xb1.x + bf16bits_to_f32(w22) * xb1.y +
-        //            bf16bits_to_f32(w31) * xb1.z + bf16bits_to_f32(w32) * xb1.w;
         partial = fmaf(bf16bits_to_f32(w01), xb0.x, partial);
         partial = fmaf(bf16bits_to_f32(w02), xb0.y, partial);
         partial = fmaf(bf16bits_to_f32(w11), xb0.z, partial);
@@ -205,7 +202,7 @@ static inline void getp_matmul_qkv_fused_bf16(
   size_t shmem = TILE * sizeof(float);
   gemv_qkv_bf16_vec<TILE, WARPS><<<grid, block, shmem>>>(
       q, k, v, x, w_qkv_bf16, b_qkv_bf16, n, q_len, k_len, v_len);
-  // HIP_CHECK(hipDeviceSynchronize());
+  //HIP_CHECK(hipDeviceSynchronize());
 }
 
 template <int TILE_N, int WARPS_PER_BLOCK>
@@ -297,7 +294,8 @@ __global__ void gemv_bf16_vec_v2(float *__restrict__ y,
   }
 }
 template <typename T>
-void getp_matmul(float *xout, float *x, T *w, T *b, int n, int d, int batch_size) {
+void getp_matmul(float *xout, float *x, T *w, T *b, int n, int d,
+                 int batch_size) {
   PROFILE_FUNCTION();
   constexpr int WARPS = GEMV_WARPS_PER_BLOCK;
   constexpr int TILE_N = GEMV_TILE_N;
@@ -308,7 +306,7 @@ void getp_matmul(float *xout, float *x, T *w, T *b, int n, int d, int batch_size
   gemv_bf16_vec_v2<TILE_N, WARPS><<<grid, block, shmem>>>(
       xout, x, (const __hip_bfloat16 *)w, (const __hip_bfloat16 *)b, n, d);
 
-  // HIP_CHECK(hipDeviceSynchronize());
+  //HIP_CHECK(hipDeviceSynchronize());
 }
 
 template <int TILE_N, int WARPS_PER_BLOCK, int MAX_E = 4>
@@ -477,7 +475,7 @@ static inline void getp_mlp1_swiglu_bf16_batch(
       gate_up_all, x, w_mlp1_layer_base, b_mlp1_layer_base, hidden_dim,
       intermediate_dim, experts_per_device, expert_local_ids, n_active,
       swiglu_limit);
-  // HIP_CHECK(hipDeviceSynchronize());
+  //HIP_CHECK(hipDeviceSynchronize());
 }
 
 template <int TILE_N, int WARPS_PER_BLOCK, int MAX_E = 4>
@@ -613,7 +611,7 @@ static inline void getp_mlp2_accum_bf16_batch(
       <<<grid, block, shmem>>>(e_agg, gate_up_all, w2_layer_base, b2_layer_base,
                                expert_weights4, intermediate_dim, hidden_dim,
                                experts_per_device, expert_local_ids, n_active);
-  // HIP_CHECK(hipDeviceSynchronize());
+  //HIP_CHECK(hipDeviceSynchronize());
 }
 
 __global__ void compute_inv_freq_kernel(float base, int head_dim,
@@ -679,7 +677,7 @@ void getp_compute_cos_sin(int pos, float base, int head_dim,
         cos_out, sin_out, inv_freq, concentration, pos, head_dim / 2);
   }
   HIP_CHECK(hipFree(inv_freq));
-  // HIP_CHECK(hipDeviceSynchronize());
+  //HIP_CHECK(hipDeviceSynchronize());
 }
 
 __global__ void apply_rotary_emb_kernel(float *x, float *cos, float *sin,
@@ -700,23 +698,27 @@ __global__ void apply_rotary_emb_kernel(float *x, float *cos, float *sin,
   x[h * head_dim + i] = o1;
   x[h * head_dim + half + i] = o2;
 }
-void getp_apply_rotary_emb(float *x, float *cos, float *sin, int n_heads, int head_dim, int batch_size) {
+void getp_apply_rotary_emb(float *x, float *cos, float *sin, int n_heads,
+                           int head_dim, int batch_size) {
   PROFILE_FUNCTION();
   dim3 blockDim(16, 16);
-  dim3 gridDim((head_dim / 2 + blockDim.x - 1) / blockDim.x, 
-               (n_heads + blockDim.y - 1) / blockDim.y,
-               batch_size);
-  apply_rotary_emb_kernel<<<gridDim, blockDim>>>(x, cos, sin, n_heads, head_dim);
-  // HIP_CHECK(hipDeviceSynchronize());
+  dim3 gridDim((head_dim / 2 + blockDim.x - 1) / blockDim.x,
+               (n_heads + blockDim.y - 1) / blockDim.y, batch_size);
+  apply_rotary_emb_kernel<<<gridDim, blockDim>>>(x, cos, sin, n_heads,
+                                                 head_dim);
+  //HIP_CHECK(hipDeviceSynchronize());
 }
 
-__global__ void multihead_attention_kernel(float *key_cache, float *value_cache, float *query,
-                                           float *mask, float *attn_sinks, float *attn,
-                                           int l, int head_dim, int n_attn_heads, int n_kv_heads,
-                                           int pos, int att_lda, int mask_lda, int apply_mask, int batch_size) {
+__global__ void multihead_attention_kernel(float *key_cache, float *value_cache,
+                                           float *query, float *mask,
+                                           float *attn_sinks, float *attn,
+                                           int l, int head_dim,
+                                           int n_attn_heads, int n_kv_heads,
+                                           int pos, int att_lda, int mask_lda,
+                                           int apply_mask, int batch_size) {
   int h = blockDim.y * blockIdx.y + threadIdx.y;
   int t = blockDim.x * blockIdx.x + threadIdx.x;
-  int bid = blockIdx.z; // batch index
+  int bid = blockIdx.z;  // batch index
   attn += bid * n_attn_heads * att_lda;
   if (h >= n_attn_heads || t > pos + 1) return;
   if (t == pos + 1) {
@@ -726,26 +728,29 @@ __global__ void multihead_attention_kernel(float *key_cache, float *value_cache,
   const int kv_dim = head_dim * n_kv_heads;
   const int kv_mul = n_attn_heads / n_kv_heads;
   const float *q = query + bid * n_attn_heads * head_dim + h * head_dim;
-  const float *k = key_cache + t * batch_size * kv_dim + bid * kv_dim + (h / kv_mul) * head_dim;
+  const float *k = key_cache + t * batch_size * kv_dim + bid * kv_dim +
+                   (h / kv_mul) * head_dim;
   float score = 0;
   for (int i = 0; i < head_dim; ++i) score += q[i] * k[i];
   score = score / sqrtf((float)head_dim);
   if (apply_mask && t <= pos) score += mask[pos * mask_lda + t];
   attn[h * att_lda + t] = score;
 }
-void getp_multihead_attention(float *key_cache, float *value_cache, float *query, float *mask,
-                              float *attn_sinks, float *attn, int l, int head_dim, int n_attn_heads,
-                              int n_kv_heads, int pos, int att_lda, int mask_lda, int sliding_window, int batch_size) {
+void getp_multihead_attention(float *key_cache, float *value_cache,
+                              float *query, float *mask, float *attn_sinks,
+                              float *attn, int l, int head_dim,
+                              int n_attn_heads, int n_kv_heads, int pos,
+                              int att_lda, int mask_lda, int sliding_window,
+                              int batch_size) {
   PROFILE_FUNCTION();
   int apply_mask = (sliding_window > 0 && (l % 2 == 0) ? 1 : 0);
   dim3 blockDim(16, 16);
-  dim3 gridDim((pos + 2 + blockDim.x - 1) / blockDim.x, 
-               (n_attn_heads + blockDim.y - 1) / blockDim.y,
-               batch_size);
-  multihead_attention_kernel<<<gridDim, blockDim>>>(key_cache, value_cache, query, mask, attn_sinks, attn,
-                                                    l, head_dim, n_attn_heads, n_kv_heads, pos, att_lda, mask_lda, 
-                                                    apply_mask, batch_size);
-  // HIP_CHECK(hipDeviceSynchronize());
+  dim3 gridDim((pos + 2 + blockDim.x - 1) / blockDim.x,
+               (n_attn_heads + blockDim.y - 1) / blockDim.y, batch_size);
+  multihead_attention_kernel<<<gridDim, blockDim>>>(
+      key_cache, value_cache, query, mask, attn_sinks, attn, l, head_dim,
+      n_attn_heads, n_kv_heads, pos, att_lda, mask_lda, apply_mask, batch_size);
+  //HIP_CHECK(hipDeviceSynchronize());
 }
 
 template <int TILE_T = 128>
@@ -753,12 +758,12 @@ __global__ void weighted_sum_tiled_kernel(float *__restrict__ tb,
                                           const float *__restrict__ value_cache,
                                           const float *__restrict__ att,
                                           int seq_len, int n_attn_heads,
-                                          int n_kv_heads, int pos,
-                                          int head_dim, int batch_size) {
+                                          int n_kv_heads, int pos, int head_dim,
+                                          int batch_size) {
   const int h = blockIdx.y;
   const int i0 = blockIdx.x * blockDim.x;
   const int i = i0 + threadIdx.x;
-  const int b = blockIdx.z; // batch
+  const int b = blockIdx.z;  // batch
   att += b * n_attn_heads * seq_len;
   tb += b * n_attn_heads * head_dim;
   if (h >= n_attn_heads) return;
@@ -773,8 +778,8 @@ __global__ void weighted_sum_tiled_kernel(float *__restrict__ tb,
       s_att[tt] = att[h * seq_len + (t0 + tt)];
     __syncthreads();
     if (i < head_dim) {
-      const float *vptr =
-          value_cache + (size_t)t0 * batch_size * kv_dim + b * kv_dim + kv_h * head_dim + i;
+      const float *vptr = value_cache + (size_t)t0 * batch_size * kv_dim +
+                          b * kv_dim + kv_h * head_dim + i;
       for (int tt = 0; tt < tlen; ++tt) {
         acc += s_att[tt] * (*vptr);
         vptr += batch_size * kv_dim;
@@ -786,14 +791,17 @@ __global__ void weighted_sum_tiled_kernel(float *__restrict__ tb,
 }
 
 void getp_weighted_sum(float *tb, float *value_cache, float *att, int seq_len,
-                       int n_attn_heads, int n_kv_heads, int pos, int head_dim, int batch_size) {
+                       int n_attn_heads, int n_kv_heads, int pos, int head_dim,
+                       int batch_size) {
   PROFILE_FUNCTION();
   const int BLK_X = 32;
   dim3 block(BLK_X);
   dim3 grid((head_dim + BLK_X - 1) / BLK_X, n_attn_heads, batch_size);
   const size_t shmem = (size_t)MIN(128, pos + 1) * sizeof(float);
-  weighted_sum_tiled_kernel<128><<<grid, block, shmem>>>(tb, value_cache, att, seq_len, n_attn_heads, n_kv_heads, pos, head_dim, batch_size);
-  // HIP_CHECK(hipDeviceSynchronize());
+  weighted_sum_tiled_kernel<128>
+      <<<grid, block, shmem>>>(tb, value_cache, att, seq_len, n_attn_heads,
+                               n_kv_heads, pos, head_dim, batch_size);
+  //HIP_CHECK(hipDeviceSynchronize());
 }
 
 __global__ void softmax_kernel(float *A, int M, int N, int lda) {
@@ -846,8 +854,101 @@ void getp_softmax(float *A, int M, int N, int lda, int batch_size) {
   PROFILE_FUNCTION();
   dim3 blockDim(1024);
   dim3 gridDim(M, batch_size);
-  softmax_kernel<<<gridDim, blockDim, sizeof(float) * (blockDim.x + 2)>>>(A, M, N, lda);
-  // HIP_CHECK(hipDeviceSynchronize());
+  softmax_kernel<<<gridDim, blockDim, sizeof(float) * (blockDim.x + 2)>>>(
+      A, M, N, lda);
+  //HIP_CHECK(hipDeviceSynchronize());
+}
+
+#ifndef GETP_ROUTER_TOPK_MAXK
+#define GETP_ROUTER_TOPK_MAXK 4
+#endif
+
+__global__ void router_topk_softmax_batch_kernel(
+    const float *__restrict__ router_score,  // [B, n_experts]
+    int n_experts,
+    int experts_per_token,           // K <= GETP_ROUTER_TOPK_MAXK
+    float *__restrict__ topk_v_out,
+    int *__restrict__ topk_i_out) {  // [B, K]
+  const int b = blockIdx.x;          // sample index
+  const int tid = threadIdx.x;
+  const int K = experts_per_token;
+
+  router_score += (size_t)b * n_experts;
+  topk_v_out += (size_t)b * K;
+  topk_i_out += (size_t)b * K;
+
+  extern __shared__ unsigned char smem_raw[];
+  float *scores = reinterpret_cast<float *>(smem_raw);
+  float *valbuf = scores + n_experts;
+  int *idxbuf = reinterpret_cast<int *>(valbuf + blockDim.x);
+  float *topv = reinterpret_cast<float *>(idxbuf + blockDim.x);
+  int *topi = reinterpret_cast<int *>(topv + GETP_ROUTER_TOPK_MAXK);
+
+  for (int i = tid; i < n_experts; i += blockDim.x) scores[i] = router_score[i];
+  __syncthreads();
+
+  for (int sel = 0; sel < K; ++sel) {
+    float best = -INFINITY;
+    int besti = -1;
+    for (int i = tid; i < n_experts; i += blockDim.x) {
+      float v = scores[i];
+      if (v > best) {
+        best = v;
+        besti = i;
+      }
+    }
+    valbuf[tid] = best;
+    idxbuf[tid] = besti;
+    __syncthreads();
+
+    for (int stride = blockDim.x >> 1; stride > 0; stride >>= 1) {
+      if (tid < stride) {
+        if (valbuf[tid + stride] > valbuf[tid]) {
+          valbuf[tid] = valbuf[tid + stride];
+          idxbuf[tid] = idxbuf[tid + stride];
+        }
+      }
+      __syncthreads();
+    }
+    if (tid == 0) {
+      topv[sel] = valbuf[0];
+      topi[sel] = idxbuf[0] < 0 ? 0 : idxbuf[0];
+      scores[topi[sel]] = -INFINITY;
+    }
+    __syncthreads();
+  }
+
+  if (tid == 0) {
+    float m = topv[0];
+    for (int i = 1; i < K; ++i)
+      if (topv[i] > m) m = topv[i];
+    float e[GETP_ROUTER_TOPK_MAXK];
+    float s = 0.f;
+    for (int i = 0; i < K; ++i) {
+      e[i] = expf(topv[i] - m);
+      s += e[i];
+    }
+    float invs = 1.f / s;
+    for (int i = 0; i < K; ++i) {
+      topk_v_out[i] = e[i] * invs;
+      topk_i_out[i] = topi[i];
+    }
+  }
+}
+
+static inline void getp_router_topk_softmax_batch(
+    const float *router_score, int n_experts, int experts_per_token,
+    float *topk_v_out, int *topk_i_out, int batch_size) {
+  PROFILE_FUNCTION();
+  const int BLK = 1024;
+  const dim3 block(BLK);
+  const dim3 grid(batch_size);
+  const size_t shmem = (size_t)n_experts * sizeof(float) +
+                       (size_t)BLK * (sizeof(float) + sizeof(int)) +
+                       GETP_ROUTER_TOPK_MAXK * (sizeof(float) + sizeof(int));
+  router_topk_softmax_batch_kernel<<<grid, block, shmem>>>(
+      router_score, n_experts, experts_per_token, topk_v_out, topk_i_out);
+  //HIP_CHECK(hipDeviceSynchronize());
 }
 
 __global__ void vecadd_kernel(float *x, float *y, int size) {
@@ -864,53 +965,12 @@ void getp_vecadd(float *x, float *y, int size, int batch_size) {
   dim3 blockDim(1024);
   dim3 gridDim((size + blockDim.x - 1) / blockDim.x, batch_size);
   vecadd_kernel<<<gridDim, blockDim>>>(x, y, size);
-  // HIP_CHECK(hipDeviceSynchronize());
+  //HIP_CHECK(hipDeviceSynchronize());
 }
 
-__global__ void topk_kernel(float *router_score, float *topk_values,
-                            int *topk_indices, int n_experts,
-                            int experts_per_token) {
-  int tid = threadIdx.x;
-  if (tid >= experts_per_token) return;
-  if (tid < n_experts) {
-    topk_values[tid] = router_score[tid];
-    topk_indices[tid] = tid;
-  } else {
-    topk_values[tid] = -INFINITY;
-    topk_indices[tid] = -1;
-  }
-  __syncthreads();
-  for (int i = experts_per_token; i < n_experts; i++) {
-    __syncthreads();
-    float current_score = router_score[i];
-    if (tid == 0) {
-      int min_idx = 0;
-      float min_val = topk_values[0];
-      for (int j = 1; j < experts_per_token; j++)
-        if (topk_values[j] < min_val) {
-          min_val = topk_values[j];
-          min_idx = j;
-        }
-      if (current_score > min_val) {
-        topk_values[min_idx] = current_score;
-        topk_indices[min_idx] = i;
-      }
-    }
-  }
-}
-
-void getp_topk(float *topk_values, int *topk_indices, float *router_score,
-               int n_experts, int experts_per_token) {
-  PROFILE_FUNCTION();
-  dim3 blockDim(experts_per_token);
-  dim3 gridDim(1);
-  topk_kernel<<<gridDim, blockDim>>>(router_score, topk_values, topk_indices,
-                                     n_experts, experts_per_token);
-  // HIP_CHECK(hipDeviceSynchronize());
-}
-
-float *getp_forward(Transformer */*transformer*/,
-                    DeviceTransformer **dev_transformeres, GPUWorker *worker, int token[], int pos) {
+float *getp_forward(Transformer * /*transformer*/,
+                    DeviceTransformer **dev_transformeres, GPUWorker *worker,
+                    int token[], int pos) {
   PROFILE_FUNCTION();
 
   int device_index = worker->device_index;
@@ -931,9 +991,10 @@ float *getp_forward(Transformer */*transformer*/,
 
   for (int b = 0; b < BATCH_SIZE; ++b) {
     assert(token[b] < p->vocab_size);
-    float *content_row = dev_w->token_embedding_table + (size_t)token[b] * hidden_dim;
-    HIP_CHECK(hipMemcpy(dev_x + b * hidden_dim, content_row, 
-      hidden_dim * sizeof(float), hipMemcpyDeviceToDevice));
+    float *content_row =
+        dev_w->token_embedding_table + (size_t)token[b] * hidden_dim;
+    HIP_CHECK(hipMemcpy(dev_x + b * hidden_dim, content_row,
+                        hidden_dim * sizeof(float), hipMemcpyDeviceToDevice));
   }
 
   float *dev_cos_vals, *dev_sin_vals;
@@ -944,11 +1005,14 @@ float *getp_forward(Transformer */*transformer*/,
                        p->initial_context_length, ntk_beta, ntk_alpha,
                        dev_cos_vals, dev_sin_vals);
 
-  float *topk_v = reinterpret_cast<float *>(malloc(sizeof(float) * p->experts_per_token));
-  int *topk_i = reinterpret_cast<int *>(malloc(sizeof(int) * p->experts_per_token));
+  float *topk_v = reinterpret_cast<float *>(
+      malloc(sizeof(float) * BATCH_SIZE * p->experts_per_token));
+  int *topk_i = reinterpret_cast<int *>(
+      malloc(sizeof(int) * BATCH_SIZE * p->experts_per_token));
 
   for (unsigned long long l = 0; l < p->n_layers; l++) {
-    getp_rmsnorm(dev_s->t, dev_x, dev_w->rms_attn_w + 1ll * l * hidden_dim, BATCH_SIZE, hidden_dim);
+    getp_rmsnorm(dev_s->t, dev_x, dev_w->rms_attn_w + 1ll * l * hidden_dim,
+                 BATCH_SIZE, hidden_dim);
     int loff = l * p->seq_len * BATCH_SIZE * kv_dim;
     dev_s->k = dev_s->key_cache + loff + pos * BATCH_SIZE * kv_dim;
     dev_s->v = dev_s->value_cache + loff + pos * BATCH_SIZE * kv_dim;
@@ -971,45 +1035,50 @@ float *getp_forward(Transformer */*transformer*/,
 
     int att_lda = p->seq_len + 1;
     int mask_lda = p->seq_len;
-    getp_multihead_attention(dev_s->key_cache + loff, dev_s->value_cache + loff, dev_s->q,
-                             dev_s->mask, dev_w->attn_sinks, dev_s->att, l, head_dim,
-                             p->n_attn_heads, p->n_kv_heads, pos, att_lda, mask_lda, p->sliding_window, BATCH_SIZE);
+    getp_multihead_attention(dev_s->key_cache + loff, dev_s->value_cache + loff,
+                             dev_s->q, dev_s->mask, dev_w->attn_sinks,
+                             dev_s->att, l, head_dim, p->n_attn_heads,
+                             p->n_kv_heads, pos, att_lda, mask_lda,
+                             p->sliding_window, BATCH_SIZE);
     int Nsoft = MIN(pos + 2, att_lda);
     getp_softmax(dev_s->att, p->n_attn_heads, Nsoft, att_lda, BATCH_SIZE);
     getp_weighted_sum(dev_s->tb, dev_s->value_cache + loff, dev_s->att, att_lda,
-                      p->n_attn_heads, p->n_kv_heads, pos, head_dim, BATCH_SIZE);
+                      p->n_attn_heads, p->n_kv_heads, pos, head_dim,
+                      BATCH_SIZE);
 
     __hip_bfloat16 *dev_w_o =
         dev_w->w_o_bf16 + 1ll * l * (head_dim * p->n_attn_heads) * hidden_dim;
     __hip_bfloat16 *dev_b_o = dev_w->b_o_bf16 + 1ll * l * hidden_dim;
     getp_matmul<__hip_bfloat16>(dev_s->tb2, dev_s->tb, dev_w_o, dev_b_o,
-                                head_dim * p->n_attn_heads, hidden_dim, BATCH_SIZE);
+                                head_dim * p->n_attn_heads, hidden_dim,
+                                BATCH_SIZE);
 
     getp_vecadd(dev_x, dev_s->tb2, hidden_dim, BATCH_SIZE);
 
-    getp_rmsnorm(dev_s->t, dev_x, dev_w->rms_ffn_w + 1ll * l * hidden_dim, BATCH_SIZE,
-                 hidden_dim);
+    getp_rmsnorm(dev_s->t, dev_x, dev_w->rms_ffn_w + 1ll * l * hidden_dim,
+                 BATCH_SIZE, hidden_dim);
 
     __hip_bfloat16 *dev_w_router =
         dev_w->w_router_bf16 + 1ll * l * hidden_dim * n_experts;
     __hip_bfloat16 *dev_b_router = dev_w->b_router_bf16 + 1ll * l * n_experts;
     getp_matmul<__hip_bfloat16>(dev_s->router_score, dev_s->t, dev_w_router,
-                                dev_b_router, hidden_dim, n_experts, BATCH_SIZE);
+                                dev_b_router, hidden_dim, n_experts,
+                                BATCH_SIZE);
 
     HIP_CHECK(hipMemset(dev_s->e_agg, 0, hidden_dim * sizeof(float)));
-    
+
+    getp_router_topk_softmax_batch(dev_s->router_score, n_experts,
+                                   p->experts_per_token, dev_s->topk_v,
+                                   dev_s->topk_i, BATCH_SIZE);
+
+    HIP_CHECK(hipMemcpy(topk_v, dev_s->topk_v,
+                        sizeof(float) * BATCH_SIZE * p->experts_per_token,
+                        hipMemcpyDeviceToHost));
+    HIP_CHECK(hipMemcpy(topk_i, dev_s->topk_i,
+                        sizeof(int) * BATCH_SIZE * p->experts_per_token,
+                        hipMemcpyDeviceToHost));
+
     for (int b = 0; b < BATCH_SIZE; ++b) {
-      getp_topk(dev_s->topk_v, dev_s->topk_i, dev_s->router_score + b * n_experts, n_experts,
-                p->experts_per_token);
-      getp_softmax(dev_s->topk_v, 1, p->experts_per_token, p->experts_per_token, 1);
-  
-      HIP_CHECK(hipMemcpy(topk_v, dev_s->topk_v,
-                          p->experts_per_token * sizeof(float),
-                          hipMemcpyDeviceToHost));
-      HIP_CHECK(hipMemcpy(topk_i, dev_s->topk_i,
-                          p->experts_per_token * sizeof(int),
-                          hipMemcpyDeviceToHost));
-      
       int expert_start = worker->expert_start;
       int expert_end = worker->expert_end;
       int experts_per_device = worker->expert_end - worker->expert_start;
@@ -1017,22 +1086,25 @@ float *getp_forward(Transformer */*transformer*/,
       DeviceTransformerWeights *curr_dev_w =
           &dev_transformeres[device_index]->weights;
       RunState *curr_dev_s = &dev_transformeres[device_index]->state;
-      
-      HIP_CHECK(hipMemset(curr_dev_s->e_agg + b * hidden_dim, 0, hidden_dim * sizeof(float)));
+
+      HIP_CHECK(hipMemset(curr_dev_s->e_agg + b * hidden_dim, 0,
+                          hidden_dim * sizeof(float)));
 
       int local_ids[4] = {-1, -1, -1, -1};
       float local_wts[4] = {0, 0, 0, 0};
       int n_local = 0;
+      const float *topk_v_b = topk_v + (size_t)b * p->experts_per_token;
+      const int *topk_i_b = topk_i + (size_t)b * p->experts_per_token;
       for (int idx = 0; idx < p->experts_per_token; ++idx) {
-        int e_global = topk_i[idx];
+        int e_global = topk_i_b[idx];
         if (e_global >= expert_start && e_global < expert_end) {
-          local_ids[n_local] = e_global - expert_start;  // local index
-          local_wts[n_local] = topk_v[idx];
+          local_ids[n_local] = e_global - expert_start;
+          local_wts[n_local] = topk_v_b[idx];
           ++n_local;
         }
       }
+
       if (n_local > 0) {
-        // base pointer của layer hiện tại
         __hip_bfloat16 *w1_base =
             curr_dev_w->w_mlp1 +
             1ll * l * experts_per_device * 2 * p->intermediate_dim * hidden_dim;
@@ -1041,11 +1113,10 @@ float *getp_forward(Transformer */*transformer*/,
             1ll * l * experts_per_device * 2 * p->intermediate_dim;
 
         int4 ids = {local_ids[0], local_ids[1], local_ids[2], local_ids[3]};
-        // gate_up_all buffer: [n_local, intermediate_dim]
-        getp_mlp1_swiglu_bf16_batch(curr_dev_s->gate_up, curr_dev_s->t + b * hidden_dim, w1_base,
-                                    b1_base, hidden_dim, p->intermediate_dim,
-                                    experts_per_device, ids, n_local,
-                                    p->swiglu_limit);
+        getp_mlp1_swiglu_bf16_batch(
+            curr_dev_s->gate_up, curr_dev_s->t + b * hidden_dim, w1_base,
+            b1_base, hidden_dim, p->intermediate_dim, experts_per_device, ids,
+            n_local, p->swiglu_limit);
 
         __hip_bfloat16 *w2_layer_base =
             curr_dev_w->w_mlp2 +
@@ -1058,12 +1129,13 @@ float *getp_forward(Transformer */*transformer*/,
         if (n_local > 2) wpack.z = local_wts[2];
         if (n_local > 3) wpack.w = local_wts[3];
 
-        getp_mlp2_accum_bf16_batch(curr_dev_s->e_agg + b * hidden_dim, curr_dev_s->gate_up,
-                                    w2_layer_base, b2_layer_base,
-                                    experts_per_device, ids, n_local, wpack,
-                                    p->intermediate_dim, hidden_dim);
+        getp_mlp2_accum_bf16_batch(
+            curr_dev_s->e_agg + b * hidden_dim, curr_dev_s->gate_up,
+            w2_layer_base, b2_layer_base, experts_per_device, ids, n_local,
+            wpack, p->intermediate_dim, hidden_dim);
       }
     }
+
     getp_vecadd(dev_x, dev_s->e_agg, hidden_dim, BATCH_SIZE);
   }
 
@@ -1075,11 +1147,13 @@ float *getp_forward(Transformer */*transformer*/,
 
   getp_rmsnorm(dev_x, dev_x, dev_w->rms_out_w, BATCH_SIZE, hidden_dim);
   getp_matmul<__hip_bfloat16>(dev_s->logits, dev_x, dev_w->out_bf16,
-                              (__hip_bfloat16 *)NULL, hidden_dim,
-                              p->vocab_size, BATCH_SIZE);
-  float *logits_result = reinterpret_cast<float *>(malloc(sizeof(float) * BATCH_SIZE * p->vocab_size));
-  HIP_CHECK(hipMemcpy(logits_result, dev_s->logits, sizeof(float) * BATCH_SIZE * p->vocab_size,
+                              (__hip_bfloat16 *)NULL, hidden_dim, p->vocab_size,
+                              BATCH_SIZE);
+  float *logits_result = reinterpret_cast<float *>(
+      malloc(sizeof(float) * BATCH_SIZE * p->vocab_size));
+  HIP_CHECK(hipMemcpy(logits_result, dev_s->logits,
+                      sizeof(float) * BATCH_SIZE * p->vocab_size,
                       hipMemcpyDeviceToHost));
-  // HIP_CHECK(hipDeviceSynchronize());
+  //HIP_CHECK(hipDeviceSynchronize());
   return logits_result;
 }
