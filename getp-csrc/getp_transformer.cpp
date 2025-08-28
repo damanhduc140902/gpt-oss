@@ -186,32 +186,24 @@ static void upload_weights(TransformerWeights *w,
 
 void init_device_run_state(RunState *s, Config *p) {
   int kv_dim = p->head_dim * p->n_kv_heads;
-  HIP_CHECK(hipMalloc(&s->x, p->hidden_dim * sizeof(float)));
-  HIP_CHECK(hipMalloc(&s->t, p->hidden_dim * sizeof(float)));
-  HIP_CHECK(hipMalloc(&s->tb, p->head_dim * p->n_attn_heads * sizeof(float)));
-  HIP_CHECK(hipMalloc(&s->tb2, p->hidden_dim * sizeof(float)));
-  HIP_CHECK(hipMalloc(&s->router_score, p->n_experts * sizeof(float)));
-  HIP_CHECK(hipMalloc(&s->topk_v, p->experts_per_token * sizeof(float)));
-  HIP_CHECK(hipMalloc(&s->topk_i, p->experts_per_token * sizeof(int)));
-  HIP_CHECK(hipMalloc(&s->mlp1_out, 2 * p->intermediate_dim * sizeof(float)));
-  HIP_CHECK(hipMalloc(&s->gate, p->intermediate_dim * sizeof(float)));
-  HIP_CHECK(hipMalloc(&s->up, p->intermediate_dim * sizeof(float)));
-  // HIP_CHECK(hipMalloc(&s->gate_up, p->intermediate_dim * sizeof(float)));
-  HIP_CHECK(hipMalloc(&s->gate_up,
-    p->experts_per_token * p->intermediate_dim * sizeof(float)));
-  HIP_CHECK(hipMalloc(&s->e_agg, p->hidden_dim * sizeof(float)));
-  HIP_CHECK(hipMalloc(
-      &s->qkv,
-      p->head_dim * (p->n_attn_heads + 2 * p->n_kv_heads) * sizeof(float)));
-  HIP_CHECK(hipMalloc(&s->q, p->n_attn_heads * p->head_dim * sizeof(float)));
-  HIP_CHECK(hipMalloc(&s->key_cache,
-                      p->n_layers * p->seq_len * kv_dim * sizeof(float)));
-  HIP_CHECK(hipMalloc(&s->value_cache,
-                      p->n_layers * p->seq_len * kv_dim * sizeof(float)));
-  HIP_CHECK(
-      hipMalloc(&s->att, p->n_attn_heads * (p->seq_len + 1) * sizeof(float)));
-  HIP_CHECK(hipMalloc(&s->logits, p->vocab_size * sizeof(float)));
-  
+  HIP_CHECK(hipMalloc(&s->x, BATCH_SIZE * p->hidden_dim * sizeof(float))); // (batch, hidden_dim)
+  HIP_CHECK(hipMalloc(&s->t, BATCH_SIZE * p->hidden_dim * sizeof(float))); // (batch, hidden_dim)
+  HIP_CHECK(hipMalloc(&s->tb, BATCH_SIZE * p->head_dim * p->n_attn_heads * sizeof(float))); // (batch, n_attn_heads, head_dim)
+  HIP_CHECK(hipMalloc(&s->tb2, BATCH_SIZE * p->hidden_dim * sizeof(float)));  // (batch, hidden_dim)
+  HIP_CHECK(hipMalloc(&s->router_score, BATCH_SIZE * p->n_experts * sizeof(float))); // (batch, n_experts)
+  HIP_CHECK(hipMalloc(&s->topk_v, BATCH_SIZE * p->experts_per_token * sizeof(float))); // (batch, experts_per_token)
+  HIP_CHECK(hipMalloc(&s->topk_i, BATCH_SIZE * p->experts_per_token * sizeof(int))); // (batch, experts_per_token)
+  HIP_CHECK(hipMalloc(&s->mlp1_out, 2 * p->intermediate_dim * sizeof(float))); // no used?
+  HIP_CHECK(hipMalloc(&s->gate, p->intermediate_dim * sizeof(float)));  // no used?
+  HIP_CHECK(hipMalloc(&s->up, p->intermediate_dim * sizeof(float))); // no used?
+  HIP_CHECK(hipMalloc(&s->gate_up, BATCH_SIZE * p->experts_per_token * p->intermediate_dim * sizeof(float)));
+  HIP_CHECK(hipMalloc(&s->e_agg, BATCH_SIZE * p->hidden_dim * sizeof(float))); // (batch, hidden_dim)
+  HIP_CHECK(hipMalloc(&s->qkv, p->head_dim * (p->n_attn_heads + 2 * p->n_kv_heads) * sizeof(float))); // no used
+  HIP_CHECK(hipMalloc(&s->q, BATCH_SIZE * p->n_attn_heads * p->head_dim * sizeof(float))); // (batch, n_attn_heads, head_dim)
+  HIP_CHECK(hipMalloc(&s->key_cache, BATCH_SIZE * p->n_layers * p->seq_len * kv_dim * sizeof(float))); // (layer, seq_len, batch, n_kv_heads, head_dim)
+  HIP_CHECK(hipMalloc(&s->value_cache, BATCH_SIZE * p->n_layers * p->seq_len * kv_dim * sizeof(float))); // (layer, seq_len, batch, n_kv_heads, head_dim)
+  HIP_CHECK(hipMalloc(&s->att, BATCH_SIZE * p->n_attn_heads * (p->seq_len + 1) * sizeof(float))); // (batch, n_attn_heads, seq_len + 1)
+  HIP_CHECK(hipMalloc(&s->logits, BATCH_SIZE * p->vocab_size * sizeof(float))); // (batch, vocab)
   if (p->sliding_window > 0) {
     HIP_CHECK(hipMalloc(&s->mask, p->seq_len * p->seq_len * sizeof(float)));
     dim3 blockDim(32, 32);
