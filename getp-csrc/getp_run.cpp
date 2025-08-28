@@ -264,6 +264,7 @@ long long inference(Transformer *transformer, Tokenizer *tokenizer,
     workers[i].request_start = i * num_reqs_per_device;
     workers[i].request_end = (i + 1) * num_reqs_per_device;
     if (i == n_devices - 1) workers[i].request_end = requests->num_reqs;
+    assert((workers[i].request_end - workers[i].request_start) % BATCH_SIZE == 0);
   }
   
   std::vector<long long> nums_token_out(n_devices);
