@@ -728,7 +728,7 @@ __global__ void multihead_attention_kernel(float *key_cache, float *value_cache,
   const float *q = query + bid * n_attn_heads * head_dim + h * head_dim;
   const float *k = key_cache + t * batch_size * kv_dim + bid * kv_dim + (h / kv_mul) * head_dim;
   float score = 0;
-  for (int i = 0; i < head_dim; ++i) score += smem[i] * k[i];
+  for (int i = 0; i < head_dim; ++i) score += q[i] * k[i];
   score = score / sqrtf((float)head_dim);
   if (apply_mask && t <= pos) score += mask[pos * mask_lda + t];
   attn[h * att_lda + t] = score;
