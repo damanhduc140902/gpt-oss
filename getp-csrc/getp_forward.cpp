@@ -11,6 +11,9 @@
 #include "getp_transformer.cpp"
 #include "getp_transformer.hpp"
 #include "profiler.hpp"
+
+
+
 #ifndef GEMV_TILE_N
 #define GEMV_TILE_N 512
 #endif
@@ -60,7 +63,7 @@ void getp_rmsnorm(float *o, float *x, float *weight, int batch_size, int dim) {
   dim3 gridDim(1, batch_size);
   rmsnorm_kernel<<<gridDim, blockDim, sizeof(float) * (blockDim.x + 1)>>>(
       o, x, weight, dim);
-  // HIP_CHECK(hipDeviceSynchronize());
+  HIP_CHECK(hipDeviceSynchronize());
 }
 
 // Warp reduce sum (HIP wavefront = 64)
@@ -101,7 +104,7 @@ __global__ void gemv_qkv_bf16_vec(float *__restrict__ q_out,
   float partial_total = 0.f;
 
   for (int tile = 0; tile < n; tile += TILE_N) {
-    const int tile_len = min(TILE_N, n - tile);
+    const int tile_len = MIN(TILE_N, n - tile);
 
     // x -> shared, vector 16B
     for (int t = warp * warpSize * 4 + lane * 4; t < tile_len;
@@ -203,7 +206,7 @@ static inline void getp_matmul_qkv_fused_bf16(
   size_t shmem = TILE * sizeof(float);
   gemv_qkv_bf16_vec<TILE, WARPS><<<grid, block, shmem>>>(
       q, k, v, x, w_qkv_bf16, b_qkv_bf16, n, q_len, k_len, v_len);
-  // HIP_CHECK(hipDeviceSynchronize());
+  HIP_CHECK(hipDeviceSynchronize());
 }
 
 template <int TILE_N, int WARPS_PER_BLOCK>
@@ -224,7 +227,7 @@ __global__ void gemv_bf16_vec_v2(float *__restrict__ y,
   float partial_total = 0.f;
 
   for (int tile = 0; tile < n; tile += TILE_N) {
-    const int tile_len = min(TILE_N, n - tile);
+    const int tile_len = MIN(TILE_N, n - tile);
 
     // x -> shared (vector 16B)
     for (int t = warp * warpSize * 4 + lane * 4; t < tile_len;
@@ -307,7 +310,7 @@ void getp_matmul(float *xout, float *x, T *w, T *b, int n, int d,
   gemv_bf16_vec_v2<TILE_N, WARPS><<<grid, block, shmem>>>(
       xout, x, (const __hip_bfloat16 *)w, (const __hip_bfloat16 *)b, n, d);
 
-  // HIP_CHECK(hipDeviceSynchronize());
+  HIP_CHECK(hipDeviceSynchronize());
 }
 
 __global__ void compute_inv_freq_kernel(float base, int head_dim,
@@ -373,7 +376,7 @@ void getp_compute_cos_sin(int pos, float base, int head_dim,
         cos_out, sin_out, inv_freq, concentration, pos, head_dim / 2);
   }
   HIP_CHECK(hipFree(inv_freq));
-  // HIP_CHECK(hipDeviceSynchronize());
+  HIP_CHECK(hipDeviceSynchronize());
 }
 
 __global__ void apply_rotary_emb_kernel(float *x, float *cos, float *sin,
@@ -402,157 +405,7 @@ void getp_apply_rotary_emb(float *x, float *cos, float *sin, int n_heads,
                (n_heads + blockDim.y - 1) / blockDim.y, batch_size);
   apply_rotary_emb_kernel<<<gridDim, blockDim>>>(x, cos, sin, n_heads,
                                                  head_dim);
-  // HIP_CHECK(hipDeviceSynchronize());
-}
-
-__global__ void multihead_attention_kernel(float *key_cache, float *value_cache,
-                                           float *query, float *mask,
-                                           float *attn_sinks, float *attn,
-                                           int l, int head_dim,
-                                           int n_attn_heads, int n_kv_heads,
-                                           int pos, int att_lda, int mask_lda,
-                                           int apply_mask, int batch_size) {
-  int h = blockDim.y * blockIdx.y + threadIdx.y;
-  int t = blockDim.x * blockIdx.x + threadIdx.x;
-  int bid = blockIdx.z;  // batch index
-  attn += bid * n_attn_heads * att_lda;
-  if (h >= n_attn_heads || t > pos + 1) return;
-  if (t == pos + 1) {
-    if (t < att_lda) attn[h * att_lda + t] = attn_sinks[l * n_attn_heads + h];
-    return;
-  }
-  const int kv_dim = head_dim * n_kv_heads;
-  const int kv_mul = n_attn_heads / n_kv_heads;
-  const float *q = query + bid * n_attn_heads * head_dim + h * head_dim;
-  const float *k = key_cache + t * batch_size * kv_dim + bid * kv_dim +
-                   (h / kv_mul) * head_dim;
-  float score = 0;
-  for (int i = 0; i < head_dim; ++i) score += q[i] * k[i];
-  score = score / sqrtf((float)head_dim);
-  if (apply_mask && t <= pos) score += mask[pos * mask_lda + t];
-  attn[h * att_lda + t] = score;
-}
-void getp_multihead_attention(float *key_cache, float *value_cache,
-                              float *query, float *mask, float *attn_sinks,
-                              float *attn, int l, int head_dim,
-                              int n_attn_heads, int n_kv_heads, int pos,
-                              int att_lda, int mask_lda, int sliding_window,
-                              int batch_size) {
-  PROFILE_FUNCTION();
-  int apply_mask = (sliding_window > 0 && (l % 2 == 0) ? 1 : 0);
-  dim3 blockDim(16, 16);
-  dim3 gridDim((pos + 2 + blockDim.x - 1) / blockDim.x,
-               (n_attn_heads + blockDim.y - 1) / blockDim.y, batch_size);
-  multihead_attention_kernel<<<gridDim, blockDim>>>(
-      key_cache, value_cache, query, mask, attn_sinks, attn, l, head_dim,
-      n_attn_heads, n_kv_heads, pos, att_lda, mask_lda, apply_mask, batch_size);
-  // HIP_CHECK(hipDeviceSynchronize());
-}
-
-template <int TILE_T = 128>
-__global__ void weighted_sum_tiled_kernel(float *__restrict__ tb,
-                                          const float *__restrict__ value_cache,
-                                          const float *__restrict__ att,
-                                          int seq_len, int n_attn_heads,
-                                          int n_kv_heads, int pos, int head_dim,
-                                          int batch_size) {
-  const int h = blockIdx.y;
-  const int i0 = blockIdx.x * blockDim.x;
-  const int i = i0 + threadIdx.x;
-  const int b = blockIdx.z;  // batch
-  att += b * n_attn_heads * seq_len;
-  tb += b * n_attn_heads * head_dim;
-  if (h >= n_attn_heads) return;
-  extern __shared__ float s_att[];
-  const int kv_dim = head_dim * n_kv_heads;
-  const int kv_mul = n_attn_heads / n_kv_heads;
-  const int kv_h = h / kv_mul;
-  float acc = 0.f;
-  for (int t0 = 0; t0 <= pos; t0 += TILE_T) {
-    const int tlen = min(TILE_T, pos - t0 + 1);
-    for (int tt = threadIdx.x; tt < tlen; tt += blockDim.x)
-      s_att[tt] = att[h * seq_len + (t0 + tt)];
-    __syncthreads();
-    if (i < head_dim) {
-      const float *vptr = value_cache + (size_t)t0 * batch_size * kv_dim +
-                          b * kv_dim + kv_h * head_dim + i;
-      for (int tt = 0; tt < tlen; ++tt) {
-        acc += s_att[tt] * (*vptr);
-        vptr += batch_size * kv_dim;
-      }
-    }
-    __syncthreads();
-  }
-  if (i < head_dim) tb[h * head_dim + i] = acc;
-}
-
-void getp_weighted_sum(float *tb, float *value_cache, float *att, int seq_len,
-                       int n_attn_heads, int n_kv_heads, int pos, int head_dim,
-                       int batch_size) {
-  PROFILE_FUNCTION();
-  const int BLK_X = 32;
-  dim3 block(BLK_X);
-  dim3 grid((head_dim + BLK_X - 1) / BLK_X, n_attn_heads, batch_size);
-  const size_t shmem = (size_t)MIN(128, pos + 1) * sizeof(float);
-  weighted_sum_tiled_kernel<128>
-      <<<grid, block, shmem>>>(tb, value_cache, att, seq_len, n_attn_heads,
-                               n_kv_heads, pos, head_dim, batch_size);
-  // HIP_CHECK(hipDeviceSynchronize());
-}
-
-__global__ void softmax_kernel(float *A, int M, int N, int lda) {
-  extern __shared__ float smem[];
-  float *max_ptr = &smem[blockDim.x];
-  float *sum_ptr = &smem[blockDim.x + 1];
-  // blockIdx.y equal to batch index
-  // shift to the corresponding batch
-  A += blockIdx.y * M * lda + blockIdx.x * lda;
-  int tid = threadIdx.x;
-  smem[tid] = -INFINITY;
-  for (int offset = 0; offset < N; offset += blockDim.x) {
-    if (tid + offset < N) {
-      float t = A[tid + offset];
-      if (t > smem[tid]) smem[tid] = t;
-    }
-  }
-  __syncthreads();
-  for (int stride = blockDim.x / 2; stride > 0; stride /= 2) {
-    if (tid < stride) {
-      float t = smem[tid + stride];
-      if (t > smem[tid]) smem[tid] = t;
-    }
-    __syncthreads();
-  }
-  if (tid == 0) *max_ptr = smem[0];
-  __syncthreads();
-  float max_val = *max_ptr;
-  smem[tid] = 0;
-  for (int offset = 0; offset < N; offset += blockDim.x) {
-    if (tid + offset < N) smem[tid] += expf(A[tid + offset] - max_val);
-  }
-  __syncthreads();
-  for (int stride = blockDim.x / 2; stride > 0; stride /= 2) {
-    if (tid < stride) smem[tid] += smem[tid + stride];
-    __syncthreads();
-  }
-  if (tid == 0) *sum_ptr = smem[0];
-  __syncthreads();
-  float sum = *sum_ptr;
-  for (int offset = 0; offset < N; offset += blockDim.x) {
-    if (tid + offset < N) {
-      float x = A[tid + offset];
-      x = expf(x - max_val) / sum;
-      A[tid + offset] = x;
-    }
-  }
-}
-void getp_softmax(float *A, int M, int N, int lda, int batch_size) {
-  PROFILE_FUNCTION();
-  dim3 blockDim(1024);
-  dim3 gridDim(M, batch_size);
-  softmax_kernel<<<gridDim, blockDim, sizeof(float) * (blockDim.x + 2)>>>(
-      A, M, N, lda);
-  // HIP_CHECK(hipDeviceSynchronize());
+  HIP_CHECK(hipDeviceSynchronize());
 }
 
 #ifndef GETP_ROUTER_TOPK_MAXK
@@ -644,7 +497,7 @@ static inline void getp_router_topk_softmax_batch(
                        GETP_ROUTER_TOPK_MAXK * (sizeof(float) + sizeof(int));
   router_topk_softmax_batch_kernel<<<grid, block, shmem>>>(
       router_score, n_experts, experts_per_token, topk_v_out, topk_i_out);
-  // HIP_CHECK(hipDeviceSynchronize());
+  HIP_CHECK(hipDeviceSynchronize());
 }
 
 __global__ void map_global_to_local_batch_kernel(
@@ -681,7 +534,7 @@ static inline void getp_map_global_to_local_batch(
   map_global_to_local_batch_kernel<<<GRD, BLK>>>(topk_i, topk_v, local_ids,
                                                  local_wts, n_local, K,
                                                  expert_start, expert_end, B);
-  // HIP_CHECK(hipDeviceSynchronize());
+  HIP_CHECK(hipDeviceSynchronize());
 }
 
 template <int TILE_N, int WARPS_PER_BLOCK, int MAX_E = 4>
@@ -701,7 +554,7 @@ __global__ void mlp1_swiglu_bf16_kernel_batch_gridy(
   const int b = blockIdx.y;
   if (j >= I) return;
 
-  const int nact = min(n_local[b], K);
+  const int nact = MIN(n_local[b], K);
   const int ids0 = local_ids[b * K + 0], ids1 = local_ids[b * K + 1];
   const int ids2 = local_ids[b * K + 2], ids3 = local_ids[b * K + 3];
 
@@ -710,7 +563,7 @@ __global__ void mlp1_swiglu_bf16_kernel_batch_gridy(
 
   const float *xb = x + (size_t)b * H;
   for (int tile = 0; tile < H; tile += TILE_N) {
-    const int tlen = min(TILE_N, H - tile);
+    const int tlen = MIN(TILE_N, H - tile);
     for (int t = warp * warpSize * 4 + lane * 4; t < tlen;
          t += WARPS_PER_BLOCK * warpSize * 4) {
       if (t + 3 < tlen)
@@ -841,7 +694,7 @@ static inline void getp_mlp1_swiglu_bf16_batch_gridy(
   mlp1_swiglu_bf16_kernel_batch_gridy<TILE, WARPS>
       <<<grid, block, shmem>>>(gate_up_all, x, w1_layer_base, b1_layer_base, H,
                                I, E_dev, local_ids, n_local, K, swiglu_limit);
-  // HIP_CHECK(hipDeviceSynchronize());
+  HIP_CHECK(hipDeviceSynchronize());
 }
 
 template <int TILE_N, int WARPS_PER_BLOCK, int MAX_E = 4>
@@ -861,7 +714,7 @@ __global__ void mlp2_accum_bf16_kernel_batch_gridy(
   const int b = blockIdx.y;
   if (row >= H) return;
 
-  const int nact = min(n_local[b], K);
+  const int nact = MIN(n_local[b], K);
   const int ids0 = local_ids[b * K + 0], ids1 = local_ids[b * K + 1];
   const int ids2 = local_ids[b * K + 2], ids3 = local_ids[b * K + 3];
   const float wt0 = local_wts[b * K + 0], wt1 = local_wts[b * K + 1];
@@ -871,7 +724,7 @@ __global__ void mlp2_accum_bf16_kernel_batch_gridy(
   const float *gub = gate_up_all + (size_t)b * (size_t)K * (size_t)I;
 
   for (int tile = 0; tile < I; tile += TILE_N) {
-    const int tlen = min(TILE_N, I - tile);
+    const int tlen = MIN(TILE_N, I - tile);
 #pragma unroll
     for (int ee = 0; ee < MAX_E; ++ee) {
       if (ee >= nact) break;
@@ -980,7 +833,7 @@ static inline void getp_mlp2_accum_bf16_batch_gridy(
   mlp2_accum_bf16_kernel_batch_gridy<TILE, WARPS>
       <<<grid, block, shmem>>>(e_agg, gate_up_all, w2_layer_base, b2_layer_base,
                                local_wts, local_ids, n_local, K, I, H);
-  // HIP_CHECK(hipDeviceSynchronize());
+  HIP_CHECK(hipDeviceSynchronize());
 }
 
 __global__ void vecadd_kernel(float *x, float *y, int size) {
@@ -997,7 +850,128 @@ void getp_vecadd(float *x, float *y, int size, int batch_size) {
   dim3 blockDim(1024);
   dim3 gridDim((size + blockDim.x - 1) / blockDim.x, batch_size);
   vecadd_kernel<<<gridDim, blockDim>>>(x, y, size);
-  // HIP_CHECK(hipDeviceSynchronize());
+  HIP_CHECK(hipDeviceSynchronize());
+}
+
+
+
+
+
+
+
+__global__ void flash_attn_decode_kernel(
+    float* __restrict__ tb,
+    const float* __restrict__ key_cache,
+    const float* __restrict__ value_cache,
+    const float* __restrict__ q,
+    const float* __restrict__ attn_sinks,
+    int head_dim, int n_attn_heads, int n_kv_heads,
+    int pos, int seq_len, int sliding_window, int apply_mask,
+    int batch_size, int kv_dim, int kv_mul, float inv_sqrt_d)
+{
+  const int h = blockIdx.x;
+  const int b = blockIdx.y;
+  const int i = threadIdx.x;
+
+  // ⬇️ đưa shared memory ra đây
+  __shared__ float sbuf[2]; // sbuf[0]=score/e; sbuf[1]=alpha/l
+
+  // Pointers
+  const float* qbh = q  + (size_t)b * n_attn_heads * head_dim + (size_t)h * head_dim;
+  float*       obh = tb + (size_t)b * n_attn_heads * head_dim + (size_t)h * head_dim;
+
+  const int kv_h = h / kv_mul;
+
+  float qi = (i < head_dim) ? qbh[i] : 0.0f;
+  float out_i = 0.0f;
+
+  float m = -INFINITY;
+  float l = 0.0f;
+
+  int t_start = 0;
+  if (apply_mask && sliding_window > 0) {
+    t_start = MAX(0, pos - sliding_window + 1);
+  }
+
+  for (int t = t_start; t <= pos; ++t) {
+    float k_i = 0.f;
+    if (i < head_dim) {
+      const float* kptr = key_cache +
+          (size_t)t * batch_size * kv_dim + (size_t)b * kv_dim +
+          (size_t)kv_h * head_dim + i;
+      k_i = *kptr;
+    }
+    float part = qi * k_i;
+    float sum = warp_sum_f32(part);
+
+    if (threadIdx.x == 0) {
+      float s = sum * inv_sqrt_d;
+      if (apply_mask && sliding_window > 0) {
+        if ((pos - t) >= sliding_window) s = -INFINITY;
+      }
+      float m_new = fmaxf(m, s);
+      float alpha = __expf(m - m_new);
+      float e = __expf(s - m_new);
+      l = l * alpha + e;
+      m = m_new;
+      sbuf[0] = e;
+      sbuf[1] = alpha;
+    }
+    __syncthreads();
+
+    float e = sbuf[0];
+    float alpha = sbuf[1];
+
+    if (i < head_dim) {
+      const float* vptr = value_cache +
+          (size_t)t * batch_size * kv_dim + (size_t)b * kv_dim +
+          (size_t)kv_h * head_dim + i;
+      out_i = alpha * out_i + e * (*vptr);
+    }
+    __syncthreads();
+  }
+
+  // Attention sink
+  if (threadIdx.x == 0) {
+    float s_sink = attn_sinks[h];
+    float m_new = fmaxf(m, s_sink);
+    float alpha = __expf(m - m_new);
+    float e = __expf(s_sink - m_new);
+    l = l * alpha + e;
+    m = m_new;
+    sbuf[0] = alpha;
+    sbuf[1] = l;
+  }
+  __syncthreads();
+
+  float alpha_sink = sbuf[0];
+  float l_final = sbuf[1];
+
+  if (i < head_dim) {
+    out_i = (alpha_sink * out_i) / l_final;
+    obh[i] = out_i;
+  }
+}
+static inline void getp_flash_attn_decode(
+    float* tb, const float* key_cache_layer, const float* value_cache_layer,
+    const float* q, const float* attn_sinks_layer, // attn_sinks + l*n_heads
+    int head_dim, int n_attn_heads, int n_kv_heads,
+    int pos, int seq_len, int sliding_window, int layer_id, int batch_size)
+{
+  PROFILE_FUNCTION();
+  const int kv_dim  = head_dim * n_kv_heads;
+  const int kv_mul  = n_attn_heads / n_kv_heads;
+  const float inv_sqrt_d = 1.0f / sqrtf((float)head_dim);
+  const int apply_mask = (sliding_window > 0 && ((layer_id & 1) == 0)) ? 1 : 0;
+
+  dim3 block(64); // 1 wavefront; head_dim ~45 => đủ, dư thread tự bỏ qua
+  dim3 grid(n_attn_heads, batch_size);
+  flash_attn_decode_kernel<<<grid, block>>>(
+      tb, key_cache_layer, value_cache_layer, q, attn_sinks_layer,
+      head_dim, n_attn_heads, n_kv_heads, pos, seq_len,
+      sliding_window, apply_mask, batch_size,
+      kv_dim, kv_mul, inv_sqrt_d);
+  HIP_CHECK(hipDeviceSynchronize());
 }
 
 float *getp_forward(Transformer * /*transformer*/,
@@ -1016,8 +990,8 @@ float *getp_forward(Transformer * /*transformer*/,
   int head_dim = p->head_dim;
   int hidden_dim = p->hidden_dim;
   int kv_dim = p->head_dim * p->n_kv_heads;
-  int kv_mul = p->n_attn_heads / p->n_kv_heads;
-  int intermediate_dim = p->intermediate_dim;
+  // int kv_mul = p->n_attn_heads / p->n_kv_heads;
+  // int intermediate_dim = p->intermediate_dim;
   int n_experts = p->n_experts;
 
   HIP_CHECK(hipSetDevice(device_index));
@@ -1061,18 +1035,23 @@ float *getp_forward(Transformer * /*transformer*/,
     getp_apply_rotary_emb(dev_s->k, dev_cos_vals, dev_sin_vals, p->n_kv_heads,
                           head_dim, BATCH_SIZE);
 
-    int att_lda = p->seq_len + 1;
-    int mask_lda = p->seq_len;
-    getp_multihead_attention(dev_s->key_cache + loff, dev_s->value_cache + loff,
-                             dev_s->q, dev_s->mask, dev_w->attn_sinks,
-                             dev_s->att, l, head_dim, p->n_attn_heads,
-                             p->n_kv_heads, pos, att_lda, mask_lda,
-                             p->sliding_window, BATCH_SIZE);
-    int Nsoft = MIN(pos + 2, att_lda);
-    getp_softmax(dev_s->att, p->n_attn_heads, Nsoft, att_lda, BATCH_SIZE);
-    getp_weighted_sum(dev_s->tb, dev_s->value_cache + loff, dev_s->att, att_lda,
-                      p->n_attn_heads, p->n_kv_heads, pos, head_dim,
-                      BATCH_SIZE);
+    {
+      // int att_lda   = p->seq_len + 1; // không dùng nữa, giữ để dễ so diff
+      int loff      = l * p->seq_len * BATCH_SIZE * (p->head_dim * p->n_kv_heads);
+      float* k_layer = dev_s->key_cache   + loff;
+      float* v_layer = dev_s->value_cache + loff;
+      float* q_ptr   = dev_s->q;
+      const float* attn_sinks_layer = dev_w->attn_sinks + (size_t)l * p->n_attn_heads;
+    
+      getp_flash_attn_decode(
+          dev_s->tb,           // out: [B, n_heads, head_dim]
+          k_layer, v_layer,    // caches của layer l
+          q_ptr,               // [B, n_heads, head_dim]
+          attn_sinks_layer,    // [n_heads] của layer l
+          head_dim, p->n_attn_heads, p->n_kv_heads,
+          pos, p->seq_len, p->sliding_window, (int)l, BATCH_SIZE);
+    }
+    
 
     __hip_bfloat16 *dev_w_o =
         dev_w->w_o_bf16 + 1ll * l * (head_dim * p->n_attn_heads) * hidden_dim;
@@ -1152,6 +1131,6 @@ float *getp_forward(Transformer * /*transformer*/,
   HIP_CHECK(hipMemcpy(logits_result, dev_s->logits,
                       sizeof(float) * BATCH_SIZE * p->vocab_size,
                       hipMemcpyDeviceToHost));
-  // HIP_CHECK(hipDeviceSynchronize());
+  HIP_CHECK(hipDeviceSynchronize());
   return logits_result;
 }
