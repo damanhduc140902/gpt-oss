@@ -352,29 +352,26 @@ __global__ void compute_cos_sin_kernel(float *cos_out, float *sin_out,
 }
 void getp_compute_cos_sin(int pos, float base, int head_dim,
                           float scaling_factor, float initial_context_length,
-                          float ntk_beta, float ntk_alpha, float *cos_out,
-                          float *sin_out) {
+                          float ntk_beta, float ntk_alpha,
+                          float *cos_out, float *sin_out,
+                          float *inv_freq) {
   PROFILE_FUNCTION();
   int d_half = head_dim / 2;
   float concentration =
       scaling_factor > 1.0f ? 0.1f * logf(scaling_factor) + 1.0f : 1.0f;
-  float *inv_freq;
-  HIP_CHECK(hipMalloc(&inv_freq, d_half * sizeof(float)));
   {
     dim3 blockDim(256);
     dim3 gridDim((head_dim / 2 + blockDim.x - 1) / blockDim.x);
     compute_inv_freq_kernel<<<gridDim, blockDim>>>(
-        base, head_dim, scaling_factor, initial_context_length, ntk_beta,
-        ntk_alpha, inv_freq);
+        base, head_dim, scaling_factor, initial_context_length,
+        ntk_beta, ntk_alpha, inv_freq);
   }
   {
     dim3 blockDim(256);
     dim3 gridDim((head_dim / 2 + blockDim.x - 1) / blockDim.x);
     compute_cos_sin_kernel<<<gridDim, blockDim>>>(
-        cos_out, sin_out, inv_freq, concentration, pos, head_dim / 2);
+        cos_out, sin_out, inv_freq, concentration, pos, d_half);
   }
-  HIP_CHECK(hipFree(inv_freq));
-  //HIP_CHECK(hipDeviceSynchronize());
 }
 
 __global__ void apply_rotary_emb_kernel(float *x, float *cos, float *sin,
@@ -958,9 +955,57 @@ static inline void getp_flash_attn_decode(
   //HIP_CHECK(hipDeviceSynchronize());
 }
 
-float *getp_forward(Transformer * /*transformer*/,
-                    DeviceTransformer **dev_transformeres, GPUWorker *worker,
-                    int token[], int pos) {
+__global__ void gather_embedding_kernel(
+    float* __restrict__ x,
+    const float* __restrict__ table,
+    const int* __restrict__ tok,
+    int H) {
+  int b = blockIdx.x;
+  int tid = threadIdx.x;
+  int id = tok[b];
+  const float* src = table + (size_t)id * H;
+  float* dst = x + (size_t)b * H;
+  for (int j = tid; j < H; j += blockDim.x) dst[j] = src[j];
+}
+static inline void getp_gather_embedding(
+    float* x, const float* table, const int* tok, int H, int B) {
+  dim3 block(256), grid(B);
+  gather_embedding_kernel<<<grid, block>>>(x, table, tok, H);
+}
+
+__global__ void argmax_rows_kernel(
+    const float* __restrict__ logits, int V, int* __restrict__ out) {
+  __shared__ float smax[1024];
+  __shared__ int   sidx[1024];
+  int b = blockIdx.x;
+  int tid = threadIdx.x;
+  const float* row = logits + (size_t)b * V;
+  float mv = -INFINITY; int mi = 0;
+  for (int i = tid; i < V; i += blockDim.x) {
+    float v = row[i];
+    if (v > mv) { mv = v; mi = i; }
+  }
+  smax[tid] = mv; sidx[tid] = mi; __syncthreads();
+  for (int s = blockDim.x >> 1; s > 0; s >>= 1) {
+    if (tid < s) {
+      if (smax[tid + s] > smax[tid]) {
+        smax[tid] = smax[tid + s];
+        sidx[tid] = sidx[tid + s];
+      }
+    }
+    __syncthreads();
+  }
+  if (tid == 0) out[b] = sidx[0];
+}
+static inline void getp_argmax_rows(
+    const float* logits, int V, int* out, int B) {
+  dim3 grid(B), block(1024);
+  argmax_rows_kernel<<<grid, block>>>(logits, V, out);
+}
+
+int *getp_forward(Transformer * /*transformer*/,
+                  DeviceTransformer **dev_transformeres, GPUWorker *worker,
+                  int token[], int pos) {
   PROFILE_FUNCTION();
 
   int device_index = worker->device_index;
@@ -978,25 +1023,23 @@ float *getp_forward(Transformer * /*transformer*/,
 
   HIP_CHECK(hipSetDevice(device_index));
 
-  for (int b = 0; b < BATCH_SIZE; ++b) {
-    assert(token[b] < p->vocab_size);
-    float *content_row =
-        dev_w->token_embedding_table + (size_t)token[b] * hidden_dim;
-    HIP_CHECK(hipMemcpy(dev_x + b * hidden_dim, content_row,
-                        hidden_dim * sizeof(float), hipMemcpyDeviceToDevice));
-  }
+  HIP_CHECK(hipMemcpy(dev_s->topk_i, token, sizeof(int) * BATCH_SIZE,
+                      hipMemcpyHostToDevice));
+  getp_gather_embedding(dev_x, dev_w->token_embedding_table, dev_s->topk_i,
+                        hidden_dim, BATCH_SIZE);
 
-  float *dev_cos_vals, *dev_sin_vals;
-  HIP_CHECK(hipMalloc(&dev_cos_vals, sizeof(float) * (head_dim / 2)));
-  HIP_CHECK(hipMalloc(&dev_sin_vals, sizeof(float) * (head_dim / 2)));
+  float *dev_cos_vals = dev_s->mlp1_out;
+  float *dev_sin_vals = dev_s->gate;
+  float *dev_inv_freq = dev_s->up;
   float ntk_beta = 32.0f, ntk_alpha = 1.0f;
   getp_compute_cos_sin(pos, p->rope_theta, head_dim, p->rope_scaling_factor,
                        p->initial_context_length, ntk_beta, ntk_alpha,
-                       dev_cos_vals, dev_sin_vals);
+                       dev_cos_vals, dev_sin_vals, dev_inv_freq);
 
   for (unsigned long long l = 0; l < p->n_layers; l++) {
     getp_rmsnorm(dev_s->t, dev_x, dev_w->rms_attn_w + 1ll * l * hidden_dim,
                  BATCH_SIZE, hidden_dim);
+
     int loff = l * p->seq_len * BATCH_SIZE * kv_dim;
     dev_s->k = dev_s->key_cache + loff + pos * BATCH_SIZE * kv_dim;
     dev_s->v = dev_s->value_cache + loff + pos * BATCH_SIZE * kv_dim;
@@ -1018,19 +1061,17 @@ float *getp_forward(Transformer * /*transformer*/,
                           head_dim, BATCH_SIZE);
 
     {
-      int loff = l * p->seq_len * BATCH_SIZE * (p->head_dim * p->n_kv_heads);
-      float *k_layer = dev_s->key_cache + loff;
-      float *v_layer = dev_s->value_cache + loff;
+      int loff2 = l * p->seq_len * BATCH_SIZE * (p->head_dim * p->n_kv_heads);
+      float *k_layer = dev_s->key_cache + loff2;
+      float *v_layer = dev_s->value_cache + loff2;
       float *q_ptr = dev_s->q;
       const float *attn_sinks_layer =
           dev_w->attn_sinks + (size_t)l * p->n_attn_heads;
 
-      getp_flash_attn_decode(dev_s->tb,         // out: [B, n_heads, head_dim]
-                             k_layer, v_layer,  // caches của layer l
-                             q_ptr,             // [B, n_heads, head_dim]
-                             attn_sinks_layer,  // [n_heads] của layer l
-                             head_dim, p->n_attn_heads, p->n_kv_heads, pos,
-                             p->seq_len, p->sliding_window, (int)l, BATCH_SIZE);
+      getp_flash_attn_decode(dev_s->tb, k_layer, v_layer, q_ptr,
+                             attn_sinks_layer, head_dim, p->n_attn_heads,
+                             p->n_kv_heads, pos, p->seq_len, p->sliding_window,
+                             (int)l, BATCH_SIZE);
     }
 
     __hip_bfloat16 *dev_w_o =
@@ -1052,24 +1093,20 @@ float *getp_forward(Transformer * /*transformer*/,
                                 dev_b_router, hidden_dim, n_experts,
                                 BATCH_SIZE);
 
-    // A1 đã có: router scores -> topk + softmax trên device cho cả batch
     getp_router_topk_softmax_batch(dev_s->router_score, n_experts,
                                    p->experts_per_token, dev_s->topk_v,
                                    dev_s->topk_i, BATCH_SIZE);
 
-    // A2: map global->local theo batch trên device
     getp_map_global_to_local_batch(dev_s->topk_i, dev_s->topk_v, ext->local_ids,
                                    ext->local_wts, ext->n_local,
                                    p->experts_per_token, worker->expert_start,
                                    worker->expert_end, BATCH_SIZE);
 
-    // A3: zero e_agg cho toàn batch
     HIP_CHECK(hipMemset(dev_s->e_agg, 0,
                         (size_t)BATCH_SIZE * hidden_dim * sizeof(float)));
 
     int experts_per_device = worker->expert_end - worker->expert_start;
 
-    // A3: MLP1 batched (grid.y = B)
     __hip_bfloat16 *w1_base = dev_w->w_mlp1 + 1ll * l * experts_per_device * 2 *
                                                   p->intermediate_dim *
                                                   hidden_dim;
@@ -1077,13 +1114,10 @@ float *getp_forward(Transformer * /*transformer*/,
         dev_w->b_mlp1 + 1ll * l * experts_per_device * 2 * p->intermediate_dim;
 
     getp_mlp1_swiglu_bf16_batch_gridy(
-        dev_s->gate_up,  // [B,K,I]
-        dev_s->t,        // [B,H]
-        w1_base, b1_base, hidden_dim, p->intermediate_dim, experts_per_device,
-        ext->local_ids, ext->n_local, p->experts_per_token, BATCH_SIZE,
-        p->swiglu_limit);
+        dev_s->gate_up, dev_s->t, w1_base, b1_base, hidden_dim,
+        p->intermediate_dim, experts_per_device, ext->local_ids, ext->n_local,
+        p->experts_per_token, BATCH_SIZE, p->swiglu_limit);
 
-    // A3: MLP2 batched (grid.y = B)
     __hip_bfloat16 *w2_base = dev_w->w_mlp2 + 1ll * l * experts_per_device *
                                                   hidden_dim *
                                                   p->intermediate_dim;
@@ -1095,22 +1129,19 @@ float *getp_forward(Transformer * /*transformer*/,
         ext->local_wts, ext->n_local, p->experts_per_token, BATCH_SIZE,
         p->intermediate_dim, hidden_dim);
 
-    // residual add
     getp_vecadd(dev_x, dev_s->e_agg, hidden_dim, BATCH_SIZE);
   }
 
-  HIP_CHECK(hipFree(dev_cos_vals));
-  HIP_CHECK(hipFree(dev_sin_vals));
-
   getp_rmsnorm(dev_x, dev_x, dev_w->rms_out_w, BATCH_SIZE, hidden_dim);
   getp_matmul<__hip_bfloat16>(dev_s->logits, dev_x, dev_w->out_bf16,
-                              (__hip_bfloat16 *)NULL, hidden_dim, p->vocab_size,
-                              BATCH_SIZE);
-  float *logits_result = reinterpret_cast<float *>(
-      malloc(sizeof(float) * BATCH_SIZE * p->vocab_size));
-  HIP_CHECK(hipMemcpy(logits_result, dev_s->logits,
-                      sizeof(float) * BATCH_SIZE * p->vocab_size,
+                              (__hip_bfloat16 *)NULL, hidden_dim,
+                              p->vocab_size, BATCH_SIZE);
+
+  getp_argmax_rows(dev_s->logits, p->vocab_size, dev_s->topk_i, BATCH_SIZE);
+
+  int *next_host = (int *)malloc(sizeof(int) * BATCH_SIZE);
+  HIP_CHECK(hipMemcpy(next_host, dev_s->topk_i, sizeof(int) * BATCH_SIZE,
                       hipMemcpyDeviceToHost));
-  //HIP_CHECK(hipDeviceSynchronize());
-  return logits_result;
+  return next_host;
 }
+

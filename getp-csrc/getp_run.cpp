@@ -154,8 +154,8 @@ long long simple_getp_generate(Transformer *transformer, Tokenizer *tokenizer,
   while (pos < steps) {
 
     // forward the transformer to get logits for the next token
-    float *logits = getp_forward(transformer, dev_transformers, worker, token, pos);
-    // float *logits = forward(transformer, token, pos);
+    int *next_gpu = getp_forward(transformer, dev_transformers, worker, token, pos);
+
 
     // advance the state machine
     pos++;
@@ -163,16 +163,13 @@ long long simple_getp_generate(Transformer *transformer, Tokenizer *tokenizer,
       if (!mask[b]) continue;
       epos[b] = pos;
       if (pos < nums_prompt_tokens[b]) {
-        // if we are still processing the input prompt, force the next prompt
-        // token
         next[b] = prompts_tokens[b][pos];
       } else {
-        // otherwise sample the next token from the logits
-        next[b] = sample(sampler, logits + b * p->vocab_size);
-        // save the output token, it will be printed to file
+        next[b] = next_gpu[b];
         outputs_tokens[b][pos - nums_prompt_tokens[b]] = next[b];
       }
     }
+    
 
     // data-dependent terminating condition: the EOS (=199999 or =200002) token
     // delimits sequences
@@ -196,7 +193,7 @@ long long simple_getp_generate(Transformer *transformer, Tokenizer *tokenizer,
       token[b] = next[b];
     }
 
-    free(logits);
+    free(next_gpu);
   }
 
   // should be removed
