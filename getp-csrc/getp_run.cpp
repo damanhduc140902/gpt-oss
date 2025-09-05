@@ -54,10 +54,12 @@ void warm_up(Transformer *transformer, Tokenizer *tokenizer) {
   std::vector<int> devices(n_devices);
   for (int i = 0; i < n_devices; ++i) devices[i] = i;
   // Allocate on-device MoE extension state per device
+
 ext_create(n_devices);
 for (int i = 0; i < n_devices; ++i) {
-  ext_alloc_device(i, BATCH_SIZE, p->experts_per_token);
+  ext_alloc_device(i, BATCH_SIZE, p->experts_per_token, p->n_experts, p->hidden_dim);
 }
+
 
   cgCreate(g_world, devices);
 
