@@ -648,22 +648,186 @@ __global__ void __launch_bounds__(256) mlp2_partial_bf16_bucketed_mfma_kernel(
   }
 }
 
+__global__ void __launch_bounds__(128) mlp2_partial_bf16_bucketed_mfma16_kernel(
+    float *__restrict__ z_partial, const float *__restrict__ gate_up_all,
+    const __hip_bfloat16 *__restrict__ W2, const __hip_bfloat16 *__restrict__ B2,
+    const float *__restrict__ w_by_bucket, const int *__restrict__ offsets,
+    const int *__restrict__ tok_idx, int I, int H, int E, int cap_pairs) {
+  constexpr int BLOCK_SIZE = 128;
+  constexpr int BM = 16, BN = 32, BK = 32;
+  constexpr int WM = 16, WN = 16;
+  constexpr int MFMA_M = 16, MFMA_N = 16, MFMA_K = 4;
+  using mfloat4 = __attribute__((__vector_size__(MFMA_K * sizeof(float)))) float;
+
+  const int lane = threadIdx.x % warpSize;
+  const int wave = threadIdx.x / warpSize;
+  const int mTiles = BM / WM;
+  const int nTiles = BN / WN;
+  const int mTile  = wave % mTiles;
+  const int nTile  = wave / mTiles;
+  const int xMF = lane % MFMA_M;
+  const int yMF = lane / MFMA_M;
+
+  const int e = blockIdx.y % E;
+  const int blk = blockIdx.y / E;
+
+  const int start = offsets[e];
+  const int end   = offsets[e + 1];
+  const int n     = end - start;
+
+  const int base_all = blk * BM;
+  const int base = start + base_all;
+  if (base >= end) return;
+
+  const int tcnt = min(BM, n - base_all);
+  const size_t w2_e = (size_t)e * (size_t)H * (size_t)I;
+  const size_t b2_e = (size_t)e * (size_t)H;
+
+  __shared__ float sx[BK][BM];
+  __shared__ float sw[BK][BN];
+
+  mfloat4 dmn = {0, 0, 0, 0};
+
+  const int loadX_x = threadIdx.x % (BK / 4);
+  const int loadX_y = threadIdx.x / (BK / 4);
+  const int loadW_x = threadIdx.x % (BK / 8);
+  const int loadW_y = threadIdx.x / (BK / 8);
+  const int strideX = BLOCK_SIZE / (BK / 4);
+  const int strideW = BLOCK_SIZE / (BK / 8);
+
+  for (int bk = 0; bk < I; bk += BK) {
+    for (int off = 0; off < BM; off += strideX) {
+      if (loadX_y + off >= BM) break;
+      const int kk = bk + 4 * loadX_x;
+      const int r  = loadX_y + off;
+      const int pos = base + r;
+      if (r < tcnt && kk + 3 < I) {
+        float4 v = *reinterpret_cast<const float4 *>(gate_up_all + (size_t)pos * (size_t)I + kk);
+        sx[4 * loadX_x + 0][r] = v.x;
+        sx[4 * loadX_x + 1][r] = v.y;
+        sx[4 * loadX_x + 2][r] = v.z;
+        sx[4 * loadX_x + 3][r] = v.w;
+      } else if (r < tcnt && kk < I) {
+        const float *p = gate_up_all + (size_t)pos * (size_t)I + kk;
+        sx[4 * loadX_x + 0][r] = (kk + 0 < I) ? p[0] : 0.f;
+        sx[4 * loadX_x + 1][r] = (kk + 1 < I) ? p[1] : 0.f;
+        sx[4 * loadX_x + 2][r] = (kk + 2 < I) ? p[2] : 0.f;
+        sx[4 * loadX_x + 3][r] = (kk + 3 < I) ? p[3] : 0.f;
+      }
+    }
+
+    for (int off = 0; off < BN; off += strideW) {
+      if (loadW_y + off >= BN) break;
+      const int kk = bk + 8 * loadW_x;
+      const int c  = blockIdx.x * BN + loadW_y + off;
+
+      uint4 wb = make_uint4(0, 0, 0, 0);
+      if (c < H) {
+        if (kk + 7 < I) {
+          wb = *reinterpret_cast<const uint4 *>(W2 + w2_e + (size_t)c * (size_t)I + kk);
+        } else if (kk < I) {
+          const __hip_bfloat16 *src = W2 + w2_e + (size_t)c * (size_t)I + kk;
+          unsigned u0 = 0, u1 = 0, u2 = 0, u3 = 0;
+          if (kk + 0 < I) u0 |= (unsigned)(reinterpret_cast<const unsigned short *>(src)[0]);
+          if (kk + 1 < I) u0 |= (unsigned)(reinterpret_cast<const unsigned short *>(src)[1]) << 16;
+          if (kk + 2 < I) u1 |= (unsigned)(reinterpret_cast<const unsigned short *>(src)[2]);
+          if (kk + 3 < I) u1 |= (unsigned)(reinterpret_cast<const unsigned short *>(src)[3]) << 16;
+          if (kk + 4 < I) u2 |= (unsigned)(reinterpret_cast<const unsigned short *>(src)[4]);
+          if (kk + 5 < I) u2 |= (unsigned)(reinterpret_cast<const unsigned short *>(src)[5]) << 16;
+          if (kk + 6 < I) u3 |= (unsigned)(reinterpret_cast<const unsigned short *>(src)[6]);
+          wb = make_uint4(u0, u1, u2, u3);
+        }
+      }
+
+      if (c < H) {
+        sw[8 * loadW_x + 0][loadW_y + off] = bf16bits_to_f32((unsigned short)(wb.x & 0xFFFF));
+        sw[8 * loadW_x + 1][loadW_y + off] = bf16bits_to_f32((unsigned short)(wb.x >> 16));
+        sw[8 * loadW_x + 2][loadW_y + off] = bf16bits_to_f32((unsigned short)(wb.y & 0xFFFF));
+        sw[8 * loadW_x + 3][loadW_y + off] = bf16bits_to_f32((unsigned short)(wb.y >> 16));
+        sw[8 * loadW_x + 4][loadW_y + off] = bf16bits_to_f32((unsigned short)(wb.z & 0xFFFF));
+        sw[8 * loadW_x + 5][loadW_y + off] = bf16bits_to_f32((unsigned short)(wb.z >> 16));
+        sw[8 * loadW_x + 6][loadW_y + off] = bf16bits_to_f32((unsigned short)(wb.w & 0xFFFF));
+        sw[8 * loadW_x + 7][loadW_y + off] = bf16bits_to_f32((unsigned short)(wb.w >> 16));
+      } else {
+        sw[8 * loadW_x + 0][loadW_y + off] = 0.f;
+        sw[8 * loadW_x + 1][loadW_y + off] = 0.f;
+        sw[8 * loadW_x + 2][loadW_y + off] = 0.f;
+        sw[8 * loadW_x + 3][loadW_y + off] = 0.f;
+        sw[8 * loadW_x + 4][loadW_y + off] = 0.f;
+        sw[8 * loadW_x + 5][loadW_y + off] = 0.f;
+        sw[8 * loadW_x + 6][loadW_y + off] = 0.f;
+        sw[8 * loadW_x + 7][loadW_y + off] = 0.f;
+      }
+    }
+
+    __syncthreads();
+
+    for (int k = 0; k < BK; k += MFMA_K) {
+      const int rRow = mTile * WM + xMF;
+      float amk = (rRow < tcnt) ? sx[k + yMF][rRow] : 0.f;
+      float bkn = sw[k + yMF][nTile * WN + xMF];
+      dmn = __builtin_amdgcn_mfma_f32_16x16x4f32(amk, bkn, dmn, 0, 0, 0);
+    }
+    __syncthreads();
+  }
+
+  for (int i = 0; i < 4; ++i) {
+    const int xD = lane % MFMA_N;
+    const int yD = MFMA_K * (lane / MFMA_N) + i;
+    const int col = blockIdx.x * BN + nTile * WN + xD;
+    const int row = mTile * WM + yD;
+    if (row < tcnt && col < H) {
+      const int pos = base + row;
+      const float bias = B2 ? __bfloat162float(B2[b2_e + col]) : 0.f;
+      const float w = w_by_bucket[pos];
+      z_partial[(size_t)pos * (size_t)H + col] = (dmn[i] + bias) * w;
+    }
+  }
+}
+
 static inline void launch_mlp2_partial_bf16_bucketed_mfma(
     float *z_partial, const float *gate_up_all, const __hip_bfloat16 *w2_layer,
     const __hip_bfloat16 *b2_layer, const float *w_by_bucket,
     const int *offsets, const int *tok_idx, int I, int H, int E,
     int cap_pairs) {
-      PROFILE_FUNCTION();
-  constexpr int BN = 32;
-  constexpr int BM = 32;
-  dim3 block(256);
-  int by = (cap_pairs + BM - 1) / BM;
-  dim3 grid((H + BN - 1) / BN, E * by);
-  mlp2_partial_bf16_bucketed_mfma_kernel<<<grid, block>>>(
-      z_partial, gate_up_all, w2_layer, b2_layer, w_by_bucket, offsets, tok_idx,
-      I, H, E, cap_pairs);
-      //HIP_CHECK(hipDeviceSynchronize());
+  if (cap_pairs <= 16) {
+    constexpr int BN = 32, BM = 16;
+    dim3 block(128);
+    int by = (cap_pairs + BM - 1) / BM;
+    dim3 grid((H + BN - 1) / BN, E * by);
+    mlp2_partial_bf16_bucketed_mfma16_kernel<<<grid, block>>>(
+        z_partial, gate_up_all, w2_layer, b2_layer, w_by_bucket,
+        offsets, tok_idx, I, H, E, cap_pairs);
+  } else {
+    constexpr int BN = 32, BM = 32;
+    dim3 block(256);
+    int by = (cap_pairs + BM - 1) / BM;
+    dim3 grid((H + BN - 1) / BN, E * by);
+    mlp2_partial_bf16_bucketed_mfma_kernel<<<grid, block>>>(
+        z_partial, gate_up_all, w2_layer, b2_layer, w_by_bucket,
+        offsets, tok_idx, I, H, E, cap_pairs);
+  }
 }
+
+
+// static inline void launch_mlp2_partial_bf16_bucketed_mfma(
+//     float *z_partial, const float *gate_up_all, const __hip_bfloat16 *w2_layer,
+//     const __hip_bfloat16 *b2_layer, const float *w_by_bucket,
+//     const int *offsets, const int *tok_idx, int I, int H, int E,
+//     int cap_pairs) {
+//       PROFILE_FUNCTION();
+//   constexpr int BN = 32;
+//   constexpr int BM = 32;
+//   dim3 block(256);
+//   int by = (cap_pairs + BM - 1) / BM;
+//   dim3 grid((H + BN - 1) / BN, E * by);
+//   mlp2_partial_bf16_bucketed_mfma_kernel<<<grid, block>>>(
+//       z_partial, gate_up_all, w2_layer, b2_layer, w_by_bucket, offsets, tok_idx,
+//       I, H, E, cap_pairs);
+//       //HIP_CHECK(hipDeviceSynchronize());
+// }
+
+
 
 __global__ void moe_gather_pairs_kernel(float *__restrict__ e_agg,
                                         const float *__restrict__ z_partial,
