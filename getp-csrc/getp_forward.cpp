@@ -19,6 +19,9 @@
 #ifndef GEMV_WARPS_PER_BLOCK
 #define GEMV_WARPS_PER_BLOCK 8
 #endif
+#ifndef GETP_ROUTER_TOPK_MAXK
+#define GETP_ROUTER_TOPK_MAXK 4
+#endif
 extern CollectiveGroup g_world;
 
 #define MAX(x, y) (((x) > (y)) ? (x) : (y))
@@ -62,7 +65,7 @@ void getp_rmsnorm(float *o, float *x, float *weight, int batch_size, int dim) {
   dim3 gridDim(1, batch_size);
   rmsnorm_kernel<<<gridDim, blockDim, sizeof(float) * (blockDim.x + 1)>>>(
       o, x, weight, dim);
-  //HIP_CHECK(hipDeviceSynchronize());
+  // HIP_CHECK(hipDeviceSynchronize());
 }
 
 // Warp reduce sum (HIP wavefront = 64)
@@ -155,23 +158,6 @@ static inline int build_moe_buckets_local_pos(const int *local_ids,
       w_out, pair_pos);
   return cap_pairs;
 }
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
 template <int TILE_N, int WARPS_PER_BLOCK, int TB>
 __global__ void mlp1_swiglu_bf16_bucketed_kernel(
     float *__restrict__ gate_up_all, const float *__restrict__ x,
@@ -306,7 +292,7 @@ static inline void launch_mlp1_swiglu_bf16_bucketed(
     float *gate_up_all, const float *x, const __hip_bfloat16 *w1_layer,
     const __hip_bfloat16 *b1_layer, const int *offsets, const int *tok_idx,
     int H, int I, int E, int cap_pairs, float swiglu_limit) {
-      PROFILE_FUNCTION();
+  PROFILE_FUNCTION();
   constexpr int WARPS = GEMV_WARPS_PER_BLOCK;
   constexpr int TILE = GEMV_TILE_N;
   constexpr int TB = 8;
@@ -317,117 +303,184 @@ static inline void launch_mlp1_swiglu_bf16_bucketed(
   mlp1_swiglu_bf16_bucketed_kernel<TILE, WARPS, TB>
       <<<grd, blk, shmem>>>(gate_up_all, x, w1_layer, b1_layer, offsets,
                             tok_idx, H, I, E, cap_pairs, swiglu_limit);
-  //HIP_CHECK(hipDeviceSynchronize());
+  // HIP_CHECK(hipDeviceSynchronize());
 }
-template <int TILE_N, int WARPS_PER_BLOCK, int TB>
-__global__ void mlp2_partial_bf16_bucketed_kernel(
+
+__global__ void __launch_bounds__(256) mlp2_partial_bf16_bucketed_mfma_kernel(
     float *__restrict__ z_partial, const float *__restrict__ gate_up_all,
     const __hip_bfloat16 *__restrict__ W2,
     const __hip_bfloat16 *__restrict__ B2,
     const float *__restrict__ w_by_bucket, const int *__restrict__ offsets,
     const int *__restrict__ tok_idx, int I, int H, int E, int cap_pairs) {
-  extern __shared__ float sX[];
-  const int lane = threadIdx.x;
-  const int warp = threadIdx.y;
-  const int row = blockIdx.x * WARPS_PER_BLOCK + warp;
-  if (row >= H) return;
+  constexpr int BLOCK_SIZE = 256;
+  constexpr int BM = 32;
+  constexpr int BN = 32;
+  constexpr int BK = 32;
+  constexpr int WM = 16;
+  constexpr int WN = 16;
+  constexpr int MFMA_M = 16;
+  constexpr int MFMA_N = 16;
+  constexpr int MFMA_K = 4;
+  using mfloat4 =
+      __attribute__((__vector_size__(MFMA_K * sizeof(float)))) float;
+
+  const int laneIdx = threadIdx.x % warpSize;
+  const int waveIdx = threadIdx.x / warpSize;
+  const int xInBlockTile = waveIdx % (BM / WM);
+  const int yInBlockTile = waveIdx / (BM / WM);
+  const int xInMFMA = laneIdx % MFMA_M;
+  const int yInMFMA = laneIdx / MFMA_M;
+
   const int e = blockIdx.y % E;
   const int blk = blockIdx.y / E;
-  const int base_all = blk * TB;
+
   const int start = offsets[e];
   const int end = offsets[e + 1];
   const int n = end - start;
+
+  const int base_all = blk * BM;
   const int base = start + base_all;
   if (base >= end) return;
-  const int tcnt = min(TB, n - base_all);
-  float acc[TB];
-  for (int t = 0; t < TB; ++t) acc[t] = 0.f;
-  for (int tile = 0; tile < I; tile += TILE_N) {
-    const int tlen = min(TILE_N, I - tile);
-    for (int tb = 0; tb < tcnt; ++tb) {
-      const float *src =
-          gate_up_all + (size_t)(start + base_all + tb) * (size_t)I + tile;
-      float *dst = sX + tb * TILE_N;
-      for (int t = warp * warpSize * 4 + lane * 4; t < tlen;
-           t += WARPS_PER_BLOCK * warpSize * 4) {
-        if (t + 3 < tlen)
-          reinterpret_cast<float4 &>(dst[t]) =
-              *reinterpret_cast<const float4 *>(&src[t]);
-        else {
-          for (int k = 0; k < 4 && t + k < tlen; ++k) dst[t + k] = src[t + k];
+
+  const int tcnt = min(BM, n - base_all);
+  const size_t w2_e = (size_t)e * (size_t)H * (size_t)I;
+  const size_t b2_e = (size_t)e * (size_t)H;
+
+  __shared__ float sx[BK][BM];
+  __shared__ float sw[BK][BN];
+
+  for (int z = threadIdx.x; z < BK * BM; z += BLOCK_SIZE)
+    ((float *)sx)[z] = 0.f;
+  for (int z = threadIdx.x; z < BK * BN; z += BLOCK_SIZE)
+    ((float *)sw)[z] = 0.f;
+  __syncthreads();
+
+  mfloat4 dmn = {0, 0, 0, 0};
+
+  const int loadXIdx_x = threadIdx.x % (BK / 4);
+  const int loadXIdx_y = threadIdx.x / (BK / 4);
+  const int loadWIdx_x = threadIdx.x % (BK / 8);
+  const int loadWIdx_y = threadIdx.x / (BK / 8);
+  const int strideX = BLOCK_SIZE / (BK / 4);
+  const int strideW = BLOCK_SIZE / (BK / 8);
+
+  for (int bk = 0; bk < I; bk += BK) {
+    for (int off = 0; off < BM; off += strideX) {
+      if (loadXIdx_y + off >= BM) break;
+      const int kk = bk + 4 * loadXIdx_x;
+      const int r = loadXIdx_y + off;
+      const int pos = base + r;
+      if (r < tcnt && kk + 3 < I) {
+        float4 tmp = *reinterpret_cast<const float4 *>(
+            gate_up_all + (size_t)pos * (size_t)I + kk);
+        sx[4 * loadXIdx_x + 0][r] = tmp.x;
+        sx[4 * loadXIdx_x + 1][r] = tmp.y;
+        sx[4 * loadXIdx_x + 2][r] = tmp.z;
+        sx[4 * loadXIdx_x + 3][r] = tmp.w;
+      } else if (r < tcnt && kk < I) {
+        const float *src = gate_up_all + (size_t)pos * (size_t)I + kk;
+        sx[4 * loadXIdx_x + 0][r] = (kk + 0 < I) ? src[0] : 0.f;
+        sx[4 * loadXIdx_x + 1][r] = (kk + 1 < I) ? src[1] : 0.f;
+        sx[4 * loadXIdx_x + 2][r] = (kk + 2 < I) ? src[2] : 0.f;
+        sx[4 * loadXIdx_x + 3][r] = (kk + 3 < I) ? src[3] : 0.f;
+      }
+    }
+
+    for (int off = 0; off < BN; off += strideW) {
+      if (loadWIdx_y + off >= BN) break;
+      const int kk = bk + 8 * loadWIdx_x;
+      const int c = blockIdx.x * BN + loadWIdx_y + off;
+
+      uint4 wb = make_uint4(0, 0, 0, 0);
+      if (c < H) {
+        if (kk + 7 < I) {
+          wb = *reinterpret_cast<const uint4 *>(W2 + w2_e +
+                                                (size_t)c * (size_t)I + kk);
+        } else if (kk < I) {
+          const __hip_bfloat16 *src = W2 + w2_e + (size_t)c * (size_t)I + kk;
+          unsigned int u0 = 0, u1 = 0, u2 = 0, u3 = 0;
+          if (kk + 0 < I)
+            u0 |=
+                ((unsigned)(reinterpret_cast<const unsigned short *>(src)[0]));
+          if (kk + 1 < I)
+            u0 |= ((unsigned)(reinterpret_cast<const unsigned short *>(src)[1]))
+                  << 16;
+          if (kk + 2 < I)
+            u1 |=
+                ((unsigned)(reinterpret_cast<const unsigned short *>(src)[2]));
+          if (kk + 3 < I)
+            u1 |= ((unsigned)(reinterpret_cast<const unsigned short *>(src)[3]))
+                  << 16;
+          if (kk + 4 < I)
+            u2 |=
+                ((unsigned)(reinterpret_cast<const unsigned short *>(src)[4]));
+          if (kk + 5 < I)
+            u2 |= ((unsigned)(reinterpret_cast<const unsigned short *>(src)[5]))
+                  << 16;
+          if (kk + 6 < I)
+            u3 |=
+                ((unsigned)(reinterpret_cast<const unsigned short *>(src)[6]));
+          wb = make_uint4(u0, u1, u2, u3);
         }
       }
-    }
-    __syncthreads();
-    const size_t eb = (size_t)e * (size_t)H * (size_t)I;
-    const __hip_bfloat16 *wrow = W2 + eb + (size_t)row * (size_t)I + tile;
-    const uint4 *w8 = reinterpret_cast<const uint4 *>(wrow);
-    const int it8 = tlen >> 3;
-#pragma unroll 4
-    for (int k8 = lane; k8 < it8; k8 += warpSize) {
-      uint4 wb = w8[k8];
-      unsigned short w01 = (unsigned short)(wb.x & 0xFFFF),
-                     w02 = (unsigned short)(wb.x >> 16);
-      unsigned short w11 = (unsigned short)(wb.y & 0xFFFF),
-                     w12 = (unsigned short)(wb.y >> 16);
-      unsigned short w21 = (unsigned short)(wb.z & 0xFFFF),
-                     w22 = (unsigned short)(wb.z >> 16);
-      unsigned short w31 = (unsigned short)(wb.w & 0xFFFF),
-                     w32 = (unsigned short)(wb.w >> 16);
-      for (int tb = 0; tb < tcnt; ++tb) {
-        const float4 *x4 = reinterpret_cast<const float4 *>(sX + tb * TILE_N);
-        float4 xb0 = x4[(k8 << 1) + 0], xb1 = x4[(k8 << 1) + 1];
-        float a = acc[tb];
-        a = fmaf(bf16bits_to_f32(w01), xb0.x, a);
-        a = fmaf(bf16bits_to_f32(w02), xb0.y, a);
-        a = fmaf(bf16bits_to_f32(w11), xb0.z, a);
-        a = fmaf(bf16bits_to_f32(w12), xb0.w, a);
-        a = fmaf(bf16bits_to_f32(w21), xb1.x, a);
-        a = fmaf(bf16bits_to_f32(w22), xb1.y, a);
-        a = fmaf(bf16bits_to_f32(w31), xb1.z, a);
-        a = fmaf(bf16bits_to_f32(w32), xb1.w, a);
-        acc[tb] = a;
+
+      if (c < H) {
+        sw[8 * loadWIdx_x + 0][loadWIdx_y + off] =
+            bf16bits_to_f32((unsigned short)(wb.x & 0xFFFF));
+        sw[8 * loadWIdx_x + 1][loadWIdx_y + off] =
+            bf16bits_to_f32((unsigned short)(wb.x >> 16));
+        sw[8 * loadWIdx_x + 2][loadWIdx_y + off] =
+            bf16bits_to_f32((unsigned short)(wb.y & 0xFFFF));
+        sw[8 * loadWIdx_x + 3][loadWIdx_y + off] =
+            bf16bits_to_f32((unsigned short)(wb.y >> 16));
+        sw[8 * loadWIdx_x + 4][loadWIdx_y + off] =
+            bf16bits_to_f32((unsigned short)(wb.z & 0xFFFF));
+        sw[8 * loadWIdx_x + 5][loadWIdx_y + off] =
+            bf16bits_to_f32((unsigned short)(wb.z >> 16));
+        sw[8 * loadWIdx_x + 6][loadWIdx_y + off] =
+            bf16bits_to_f32((unsigned short)(wb.w & 0xFFFF));
+        sw[8 * loadWIdx_x + 7][loadWIdx_y + off] =
+            bf16bits_to_f32((unsigned short)(wb.w >> 16));
       }
     }
-    for (int k = (it8 << 3) + lane; k < tlen; k += warpSize) {
-      for (int tb = 0; tb < tcnt; ++tb)
-        acc[tb] += __bfloat162float(wrow[k]) * (sX[tb * TILE_N + k]);
+
+    __syncthreads();
+
+    for (int k = 0; k < BK; k += MFMA_K) {
+      float amk = sx[k + yInMFMA][yInBlockTile * WM + xInMFMA];
+      float bkn = sw[k + yInMFMA][xInBlockTile * WN + xInMFMA];
+      dmn = __builtin_amdgcn_mfma_f32_16x16x4f32(amk, bkn, dmn, 0, 0, 0);
     }
     __syncthreads();
   }
-  for (int tb = 0; tb < TB; ++tb) {
-    if (tb < tcnt)
-      for (int off = warpSize >> 1; off > 0; off >>= 1)
-        acc[tb] += __shfl_down(acc[tb], off);
-  }
-  if (lane == 0) {
-    for (int tb = 0; tb < tcnt; ++tb) {
-      float bias = B2 ? __bfloat162float(B2[(size_t)e * (size_t)H + row]) : 0.f;
-      float val = acc[tb] + bias;
-      float w = w_by_bucket[start + base_all + tb];
-      int pos = start + base_all + tb;
-      z_partial[(size_t)pos * (size_t)H + row] = w * val;
+
+  for (int i = 0; i < 4; ++i) {
+    const int xInD = laneIdx % MFMA_N;
+    const int yInD = MFMA_K * (laneIdx / MFMA_N) + i;
+    const int col = blockIdx.x * BN + xInBlockTile * WN + xInD;
+    const int row = yInBlockTile * WM + yInD;
+    if (row < tcnt && col < H) {
+      const int pos = base + row;
+      const float bias = B2 ? __bfloat162float(B2[b2_e + col]) : 0.f;
+      const float w = w_by_bucket[pos];
+      z_partial[(size_t)pos * (size_t)H + col] = (dmn[i] + bias) * w;
     }
   }
 }
 
-static inline void launch_mlp2_partial_bf16_bucketed(
+static inline void launch_mlp2_partial_bf16_bucketed_mfma(
     float *z_partial, const float *gate_up_all, const __hip_bfloat16 *w2_layer,
     const __hip_bfloat16 *b2_layer, const float *w_by_bucket,
     const int *offsets, const int *tok_idx, int I, int H, int E,
     int cap_pairs) {
-      PROFILE_FUNCTION();
-  constexpr int WARPS = GEMV_WARPS_PER_BLOCK;
-  constexpr int TILE = GEMV_TILE_N;
-  constexpr int TB = 8;
-  dim3 blk(64, WARPS);
-  int by = (cap_pairs + TB - 1) / TB;
-  dim3 grd((H + WARPS - 1) / WARPS, E * by);
-  size_t shmem = (size_t)TILE * TB * sizeof(float);
-  mlp2_partial_bf16_bucketed_kernel<TILE, WARPS, TB>
-      <<<grd, blk, shmem>>>(z_partial, gate_up_all, w2_layer, b2_layer,
-                            w_by_bucket, offsets, tok_idx, I, H, E, cap_pairs);
-  //HIP_CHECK(hipDeviceSynchronize());
+  constexpr int BN = 32;
+  constexpr int BM = 32;
+  dim3 block(256);
+  int by = (cap_pairs + BM - 1) / BM;
+  dim3 grid((H + BN - 1) / BN, E * by);
+  mlp2_partial_bf16_bucketed_mfma_kernel<<<grid, block>>>(
+      z_partial, gate_up_all, w2_layer, b2_layer, w_by_bucket, offsets, tok_idx,
+      I, H, E, cap_pairs);
 }
 
 __global__ void moe_gather_pairs_kernel(float *__restrict__ e_agg,
@@ -439,20 +492,17 @@ __global__ void moe_gather_pairs_kernel(float *__restrict__ e_agg,
   if (row >= H || b >= B) return;
   int base = b * K;
   float s = 0.f;
-#pragma unroll
-  for (int k = 0; k < 4; ++k) {
+  for (int k = 0; k < K; ++k) {
     int pos = pair_pos[base + k];
-    if (k >= K) break;
     if (pos >= 0) s += z_partial[(size_t)pos * (size_t)H + row];
   }
   e_agg[(size_t)b * (size_t)H + row] += s;
 }
+
 static inline void moe_gather_pairs(float *e_agg, const float *z_partial,
                                     const int *pair_pos, int H, int K, int B) {
-  PROFILE_FUNCTION();
   dim3 blk(256), grd((H + blk.x - 1) / blk.x, B);
   moe_gather_pairs_kernel<<<grd, blk>>>(e_agg, z_partial, pair_pos, H, K, B);
-  //HIP_CHECK(hipDeviceSynchronize());
 }
 
 __global__ void matmul_qkv_fused_kernel(
@@ -570,7 +620,7 @@ static inline void getp_matmul_qkv_fused_bf16(
   dim3 grid((N + BN - 1) / BN, (M + BM - 1) / BM);
   matmul_qkv_fused_kernel<<<grid, block>>>(q, k, v, x, w_qkv_bf16, b_qkv_bf16,
                                            n, q_len, k_len, v_len, batch_size);
-  //HIP_CHECK(hipDeviceSynchronize());
+  // HIP_CHECK(hipDeviceSynchronize());
 }
 
 __global__ void __launch_bounds__(256)
@@ -684,7 +734,7 @@ void getp_matmul(float *xout, float *x, T *w, T *b, int n, int d,
   dim3 block(256);
   dim3 grid((N + BN - 1) / BN, (M + BM - 1) / BM);
   matmul_kernel<<<grid, block>>>(xout, x, w, b, M, N, K);
-  //HIP_CHECK(hipDeviceSynchronize());
+  // HIP_CHECK(hipDeviceSynchronize());
 }
 
 __global__ void compute_inv_freq_kernel(float base, int head_dim,
@@ -747,7 +797,7 @@ void getp_compute_cos_sin(int pos, float base, int head_dim,
     compute_cos_sin_kernel<<<gridDim, blockDim>>>(cos_out, sin_out, inv_freq,
                                                   concentration, pos, d_half);
   }
-  //HIP_CHECK(hipDeviceSynchronize());
+  // HIP_CHECK(hipDeviceSynchronize());
 }
 
 __global__ void apply_rotary_emb_kernel(float *x, float *cos, float *sin,
@@ -776,61 +826,61 @@ void getp_apply_rotary_emb(float *x, float *cos, float *sin, int n_heads,
                (n_heads + blockDim.y - 1) / blockDim.y, batch_size);
   apply_rotary_emb_kernel<<<gridDim, blockDim>>>(x, cos, sin, n_heads,
                                                  head_dim);
-  //HIP_CHECK(hipDeviceSynchronize());
+  // HIP_CHECK(hipDeviceSynchronize());
 }
 
-#ifndef GETP_ROUTER_TOPK_MAXK
-#define GETP_ROUTER_TOPK_MAXK 4
-#endif
-
 __global__ void router_topk_softmax_batch_kernel(
-    const float* __restrict__ router_score,
-    int n_experts,
-    int experts_per_token,
-    float* __restrict__ topk_v_out,
-    int* __restrict__ topk_i_out) {
+    const float *__restrict__ router_score, int n_experts,
+    int experts_per_token, float *__restrict__ topk_v_out,
+    int *__restrict__ topk_i_out) {
   const int b = blockIdx.x;
   const int tid = threadIdx.x;
   const int K = experts_per_token;
+  const float eps = 1e-6f;
 
   router_score += (size_t)b * n_experts;
   topk_v_out += (size_t)b * K;
   topk_i_out += (size_t)b * K;
 
   extern __shared__ unsigned char smem_raw[];
-  float* scores = reinterpret_cast<float*>(smem_raw);
-  float* valbuf = scores + n_experts;
-  int*   idxbuf = reinterpret_cast<int*>(valbuf + blockDim.x);
-  float* topv   = reinterpret_cast<float*>(idxbuf + blockDim.x);
-  int*   topi   = reinterpret_cast<int*>(topv + GETP_ROUTER_TOPK_MAXK);
+  float *scores = reinterpret_cast<float *>(smem_raw);
+  float *valbuf = scores + n_experts;
+  int *idxbuf = reinterpret_cast<int *>(valbuf + blockDim.x);
+  float *topv = reinterpret_cast<float *>(idxbuf + blockDim.x);
+  int *topi = reinterpret_cast<int *>(topv + GETP_ROUTER_TOPK_MAXK);
 
   for (int i = tid; i < n_experts; i += blockDim.x) scores[i] = router_score[i];
   __syncthreads();
 
   for (int sel = 0; sel < K; ++sel) {
     float best = -INFINITY;
-    int   besti = n_experts;
+    int besti = n_experts;
     for (int i = tid; i < n_experts; i += blockDim.x) {
       float v = scores[i];
-      float thr = 1e-6f * fmaxf(fabsf(v), fabsf(best));
+      float thr = eps * fmaxf(fabsf(v), fabsf(best));
       if (v > best + thr || (fabsf(v - best) <= thr && i < besti)) {
-        best = v; besti = i;
+        best = v;
+        besti = i;
       }
     }
     valbuf[tid] = best;
     idxbuf[tid] = besti;
     __syncthreads();
 
-    for (int stride = blockDim.x >> 1; stride > 0; stride >>= 1) {
-      if (tid < stride) {
-        float vr = valbuf[tid + stride], vl = valbuf[tid];
-        int   ir = idxbuf[tid + stride], il = idxbuf[tid];
-        float thr = 1e-6f * fmaxf(fabsf(vr), fabsf(vl));
+    for (int s = blockDim.x >> 1; s > 0; s >>= 1) {
+      if (tid < s) {
+        float vr = valbuf[tid + s], vl = valbuf[tid];
+        int ir = idxbuf[tid + s], il = idxbuf[tid];
+        float thr = eps * fmaxf(fabsf(vr), fabsf(vl));
         bool take_r = (vr > vl + thr) || (fabsf(vr - vl) <= thr && ir < il);
-        if (take_r) { valbuf[tid] = vr; idxbuf[tid] = ir; }
+        if (take_r) {
+          valbuf[tid] = vr;
+          idxbuf[tid] = ir;
+        }
       }
       __syncthreads();
     }
+
     if (tid == 0) {
       topv[sel] = valbuf[0];
       topi[sel] = idxbuf[0];
@@ -841,14 +891,21 @@ __global__ void router_topk_softmax_batch_kernel(
 
   if (tid == 0) {
     float m = topv[0];
-    for (int i = 1; i < K; ++i) if (topv[i] > m) m = topv[i];
-    float e[GETP_ROUTER_TOPK_MAXK]; float s = 0.f;
-    for (int i = 0; i < K; ++i) { e[i] = expf(topv[i] - m); s += e[i]; }
+    for (int i = 1; i < K; ++i)
+      if (topv[i] > m) m = topv[i];
+    float e[GETP_ROUTER_TOPK_MAXK];
+    float s = 0.f;
+    for (int i = 0; i < K; ++i) {
+      e[i] = expf(topv[i] - m);
+      s += e[i];
+    }
     float invs = 1.f / s;
-    for (int i = 0; i < K; ++i) { topk_v_out[i] = e[i] * invs; topk_i_out[i] = topi[i]; }
+    for (int i = 0; i < K; ++i) {
+      topk_v_out[i] = e[i] * invs;
+      topk_i_out[i] = topi[i];
+    }
   }
 }
-
 
 static inline void getp_router_topk_softmax_batch(
     const float *router_score, int n_experts, int experts_per_token,
@@ -862,7 +919,7 @@ static inline void getp_router_topk_softmax_batch(
                        GETP_ROUTER_TOPK_MAXK * (sizeof(float) + sizeof(int));
   router_topk_softmax_batch_kernel<<<grid, block, shmem>>>(
       router_score, n_experts, experts_per_token, topk_v_out, topk_i_out);
-  //HIP_CHECK(hipDeviceSynchronize());
+  // HIP_CHECK(hipDeviceSynchronize());
 }
 
 __global__ void map_global_to_local_batch_kernel(
@@ -899,7 +956,7 @@ static inline void getp_map_global_to_local_batch(
   map_global_to_local_batch_kernel<<<GRD, BLK>>>(topk_i, topk_v, local_ids,
                                                  local_wts, n_local, K,
                                                  expert_start, expert_end, B);
-  //HIP_CHECK(hipDeviceSynchronize());
+  // HIP_CHECK(hipDeviceSynchronize());
 }
 
 __global__ void vecadd_kernel(float *x, float *y, int size) {
@@ -916,7 +973,7 @@ void getp_vecadd(float *x, float *y, int size, int batch_size) {
   dim3 blockDim(1024);
   dim3 gridDim((size + blockDim.x - 1) / blockDim.x, batch_size);
   vecadd_kernel<<<gridDim, blockDim>>>(x, y, size);
-  //HIP_CHECK(hipDeviceSynchronize());
+  // HIP_CHECK(hipDeviceSynchronize());
 }
 
 __global__ void flash_attn_decode_kernel(
@@ -1023,7 +1080,7 @@ static inline void getp_flash_attn_decode(
       tb, key_cache_layer, value_cache_layer, q, attn_sinks_layer, head_dim,
       n_attn_heads, n_kv_heads, pos, seq_len, sliding_window, apply_mask,
       batch_size, kv_dim, kv_mul, inv_sqrt_d);
-  //HIP_CHECK(hipDeviceSynchronize());
+  // HIP_CHECK(hipDeviceSynchronize());
 }
 
 __global__ void gather_embedding_kernel(float *__restrict__ x,
@@ -1041,21 +1098,25 @@ static inline void getp_gather_embedding(float *x, const float *table,
   PROFILE_FUNCTION();
   dim3 block(256), grid(B);
   gather_embedding_kernel<<<grid, block>>>(x, table, tok, H);
-  //HIP_CHECK(hipDeviceSynchronize());
+  // HIP_CHECK(hipDeviceSynchronize());
 }
 
 __global__ void argmax_rows_kernel(const float *__restrict__ logits, int V,
                                    int *__restrict__ out) {
   __shared__ float smax[1024];
   __shared__ int sidx[1024];
+  const float eps = 1e-6f;
+
   int b = blockIdx.x;
   int tid = threadIdx.x;
   const float *row = logits + (size_t)b * V;
+
   float mv = -INFINITY;
-  int mi = 0;
+  int mi = V;
   for (int i = tid; i < V; i += blockDim.x) {
     float v = row[i];
-    if (v > mv) {
+    float thr = eps * fmaxf(fabsf(v), fabsf(mv));
+    if (v > mv + thr || (fabsf(v - mv) <= thr && i < mi)) {
       mv = v;
       mi = i;
     }
@@ -1063,23 +1124,29 @@ __global__ void argmax_rows_kernel(const float *__restrict__ logits, int V,
   smax[tid] = mv;
   sidx[tid] = mi;
   __syncthreads();
+
   for (int s = blockDim.x >> 1; s > 0; s >>= 1) {
     if (tid < s) {
-      if (smax[tid + s] > smax[tid]) {
-        smax[tid] = smax[tid + s];
-        sidx[tid] = sidx[tid + s];
+      float vr = smax[tid + s], vl = smax[tid];
+      int ir = sidx[tid + s], il = sidx[tid];
+      float thr = eps * fmaxf(fabsf(vr), fabsf(vl));
+      bool take_r = (vr > vl + thr) || (fabsf(vr - vl) <= thr && ir < il);
+      if (take_r) {
+        smax[tid] = vr;
+        sidx[tid] = ir;
       }
     }
     __syncthreads();
   }
   if (tid == 0) out[b] = sidx[0];
 }
+
 static inline void getp_argmax_rows(const float *logits, int V, int *out,
                                     int B) {
   PROFILE_FUNCTION();
   dim3 grid(B), block(1024);
   argmax_rows_kernel<<<grid, block>>>(logits, V, out);
-  //HIP_CHECK(hipDeviceSynchronize());
+  // HIP_CHECK(hipDeviceSynchronize());
 }
 
 int *getp_forward(Transformer * /*transformer*/,
@@ -1208,7 +1275,7 @@ int *getp_forward(Transformer * /*transformer*/,
     __hip_bfloat16 *b2_base =
         dev_w->b_mlp2 + 1ll * l * experts_per_device * hidden_dim;
 
-    launch_mlp2_partial_bf16_bucketed(
+    launch_mlp2_partial_bf16_bucketed_mfma(
         ext->z_partial, dev_s->gate_up, w2_base, b2_base, ext->w_dev,
         ext->e_offsets, ext->e_dev, p->intermediate_dim, hidden_dim,
         experts_per_device, cap_pairs);
@@ -1229,6 +1296,6 @@ int *getp_forward(Transformer * /*transformer*/,
   int *next_host = (int *)malloc(sizeof(int) * BATCH_SIZE);
   HIP_CHECK(hipMemcpy(next_host, dev_s->topk_i, sizeof(int) * BATCH_SIZE,
                       hipMemcpyDeviceToHost));
-  //HIP_CHECK(hipDeviceSynchronize());
+  // HIP_CHECK(hipDeviceSynchronize());
   return next_host;
 }

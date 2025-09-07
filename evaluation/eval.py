@@ -193,6 +193,8 @@ def eval_reference_based(ids: List[str], refs: List[Dict], subm: List[Dict]):
     def check_status(row):
         if row["Metric"] not in thresholds:
             return ""
+        if row["Metric"] == "repetition_rate":
+            return "PASS" if row["Value"] <= thresholds[row["Metric"]] else "FAIL"
         return "PASS" if row["Value"] >= thresholds[row["Metric"]] else "FAIL"
 
     df["Result"] = df.apply(check_status, axis=1)
