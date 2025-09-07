@@ -37,12 +37,13 @@ def parseCLI():
         "--submission",
         default="../data/output.txt",
         type=pathlib.Path,
-        help="Path to trainee's completion file",
+        help="Path to trainee's completion file, e,g., ../data/subm.txt",
     )
     # this json file is assumed to have the form {"id", "prompt", "completion"}
     parser.add_argument(
         "-r",
         "--references",
+        default="refs_fp32.txt",
         type=pathlib.Path,
         help="Path to reference completion file used for evaluation",
     )
@@ -78,11 +79,11 @@ def ensure_nltk_resources(verbose: bool = True):
             nltk.download(r, quiet=True)
 
 
-def process_submission_data(prompts: pathlib.Path, submission: pathlib.Path):
+def process_data(prompts: pathlib.Path, completion: pathlib.Path, enc):
     data = []
-    enc = tiktoken.get_encoding("o200k_harmony")
-    with open(prompts, "r") as f_prompts, \
-      open(submission, "r") as f_subm:
+    with open(prompts, "r") as f_prompts, open(completion, "r") as f_subm:
+        # Skip the first line (it contains the count)
+        next(f_prompts)
         for (prompt, token_ids) in zip(f_prompts, f_subm):
             ids = [int(x) for x in token_ids.strip().split()]
             entry = {
@@ -156,7 +157,9 @@ def eval_reference_based(ids: List[str], refs: List[Dict], subm: List[Dict]):
     bs = bscore.compute(predictions=preds_completion,
                         references=gts_completion,
                         lang="en",
-                        model_type="microsoft/deberta-xlarge-mnli")
+                        model_type="microsoft/deberta-xlarge-mnli",
+                        batch_size=4)
+
     d1 = [distinct_n(p, 1) for p in preds_completion]
     d2 = [distinct_n(p, 2) for p in preds_completion]
     rep = [repetition_rate(p) for p in preds_completion]
@@ -173,18 +176,41 @@ def eval_reference_based(ids: List[str], refs: List[Dict], subm: List[Dict]):
         "repetition_rate": round(statistics.fmean(rep), 6),
         "avg_len_tokens": round(statistics.fmean(length), 3),
     }
+    thresholds = {
+        "items": 32,
+        "METEOR": 0.3,
+        "BERTScore_F1": 0.8,
+        "BERTScore_P": 0.8,
+        "BERTScore_R": 0.8,
+        "distinct1": 0.2,
+        "distinct2": 0.3,
+        "repetition_rate": 0.06,
+    }
     # Create DataFrame
     df = pd.DataFrame(list(agg.items()), columns=["Metric", "Value"])
-    print(df)
+    df["Threshold"] = df["Metric"].map(thresholds).fillna("")
+
+    def check_status(row):
+        if row["Metric"] not in thresholds:
+            return ""
+        return "PASS" if row["Value"] >= thresholds[row["Metric"]] else "FAIL"
+
+    df["Result"] = df.apply(check_status, axis=1)
+    pd.set_option("display.colheader_justify", "right")
+    print(df.to_string(index=False, justify="right"))
 
 
 def main():
     # parse CLI args
     args = parseCLI()
     # process submission file, which is lines of token ids
-    subm = process_submission_data(args.prompts, args.submission)
-    refs = load_jsonl(args.references)
-    if not validate_references(refs, pathlib.Path("schema.json")):
+    enc = tiktoken.get_encoding("o200k_harmony")
+    subm = process_data(args.prompts, args.submission, enc)
+    refs = process_data(args.prompts, args.references, enc)
+    if not validate_references(
+            refs, pathlib.Path("schema.json")) or not validate_references(
+                subm, pathlib.Path("schema.json")):
+
         print("Exiting due to schema validation failure.")
         return
     # coverage report

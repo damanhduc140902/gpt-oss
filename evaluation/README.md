@@ -1,17 +1,12 @@
-# Dataset Format (`.jsonl`)
-
-- Each line in the file is a valid JSON object with the following fields:
-
-```json
-{
-  "id": "unique string identifier (SHA-256 hash of the prompt",
-  "prompt": "input text that the model sees",
-  "completion": "expected answer or continuation (about 256 tokens)"
-}
-```
-
-- To run
+- To generate references
 
 ```bash
-python eval.py -p ../data/input.txt -s ../data/output.txt -r refs_openai_gpt5.jsonl
+# python generate.py /path/to/gpt-oss/safetensors -p /path/to/prompt/file -l max_new_tokens
+python generate.py /dev/shm/gpt-oss-20b/ -p ../data/input.txt -l 2048
+```
+
+- To evaluate
+
+```bash
+python eval.py -p ../data/input.txt -s ../data/output.txt -r references/refs_fp32.txt
 ```
