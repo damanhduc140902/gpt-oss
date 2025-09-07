@@ -4,6 +4,8 @@
 #include "getp_transformer.hpp"
 #include "profiler.hpp"
 #include <cstddef>
+#include <cstdio>
+#include <cstdlib>
 #include <cstring>
 #include <hip/driver_types.h>
 #include <hip/hip_runtime.h>
@@ -32,34 +34,49 @@ void warm_up(Transformer *transformer, Tokenizer *tokenizer) {
   int n_devices;
   HIP_CHECK(hipGetDeviceCount(&n_devices));
 
+  if (n_devices % EXPERT_PARALLELISM) {
+    fprintf(stderr, "Number of devices is expected to be divisible by EXPERT_PARALLELISM=%d", EXPERT_PARALLELISM);
+    exit(EXIT_FAILURE);
+  }
+
   dev_transformers = reinterpret_cast<DeviceTransformer **>(malloc(sizeof(DeviceTransformer *) * n_devices));
   workers = reinterpret_cast<GPUWorker *>(malloc(sizeof(GPUWorker) * n_devices));
 
   Config *p = &transformer->config;
 
-  for (int i = 0; i < n_devices; ++i) {
-    workers[i].device_index = i;
+  int experts_per_device = p->n_experts / EXPERT_PARALLELISM;
 
-    workers[i].expert_start = 0;
-    workers[i].expert_end = p->n_experts;
-
+  for (int i = 0; i < n_devices; i += EXPERT_PARALLELISM) {
+    for (int j = 0; j < EXPERT_PARALLELISM; ++j) {
+      workers[i + j].device_index = i + j;
+      workers[i + j].expert_start = experts_per_device * j;
+      workers[i + j].expert_end = experts_per_device * (j + 1);
+    }
   }
+
+  std::vector<std::thread> threads(n_devices);
 
   for (int i = 0; i < n_devices; ++i) {
     dev_transformers[i] = new DeviceTransformer;
     dev_transformers[i]->device_index = i;
-    upload_transformer(transformer, dev_transformers[i], &workers[i]);
+    // upload_transformer(transformer, dev_transformers[i], &workers[i]);
+    threads[i] = std::thread(upload_transformer,
+      transformer, dev_transformers[i], &workers[i]
+    );
+  }
+
+  for (int i = 0; i < n_devices; ++i) {
+    threads[i].join();
   }
 
   std::vector<int> devices(n_devices);
   for (int i = 0; i < n_devices; ++i) devices[i] = i;
   // Allocate on-device MoE extension state per device
 
-ext_create(n_devices);
-for (int i = 0; i < n_devices; ++i) {
-  ext_alloc_device(i, BATCH_SIZE, p->experts_per_token, p->n_experts, p->hidden_dim);
-}
-
+  ext_create(n_devices);
+  for (int i = 0; i < n_devices; ++i) {
+    ext_alloc_device(i, BATCH_SIZE, p->experts_per_token, p->n_experts, p->hidden_dim);
+  }
 
   cgCreate(g_world, devices);
 
@@ -227,7 +244,7 @@ void single_thread_generate(Transformer *transformer,
                             Tokenizer *tokenizer, 
                             Sampler *sampler, 
                             Requests *requests,
-                            GPUWorker *worker,
+                            GPUWorker *workers,
                             long long *num_token_out_ptr,
                             int thread_idx
 ) {
@@ -240,15 +257,16 @@ void single_thread_generate(Transformer *transformer,
   const char *inputs_seq[BATCH_SIZE];
   int *outputs_tokens[BATCH_SIZE];
 
-  int idx0 = worker->request_start;
-  int requests_per_thread = worker->request_end - worker->request_start;
+  GPUWorker *main_worker = workers;
+  int idx0 = main_worker->request_start;
+  int requests_per_thread = main_worker->request_end - main_worker->request_start;
   for (int idx = 0; idx < requests_per_thread; idx += BATCH_SIZE) {
     for (int b = 0; b < BATCH_SIZE; ++b) {
       inputs_seq[b] = get_str_req_ptr(requests, idx0 + idx + b);
       outputs_tokens[b] = get_tok_gen_ptr(requests, idx0 + idx + b);
     }
     num_token_out +=
-        simple_getp_generate(transformer, tokenizer, local_sampler, worker, inputs_seq,
+        simple_getp_generate(transformer, tokenizer, local_sampler, workers, inputs_seq,
                              outputs_tokens, requests->max_seq_len);
   }
 
@@ -264,24 +282,28 @@ long long inference(Transformer *transformer, Tokenizer *tokenizer,
 
   int n_devices;
   HIP_CHECK(hipGetDeviceCount(&n_devices));
-
-  int num_reqs_per_device = requests->num_reqs / n_devices;
-  for (int i = 0; i < n_devices; ++i) {
-    workers[i].request_start = i * num_reqs_per_device;
-    workers[i].request_end = (i + 1) * num_reqs_per_device;
-    if (i == n_devices - 1) workers[i].request_end = requests->num_reqs;
-    assert((workers[i].request_end - workers[i].request_start) % BATCH_SIZE == 0);
-  }
   
-  std::vector<long long> nums_token_out(n_devices);
-  std::vector<std::thread> threads(n_devices);
+  int n_parallel_models = n_devices / EXPERT_PARALLELISM;
 
-  for (int i = 0; i < n_devices; ++i) {
-    threads[i] = std::thread(single_thread_generate, 
-      transformer, tokenizer, sampler, requests, &workers[i], &nums_token_out[i], i);
+  int num_reqs_per_device = requests->num_reqs / n_parallel_models;
+  for (int i = 0; i < n_devices; i += EXPERT_PARALLELISM) {
+    for (int j = 0; j < EXPERT_PARALLELISM; ++j) {
+      workers[i + j].request_start = (i / EXPERT_PARALLELISM) * num_reqs_per_device;
+      workers[i + j].request_end = (i / EXPERT_PARALLELISM + 1) * num_reqs_per_device;
+      if (i == n_parallel_models - 1) workers[i].request_end = requests->num_reqs;
+      assert((workers[i].request_end - workers[i].request_start) % BATCH_SIZE == 0);
+    }
   }
 
-  for (int i = 0; i < n_devices; ++i) {
+  std::vector<long long> nums_token_out(n_parallel_models);
+  std::vector<std::thread> threads(n_parallel_models);
+
+  for (int i = 0; i < n_devices; i += EXPERT_PARALLELISM) {
+    threads[i / EXPERT_PARALLELISM] = std::thread(single_thread_generate, 
+      transformer, tokenizer, sampler, requests, &workers[i], &nums_token_out[i / EXPERT_PARALLELISM], i / EXPERT_PARALLELISM);
+  }
+
+  for (int i = 0; i < n_parallel_models; ++i) {
     threads[i].join();
   }
   
@@ -289,7 +311,7 @@ long long inference(Transformer *transformer, Tokenizer *tokenizer,
   HIP_CHECK(hipDeviceSynchronize());
 
   long long num_token_out = 0;
-  for (int i = 0; i < n_devices; ++i) {
+  for (int i = 0; i < n_parallel_models; ++i) {
     num_token_out += nums_token_out[i];
   }
   

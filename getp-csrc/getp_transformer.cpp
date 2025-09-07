@@ -1,6 +1,7 @@
 #pragma once
 #include "getp_transformer.hpp"
 
+#include <cassert>
 #include <hip/hip_runtime.h>
 
 #include <cmath>
@@ -138,8 +139,6 @@ static void upload_weights(TransformerWeights *w,
   getp_memcpy_fp32_to_bf16(p16, w->out, elems_out);
   p16 += elems_out;
 
-  int n_devices;
-  HIP_CHECK(hipGetDeviceCount(&n_devices));
   int experts_per_device = worker->expert_end - worker->expert_start;
   HIP_CHECK(hipMalloc(_dev_experts, (experts_size / sizeof(float)) *
                                         sizeof(__hip_bfloat16) / n_experts * 
@@ -170,8 +169,7 @@ static void upload_weights(TransformerWeights *w,
     getp_memcpy_fp32_to_bf16(
         ptr16,
         w->w_mlp2 + 1ll * l * n_experts * hidden_dim * intermediate_dim +
-            1ll * worker->expert_start * hidden_dim *
-                intermediate_dim,
+            1ll * worker->expert_start * hidden_dim * intermediate_dim,
         experts_per_device * hidden_dim * intermediate_dim);
     ptr16 += experts_per_device * hidden_dim * intermediate_dim;
   }

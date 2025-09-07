@@ -3,7 +3,8 @@
 #include <hip/hip_bf16.h>
 #include <hip/hip_runtime.h>
 
-#define BATCH_SIZE  (32)
+#define BATCH_SIZE            (32)
+#define EXPERT_PARALLELISM    (8)
 
 struct GPUWorker {
   int device_index;

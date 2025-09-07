@@ -1,4 +1,3 @@
-#include <hip/amd_detail/amd_hip_runtime.h>
 #include <hip/hip_runtime.h>
 #include <malloc.h>
 
@@ -1083,16 +1082,16 @@ static inline void getp_argmax_rows(const float *logits, int V, int *out,
 }
 
 int *getp_forward(Transformer * /*transformer*/,
-                  DeviceTransformer **dev_transformeres, GPUWorker *worker,
+                  DeviceTransformer **dev_transformers, GPUWorker *workers,
                   int token[], int pos) {
   PROFILE_FUNCTION();
 
-  int device_index = worker->device_index;
-  RunStateExt *ext = ext_get(device_index);
+  GPUWorker *main_worker = workers; // execute non-expert layers
+  int device_index = main_worker->device_index;
 
-  Config *p = &dev_transformeres[device_index]->config;
-  DeviceTransformerWeights *dev_w = &dev_transformeres[device_index]->weights;
-  RunState *dev_s = &dev_transformeres[device_index]->state;
+  Config *p = &dev_transformers[device_index]->config;
+  DeviceTransformerWeights *dev_w = &dev_transformers[device_index]->weights;
+  RunState *dev_s = &dev_transformers[device_index]->state;
 
   float *dev_x = dev_s->x;
   int head_dim = p->head_dim;
@@ -1176,46 +1175,75 @@ int *getp_forward(Transformer * /*transformer*/,
                                    p->experts_per_token, dev_s->topk_v,
                                    dev_s->topk_i, BATCH_SIZE);
 
-    getp_map_global_to_local_batch(dev_s->topk_i, dev_s->topk_v, ext->local_ids,
-                                   ext->local_wts, ext->n_local,
-                                   p->experts_per_token, worker->expert_start,
-                                   worker->expert_end, BATCH_SIZE);
-
-    int experts_per_device = worker->expert_end - worker->expert_start;
-
-    int cap_pairs = build_moe_buckets_local_pos(
-        ext->local_ids, ext->local_wts, ext->n_local, BATCH_SIZE,
-        p->experts_per_token, experts_per_device, ext->e_counts, ext->e_offsets,
-        ext->e_dev, ext->w_dev, ext->pair_pos);
-
     HIP_CHECK(hipMemset(dev_s->e_agg, 0,
                         (size_t)BATCH_SIZE * hidden_dim * sizeof(float)));
 
-    __hip_bfloat16 *w1_base = dev_w->w_mlp1 + 1ll * l * experts_per_device * 2 *
-                                                  p->intermediate_dim *
-                                                  hidden_dim;
-    __hip_bfloat16 *b1_base =
-        dev_w->b_mlp1 + 1ll * l * experts_per_device * 2 * p->intermediate_dim;
+    // TODO: Add async memcpy and kernel launch in MOE using stream
+    for (int i = 0; i < EXPERT_PARALLELISM; ++i) {
+      GPUWorker *expert_worker = workers + i;
+      int experts_per_device = expert_worker->expert_end - expert_worker->expert_start;
+      int expert_device_index = expert_worker->device_index;
 
-    launch_mlp1_swiglu_bf16_bucketed(dev_s->gate_up, dev_s->t, w1_base, b1_base,
-                                     ext->e_offsets, ext->e_dev, hidden_dim,
-                                     p->intermediate_dim, experts_per_device,
-                                     cap_pairs, p->swiglu_limit);
+      DeviceTransformerWeights *expert_dev_w = &dev_transformers[expert_device_index]->weights;
+      RunState *expert_dev_s = &dev_transformers[expert_device_index]->state;
+      RunStateExt *expert_ext = ext_get(expert_device_index);
 
-    __hip_bfloat16 *w2_base = dev_w->w_mlp2 + 1ll * l * experts_per_device *
-                                                  hidden_dim *
-                                                  p->intermediate_dim;
-    __hip_bfloat16 *b2_base =
-        dev_w->b_mlp2 + 1ll * l * experts_per_device * hidden_dim;
+      HIP_CHECK(hipSetDevice(expert_device_index));
 
-    launch_mlp2_partial_bf16_bucketed(
-        ext->z_partial, dev_s->gate_up, w2_base, b2_base, ext->w_dev,
-        ext->e_offsets, ext->e_dev, p->intermediate_dim, hidden_dim,
-        experts_per_device, cap_pairs);
+      if (expert_device_index != device_index) {
+        HIP_CHECK(hipMemcpyPeer(expert_dev_s->t, expert_device_index, dev_s->t, device_index, BATCH_SIZE * hidden_dim * sizeof(float)));
+        HIP_CHECK(hipMemcpyPeer(expert_dev_s->topk_i, expert_device_index, dev_s->topk_i, device_index, BATCH_SIZE * p->experts_per_token * sizeof(int)));
+        HIP_CHECK(hipMemcpyPeer(expert_dev_s->topk_v, expert_device_index, dev_s->topk_v, device_index, BATCH_SIZE * p->experts_per_token * sizeof(float)));
+      }
 
-    moe_gather_pairs(dev_s->e_agg, ext->z_partial, ext->pair_pos, hidden_dim,
-                     p->experts_per_token, BATCH_SIZE);
+      getp_map_global_to_local_batch(expert_dev_s->topk_i, expert_dev_s->topk_v, expert_ext->local_ids,
+                                     expert_ext->local_wts, expert_ext->n_local,
+                                     p->experts_per_token, expert_worker->expert_start,
+                                     expert_worker->expert_end, BATCH_SIZE);
+  
+      int cap_pairs = build_moe_buckets_local_pos(
+          expert_ext->local_ids, expert_ext->local_wts, expert_ext->n_local, BATCH_SIZE,
+          p->experts_per_token, experts_per_device, expert_ext->e_counts, expert_ext->e_offsets,
+          expert_ext->e_dev, expert_ext->w_dev, expert_ext->pair_pos);
+  
+      HIP_CHECK(hipMemset(expert_dev_s->e_agg, 0,
+                          (size_t)BATCH_SIZE * hidden_dim * sizeof(float)));
+  
+      __hip_bfloat16 *w1_base = expert_dev_w->w_mlp1 + 1ll * l * experts_per_device * 2 *
+                                                          p->intermediate_dim *
+                                                          hidden_dim;
+      __hip_bfloat16 *b1_base =
+          expert_dev_w->b_mlp1 + 1ll * l * experts_per_device * 2 * p->intermediate_dim;
+  
+      launch_mlp1_swiglu_bf16_bucketed(expert_dev_s->gate_up, expert_dev_s->t, w1_base, b1_base,
+                                       expert_ext->e_offsets, expert_ext->e_dev, hidden_dim,
+                                       p->intermediate_dim, experts_per_device,
+                                       cap_pairs, p->swiglu_limit);
+  
+      __hip_bfloat16 *w2_base = expert_dev_w->w_mlp2 + 1ll * l * experts_per_device *
+                                                          hidden_dim *
+                                                          p->intermediate_dim;
+      __hip_bfloat16 *b2_base =
+          expert_dev_w->b_mlp2 + 1ll * l * experts_per_device * hidden_dim;
+  
+      launch_mlp2_partial_bf16_bucketed(
+          expert_ext->z_partial, expert_dev_s->gate_up, w2_base, b2_base, expert_ext->w_dev,
+          expert_ext->e_offsets, expert_ext->e_dev, p->intermediate_dim, hidden_dim,
+          experts_per_device, cap_pairs);
+  
+      moe_gather_pairs(expert_dev_s->e_agg, expert_ext->z_partial, expert_ext->pair_pos, hidden_dim,
+                       p->experts_per_token, BATCH_SIZE);
 
+      if (expert_device_index != device_index) {
+        HIP_CHECK(hipDeviceSynchronize());
+        HIP_CHECK(hipMemcpyPeer(dev_s->tb2, device_index, expert_dev_s->e_agg, expert_device_index, BATCH_SIZE * hidden_dim * sizeof(float)));
+        HIP_CHECK(hipSetDevice(device_index));
+        getp_vecadd(dev_s->e_agg, dev_s->tb2, hidden_dim, BATCH_SIZE);
+        HIP_CHECK(hipDeviceSynchronize());
+      }
+    }
+
+    HIP_CHECK(hipSetDevice(device_index));
     getp_vecadd(dev_x, dev_s->e_agg, hidden_dim, BATCH_SIZE);
   }
 
