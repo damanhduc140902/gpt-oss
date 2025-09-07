@@ -14,7 +14,7 @@
 #include "profiler.hpp"
 
 #ifndef GEMV_TILE_N
-#define GEMV_TILE_N 1024
+#define GEMV_TILE_N 512
 #endif
 #ifndef GEMV_WARPS_PER_BLOCK
 #define GEMV_WARPS_PER_BLOCK 8
