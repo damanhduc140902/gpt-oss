@@ -483,6 +483,7 @@ static inline void launch_mlp1_swiglu_bf16_bucketed(
         gate_up_all, x, w1_layer, b1_layer, offsets, tok_idx,
         H, I, E, cap_pairs, swiglu_limit);
   }
+  //HIP_CHECK(hipDeviceSynchronize());
 }
 
 
@@ -790,6 +791,7 @@ static inline void launch_mlp2_partial_bf16_bucketed_mfma(
     const __hip_bfloat16 *b2_layer, const float *w_by_bucket,
     const int *offsets, const int *tok_idx, int I, int H, int E,
     int cap_pairs) {
+      PROFILE_FUNCTION();
   if (cap_pairs <= 16) {
     constexpr int BN = 32, BM = 16;
     dim3 block(128);
@@ -807,27 +809,8 @@ static inline void launch_mlp2_partial_bf16_bucketed_mfma(
         z_partial, gate_up_all, w2_layer, b2_layer, w_by_bucket,
         offsets, tok_idx, I, H, E, cap_pairs);
   }
+  //HIP_CHECK(hipDeviceSynchronize());
 }
-
-
-// static inline void launch_mlp2_partial_bf16_bucketed_mfma(
-//     float *z_partial, const float *gate_up_all, const __hip_bfloat16 *w2_layer,
-//     const __hip_bfloat16 *b2_layer, const float *w_by_bucket,
-//     const int *offsets, const int *tok_idx, int I, int H, int E,
-//     int cap_pairs) {
-//       PROFILE_FUNCTION();
-//   constexpr int BN = 32;
-//   constexpr int BM = 32;
-//   dim3 block(256);
-//   int by = (cap_pairs + BM - 1) / BM;
-//   dim3 grid((H + BN - 1) / BN, E * by);
-//   mlp2_partial_bf16_bucketed_mfma_kernel<<<grid, block>>>(
-//       z_partial, gate_up_all, w2_layer, b2_layer, w_by_bucket, offsets, tok_idx,
-//       I, H, E, cap_pairs);
-//       //HIP_CHECK(hipDeviceSynchronize());
-// }
-
-
 
 __global__ void moe_gather_pairs_kernel(float *__restrict__ e_agg,
                                         const float *__restrict__ z_partial,
