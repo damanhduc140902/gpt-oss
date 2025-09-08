@@ -529,9 +529,9 @@ __global__ void __launch_bounds__(128) mlp1_swiglu_bf16_bucketed_mfma16_kernel(
     __syncthreads();
 
     for (int k = 0; k < BK; k += MFMA_K) {
-      // const int rRow = mTile * WM + xMF;
-      // float amk = (rRow < tcnt) ? sx[k + yMF][rRow] : 0.f;
-      float amk = sx[k + yMF][mTile * WM + xMF];
+      const int rRow = mTile * WM + xMF;
+      float amk = (rRow < tcnt) ? sx[k + yMF][rRow] : 0.f;
+      // float amk = sx[k + yMF][mTile * WM + xMF];
       float bgk = swg[k + yMF][nTile * WN + xMF];
       float buk = swu[k + yMF][nTile * WN + xMF];
       dgn = __builtin_amdgcn_mfma_f32_16x16x4f32(amk, bgk, dgn, 0, 0, 0);
@@ -703,7 +703,8 @@ mlp2_partial_bf16_bucketed_splitk_kernel(
     __syncthreads();
 
     for (int k = 0; k < BK; k += MFMA_K) {
-      float amk = sx[(k + yMF) * BM + (yTile * WM + xMF)];
+      // float amk = sx[(k + yMF) * BM + (yTile * WM + xMF)];
+      float amk = (yTile * WM + xMF < tcnt) ? sx[(k + yMF) * BM + (yTile * WM + xMF)] : 0.f;
       float bkn = sw[(k + yMF) * BN + (xTile * WN + xMF)];
       dmn = __builtin_amdgcn_mfma_f32_16x16x4f32(amk, bkn, dmn, 0, 0, 0);
     }
