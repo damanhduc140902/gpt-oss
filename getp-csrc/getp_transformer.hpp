@@ -71,5 +71,8 @@ struct DeviceTransformer {
 
   int device_index;
 
+  hipStream_t memory_stream;
+  hipStream_t compute_stream;
+
   ~DeviceTransformer();
 };

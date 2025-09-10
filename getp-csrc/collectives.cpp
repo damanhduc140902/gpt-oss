@@ -74,39 +74,103 @@ void cgBroadcastF32(const CollectiveGroup& g, float** bufs, size_t count,
 // Reduce-to-root (sum) then broadcast result to all
 void cgAllReduceSumF32(const CollectiveGroup& g, float** bufs, size_t count,
                        int root_rank, bool sync) {
+  // TODO: Add comm-comp overlapping
   const size_t bytes = count * sizeof(float);
   if (g.ranks.size() <= 1) return; // no-op
 
   const int root_dev = g.ranks[root_rank];
 
+  // assert(root_dev == 0);
+  // assert(root_rank == 0);
+
   // Root scratch buffer
   HIP_CHECK(hipSetDevice(root_dev));
   float* tmp = nullptr;
-  HIP_CHECK(hipMalloc(&tmp, bytes));
+  HIP_CHECK(hipMalloc(&tmp, bytes * (g.ranks.size() - 1)));
 
-  // Accumulate other ranks into root
-  for (size_t r = 0; r < g.ranks.size(); ++r) {
+  // Gather peer buffers
+  for (size_t r = 0, peer_order = 0; r < g.ranks.size(); ++r) {
     if ((int)r == root_rank) continue;
 
     // Copy peer buffer to root scratch
     HIP_CHECK(hipMemcpyPeerAsync(
-        tmp, root_dev,
+        tmp + count * peer_order, root_dev,
         bufs[r], g.ranks[r],
         bytes, g.comm[root_rank]));
+
+    ++peer_order;
+  }
+
+  // Accumulate other ranks into root
+  for (size_t r = 0, peer_order = 0; r < g.ranks.size(); ++r) {
+    if ((int)r == root_rank) continue;
 
     // Launch in-place add on root
     const int BLK = 256;
     const int GRD = (int)((count + BLK - 1) / BLK);
     hipLaunchKernelGGL(add_inplace_f32, dim3(GRD), dim3(BLK), 0, g.comm[root_rank],
-                       bufs[root_rank], tmp, count);
+                       bufs[root_rank], tmp + count * peer_order, count);
+    
+    ++peer_order;
   }
 
-  // Make sure reduction is finished before broadcasting
-  HIP_CHECK(hipStreamSynchronize(g.comm[root_rank]));
+  // Make sure reduction is finished
+  HIP_CHECK(hipSetDevice(root_dev));
+  HIP_CHECK(hipDeviceSynchronize());
+  
   HIP_CHECK(hipFree(tmp));
 
   // Broadcast the reduced buffer from root to all
   cgBroadcastF32(g, bufs, count, root_rank, /*sync=*/sync);
+}
+
+void cgReduceSumF32(const CollectiveGroup& g, float** bufs, size_t count,
+                    int root_rank, bool sync) {
+  // TODO: Add comm-comp overlapping
+  const size_t bytes = count * sizeof(float);
+  if (g.ranks.size() <= 1) return; // no-op
+
+  const int root_dev = g.ranks[root_rank];
+
+  // assert(root_dev == 0);
+  // assert(root_rank == 0);
+
+  // Root scratch buffer
+  HIP_CHECK(hipSetDevice(root_dev));
+  float* tmp = nullptr;
+  HIP_CHECK(hipMalloc(&tmp, bytes * (g.ranks.size() - 1)));
+
+  // Gather peer buffers
+  for (size_t r = 0, peer_order = 0; r < g.ranks.size(); ++r) {
+    if ((int)r == root_rank) continue;
+
+    // Copy peer buffer to root scratch
+    HIP_CHECK(hipMemcpyPeerAsync(
+        tmp + count * peer_order, root_dev,
+        bufs[r], g.ranks[r],
+        bytes, g.comm[root_rank]));
+
+    ++peer_order;
+  }
+
+  // Accumulate other ranks into root
+  for (size_t r = 0, peer_order = 0; r < g.ranks.size(); ++r) {
+    if ((int)r == root_rank) continue;
+
+    // Launch in-place add on root
+    const int BLK = 256;
+    const int GRD = (int)((count + BLK - 1) / BLK);
+    hipLaunchKernelGGL(add_inplace_f32, dim3(GRD), dim3(BLK), 0, g.comm[root_rank],
+                       bufs[root_rank], tmp + count * peer_order, count);
+    
+    ++peer_order;
+  }
+
+  // Make sure reduction is finished
+  HIP_CHECK(hipSetDevice(root_dev));
+  HIP_CHECK(hipDeviceSynchronize());
+  
+  HIP_CHECK(hipFree(tmp));
 }
 
 // Argmax across ranks for a **single** (val, idx) (host staging; tiny payload)

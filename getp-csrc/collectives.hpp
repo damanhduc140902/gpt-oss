@@ -25,8 +25,34 @@ void cgDestroy(CollectiveGroup& g);
 void cgBroadcastF32(const CollectiveGroup& g, float** bufs, size_t count,
                     int root_rank = 0, bool sync = true);
 
+// Broadcast from root to all peers (P2P when possible)
+template <typename T>
+void cgBroadcast(const CollectiveGroup& g, T** bufs, size_t count,
+                 int root_rank, bool sync = true) {
+  const size_t bytes = count * sizeof(T);
+  if (g.ranks.size() <= 1) return; // no-op on single GPU
+
+  // Copy root -> others
+  for (size_t r = 0; r < g.ranks.size(); ++r) {
+    if ((int)r == root_rank) continue;
+    HIP_CHECK(hipMemcpyPeerAsync(
+        /*dst=*/bufs[r], g.ranks[r],
+        /*src=*/bufs[root_rank], g.ranks[root_rank],
+        bytes, g.comm[r]));
+  }
+
+  if (sync) {
+    for (size_t r = 0; r < g.ranks.size(); ++r) {
+      HIP_CHECK(hipSetDevice(g.ranks[r]));
+      HIP_CHECK(hipStreamSynchronize(g.comm[r]));
+    }
+  }
+}
+
 void cgAllReduceSumF32(const CollectiveGroup& g, float** bufs, size_t count,
                        int root_rank = 0, bool sync = true);
+void cgReduceSumF32(const CollectiveGroup& g, float** bufs, size_t count,
+                    int root_rank = 0, bool sync = true);
 
 void cgAllReduceArgmaxF32I32(const CollectiveGroup& g,
                              float** vals, int** idxs,

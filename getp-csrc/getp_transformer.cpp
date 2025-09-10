@@ -248,8 +248,12 @@ void upload_transformer(Transformer *transformer,
       &dev_transformer->dev_linear_bf16, 
       worker, dev_transformer->device_index);
   init_device_run_state(&dev_transformer->state, &dev_transformer->config);
+  HIP_CHECK(hipStreamCreate(&dev_transformer->memory_stream));
+  HIP_CHECK(hipStreamCreate(&dev_transformer->compute_stream));
 }
 
 void cleanup(Transformer *transformer, DeviceTransformer *dev_transformer) {
   free_device_run_state(&dev_transformer->state);
+  HIP_CHECK(hipStreamDestroy(dev_transformer->memory_stream));
+  HIP_CHECK(hipStreamDestroy(dev_transformer->compute_stream));
 }
