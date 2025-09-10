@@ -265,6 +265,12 @@ long long inference(Transformer *transformer, Tokenizer *tokenizer,
   int n_devices;
   HIP_CHECK(hipGetDeviceCount(&n_devices));
 
+  int seq_len_eff = std::min(transformer->config.seq_len, requests->max_seq_len);
+  for (int i = 0; i < n_devices; ++i) {
+    resize_kv_cache(dev_transformers[i], seq_len_eff);
+  }
+  
+
   int num_reqs_per_device = requests->num_reqs / n_devices;
   for (int i = 0; i < n_devices; ++i) {
     workers[i].request_start = i * num_reqs_per_device;

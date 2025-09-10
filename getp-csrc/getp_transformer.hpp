@@ -3,7 +3,7 @@
 #include <hip/hip_bf16.h>
 #include <hip/hip_runtime.h>
 
-#define BATCH_SIZE  (32)
+#define BATCH_SIZE (448)
 
 struct GPUWorker {
   int device_index;
@@ -28,10 +28,10 @@ struct DeviceTransformerWeights {
               // (out_features, in_features) w_k (head_dim * n_kv_heads,
               // hidden_dim)  (out_features, in_features) w_v (head_dim *
               // n_kv_heads, hidden_dim)  (out_features, in_features)
-  float *w_o;    // (n_layers, hidden_dim, head_dim * n_attn_heads)
-  float *b_qkv;  // (n_layers, head_dim * n_attn_heads + 2 * head_dim *
-                 // n_kv_heads) (head_dim * n_attn_heads) (head_dim *
-                 // n_kv_heads) (head_dim * n_kv_heads)
+  float *w_o;         // (n_layers, hidden_dim, head_dim * n_attn_heads)
+  float *b_qkv;       // (n_layers, head_dim * n_attn_heads + 2 * head_dim *
+                      // n_kv_heads) (head_dim * n_attn_heads) (head_dim *
+                      // n_kv_heads) (head_dim * n_kv_heads)
   float *b_o;         // (n_layers, hidden_dim)
   float *attn_sinks;  // (n_layers, n_attn_heads)
   // weights for router [mlp.gate.weight & mlp.gate.bias]
@@ -56,6 +56,8 @@ struct DeviceTransformerWeights {
   __hip_bfloat16 *w_o_bf16, *b_o_bf16;
   __hip_bfloat16 *w_router_bf16, *b_router_bf16;
   __hip_bfloat16 *out_bf16;
+
+  __hip_bfloat16 *token_embedding_table_bf16;
 };
 
 struct DeviceTransformer {

@@ -47,175 +47,212 @@ void getp_memcpy_fp32_to_bf16(__hip_bfloat16 *dst, float *src, int n_elements) {
 static void upload_weights(TransformerWeights *w,
                            DeviceTransformerWeights *dev_w, Config *cfg,
                            float **_dev_data, __hip_bfloat16 **_dev_experts,
-                           __hip_bfloat16 **_dev_linear_bf16,
-                           GPUWorker *worker, int device_index) {
-  int head_dim = cfg->head_dim;
-  int n_layers = cfg->n_layers;
-  int n_experts = cfg->n_experts;
-  int intermediate_dim = cfg->intermediate_dim;
-  int hidden_dim = cfg->hidden_dim;
-
-  float *weights_begin = w->token_embedding_table;
-  float *weights_end = w->b_mlp2 + 1ll * n_layers * n_experts * cfg->hidden_dim;
-  ssize_t weights_size = (weights_end - weights_begin) * sizeof(float);
-
-  float *experts_begin = w->w_mlp1;
-  float *experts_end = weights_end;
-  ssize_t experts_size = (experts_end - experts_begin) * sizeof(float);
-
+                           __hip_bfloat16 **_dev_linear_bf16, GPUWorker *worker,
+                           int device_index) {
   HIP_CHECK(hipSetDevice(device_index));
-  {
-    HIP_CHECK(hipMalloc(_dev_data, weights_size - experts_size));
-    HIP_CHECK(hipMemcpy(*_dev_data, w->token_embedding_table,
-                        weights_size - experts_size, hipMemcpyHostToDevice));
-    float *ptr = *_dev_data;
-    dev_w->token_embedding_table = ptr;
-    ptr += 1ll * cfg->vocab_size * cfg->hidden_dim;
-    dev_w->out = ptr;
-    ptr += 1ll * cfg->vocab_size * cfg->hidden_dim;
-    dev_w->rms_attn_w = ptr;
-    ptr += 1ll * n_layers * cfg->hidden_dim;
-    dev_w->rms_ffn_w = ptr;
-    ptr += 1ll * n_layers * cfg->hidden_dim;
-    dev_w->rms_out_w = ptr;
-    ptr += 1ll * cfg->hidden_dim;
-    dev_w->w_qkv = ptr;
-    ptr += 1ll * n_layers * cfg->hidden_dim *
-           (head_dim * cfg->n_attn_heads + 2 * head_dim * cfg->n_kv_heads);
-    dev_w->b_qkv = ptr;
-    ptr += 1ll * n_layers *
-           (head_dim * cfg->n_attn_heads + 2 * head_dim * cfg->n_kv_heads);
-    dev_w->w_o = ptr;
-    ptr += 1ll * n_layers * (head_dim * cfg->n_attn_heads) * cfg->hidden_dim;
-    dev_w->b_o = ptr;
-    ptr += 1ll * n_layers * cfg->hidden_dim;
-    dev_w->attn_sinks = ptr;
-    ptr += 1ll * n_layers * cfg->n_attn_heads;
-    dev_w->w_router = ptr;
-    ptr += 1ll * n_layers * cfg->hidden_dim * n_experts;
-    dev_w->b_router = ptr;
-    ptr += 1ll * n_layers * n_experts;
-  }
 
-  size_t elems_w_qkv =
-      1ll * n_layers * hidden_dim *
-      (head_dim * cfg->n_attn_heads + 2 * head_dim * cfg->n_kv_heads);
-  size_t elems_b_qkv =
-      1ll * n_layers *
-      (head_dim * cfg->n_attn_heads + 2 * head_dim * cfg->n_kv_heads);
-  size_t elems_w_o =
-      1ll * n_layers * hidden_dim * (head_dim * cfg->n_attn_heads);
-  size_t elems_b_o = 1ll * n_layers * hidden_dim;
-  size_t elems_w_router = 1ll * n_layers * hidden_dim * n_experts;
-  size_t elems_b_router = 1ll * n_layers * n_experts;
-  size_t elems_out = 1ll * cfg->vocab_size * hidden_dim;
+  const int L = cfg->n_layers;
+  const int E = cfg->n_experts;
+  const int H = cfg->hidden_dim;
+  const int D = cfg->head_dim;
+  const int I = cfg->intermediate_dim;
 
-  size_t linear_elems = elems_w_qkv + elems_b_qkv + elems_w_o + elems_b_o +
-                        elems_w_router + elems_b_router + elems_out;
+  const size_t emb_elems = (size_t)cfg->vocab_size * (size_t)H;
+  const size_t rms_attn_elems = (size_t)L * (size_t)H;
+  const size_t rms_ffn_elems = (size_t)L * (size_t)H;
+  const size_t rms_out_elems = (size_t)H;
+  const size_t sinks_elems = (size_t)L * (size_t)cfg->n_attn_heads;
 
-  HIP_CHECK(hipMalloc(_dev_linear_bf16, linear_elems * sizeof(__hip_bfloat16)));
+  const size_t keep_fp32_elems =
+      rms_attn_elems + rms_ffn_elems + rms_out_elems + sinks_elems;
+
+  HIP_CHECK(hipMalloc(_dev_data, keep_fp32_elems * sizeof(float)));
+  float *p32 = *_dev_data;
+
+  dev_w->rms_attn_w = p32;
+  HIP_CHECK(hipMemcpy(p32, w->rms_attn_w, rms_attn_elems * sizeof(float),
+                      hipMemcpyHostToDevice));
+  p32 += rms_attn_elems;
+
+  dev_w->rms_ffn_w = p32;
+  HIP_CHECK(hipMemcpy(p32, w->rms_ffn_w, rms_ffn_elems * sizeof(float),
+                      hipMemcpyHostToDevice));
+  p32 += rms_ffn_elems;
+
+  dev_w->rms_out_w = p32;
+  HIP_CHECK(hipMemcpy(p32, w->rms_out_w, rms_out_elems * sizeof(float),
+                      hipMemcpyHostToDevice));
+  p32 += rms_out_elems;
+
+  dev_w->attn_sinks = p32;
+  HIP_CHECK(hipMemcpy(p32, w->attn_sinks, sinks_elems * sizeof(float),
+                      hipMemcpyHostToDevice));
+  p32 += sinks_elems;
+
+  dev_w->token_embedding_table = nullptr;
+  dev_w->w_qkv = dev_w->b_qkv = nullptr;
+  dev_w->w_o = dev_w->b_o = nullptr;
+  dev_w->w_router = dev_w->b_router = nullptr;
+  dev_w->out = nullptr;
+
+  const size_t wqkv = (size_t)L * (size_t)H *
+                      ((size_t)D * (size_t)cfg->n_attn_heads +
+                       2ull * (size_t)D * (size_t)cfg->n_kv_heads);
+  const size_t bqkv = (size_t)L * ((size_t)D * (size_t)cfg->n_attn_heads +
+                                   2ull * (size_t)D * (size_t)cfg->n_kv_heads);
+  const size_t wo =
+      (size_t)L * (size_t)H * (size_t)D * (size_t)cfg->n_attn_heads;
+  const size_t bo = (size_t)L * (size_t)H;
+  const size_t wr = (size_t)L * (size_t)H * (size_t)E;
+  const size_t br = (size_t)L * (size_t)E;
+  const size_t wout = (size_t)cfg->vocab_size * (size_t)H;
+
+  const size_t linear_bf16_elems =
+      emb_elems + wqkv + bqkv + wo + bo + wr + br + wout;
+
+  HIP_CHECK(
+      hipMalloc(_dev_linear_bf16, linear_bf16_elems * sizeof(__hip_bfloat16)));
   __hip_bfloat16 *p16 = *_dev_linear_bf16;
 
+  dev_w->token_embedding_table_bf16 = p16;
+  getp_memcpy_fp32_to_bf16(p16, w->token_embedding_table, emb_elems);
+  p16 += emb_elems;
+
   dev_w->w_qkv_bf16 = p16;
-  getp_memcpy_fp32_to_bf16(p16, w->w_qkv, elems_w_qkv);
-  p16 += elems_w_qkv;
+  getp_memcpy_fp32_to_bf16(p16, w->w_qkv, wqkv);
+  p16 += wqkv;
   dev_w->b_qkv_bf16 = p16;
-  getp_memcpy_fp32_to_bf16(p16, w->b_qkv, elems_b_qkv);
-  p16 += elems_b_qkv;
+  getp_memcpy_fp32_to_bf16(p16, w->b_qkv, bqkv);
+  p16 += bqkv;
   dev_w->w_o_bf16 = p16;
-  getp_memcpy_fp32_to_bf16(p16, w->w_o, elems_w_o);
-  p16 += elems_w_o;
+  getp_memcpy_fp32_to_bf16(p16, w->w_o, wo);
+  p16 += wo;
   dev_w->b_o_bf16 = p16;
-  getp_memcpy_fp32_to_bf16(p16, w->b_o, elems_b_o);
-  p16 += elems_b_o;
+  getp_memcpy_fp32_to_bf16(p16, w->b_o, bo);
+  p16 += bo;
   dev_w->w_router_bf16 = p16;
-  getp_memcpy_fp32_to_bf16(p16, w->w_router, elems_w_router);
-  p16 += elems_w_router;
+  getp_memcpy_fp32_to_bf16(p16, w->w_router, wr);
+  p16 += wr;
   dev_w->b_router_bf16 = p16;
-  getp_memcpy_fp32_to_bf16(p16, w->b_router, elems_b_router);
-  p16 += elems_b_router;
+  getp_memcpy_fp32_to_bf16(p16, w->b_router, br);
+  p16 += br;
   dev_w->out_bf16 = p16;
-  getp_memcpy_fp32_to_bf16(p16, w->out, elems_out);
-  p16 += elems_out;
+  getp_memcpy_fp32_to_bf16(p16, w->out, wout);
+  p16 += wout;
 
-  int n_devices;
-  HIP_CHECK(hipGetDeviceCount(&n_devices));
-  int experts_per_device = worker->expert_end - worker->expert_start;
-  HIP_CHECK(hipMalloc(_dev_experts, (experts_size / sizeof(float)) *
-                                        sizeof(__hip_bfloat16) / n_experts * 
-                                        experts_per_device));
-  __hip_bfloat16 *ptr16 = *_dev_experts;
+  const int experts_per_device = worker->expert_end - worker->expert_start;
+  const size_t w1_per_layer = 2ull * (size_t)I * (size_t)H;
+  const size_t b1_per_layer = 2ull * (size_t)I;
+  const size_t w2_per_layer = (size_t)H * (size_t)I;
+  const size_t b2_per_layer = (size_t)H;
+  const size_t expert_layer_pack =
+      w1_per_layer + b1_per_layer + w2_per_layer + b2_per_layer;
+  const size_t expert_total =
+      (size_t)L * (size_t)experts_per_device * expert_layer_pack;
 
-  dev_w->w_mlp1 = ptr16;
-  for (int l = 0; l < n_layers; ++l) {
-    getp_memcpy_fp32_to_bf16(
-        ptr16,
-        w->w_mlp1 + 1ll * l * n_experts * 2 * intermediate_dim * hidden_dim +
-            1ll * worker->expert_start * 2 *
-                intermediate_dim * hidden_dim,
-        experts_per_device * 2 * intermediate_dim * hidden_dim);
-    ptr16 += experts_per_device * 2 * intermediate_dim * hidden_dim;
+  HIP_CHECK(hipMalloc(_dev_experts, expert_total * sizeof(__hip_bfloat16)));
+  __hip_bfloat16 *e16 = *_dev_experts;
+
+  dev_w->w_mlp1 = e16;
+  for (int l = 0; l < L; ++l) {
+    getp_memcpy_fp32_to_bf16(e16,
+                             w->w_mlp1 + 1ll * l * E * 2 * I * H +
+                                 1ll * worker->expert_start * 2 * I * H,
+                             (size_t)experts_per_device * 2ull * I * H);
+    e16 += (size_t)experts_per_device * 2ull * I * H;
   }
-  dev_w->b_mlp1 = ptr16;
-  for (int l = 0; l < n_layers; ++l) {
+  dev_w->b_mlp1 = e16;
+  for (int l = 0; l < L; ++l) {
     getp_memcpy_fp32_to_bf16(
-        ptr16,
-        w->b_mlp1 + 1ll * l * n_experts * 2 * intermediate_dim +
-            1ll * worker->expert_start * 2 * intermediate_dim,
-        experts_per_device * 2 * intermediate_dim);
-    ptr16 += experts_per_device * 2 * intermediate_dim;
+        e16,
+        w->b_mlp1 + 1ll * l * E * 2 * I + 1ll * worker->expert_start * 2 * I,
+        (size_t)experts_per_device * 2ull * I);
+    e16 += (size_t)experts_per_device * 2ull * I;
   }
-  dev_w->w_mlp2 = ptr16;
-  for (int l = 0; l < n_layers; ++l) {
+  dev_w->w_mlp2 = e16;
+  for (int l = 0; l < L; ++l) {
     getp_memcpy_fp32_to_bf16(
-        ptr16,
-        w->w_mlp2 + 1ll * l * n_experts * hidden_dim * intermediate_dim +
-            1ll * worker->expert_start * hidden_dim *
-                intermediate_dim,
-        experts_per_device * hidden_dim * intermediate_dim);
-    ptr16 += experts_per_device * hidden_dim * intermediate_dim;
+        e16,
+        w->w_mlp2 + 1ll * l * E * H * I + 1ll * worker->expert_start * H * I,
+        (size_t)experts_per_device * (size_t)H * (size_t)I);
+    e16 += (size_t)experts_per_device * (size_t)H * (size_t)I;
   }
-  dev_w->b_mlp2 = ptr16;
-  for (int l = 0; l < n_layers; ++l) {
+  dev_w->b_mlp2 = e16;
+  for (int l = 0; l < L; ++l) {
     getp_memcpy_fp32_to_bf16(
-        ptr16,
-        w->b_mlp2 + 1ll * l * n_experts * hidden_dim +
-            1ll * worker->expert_start * hidden_dim,
-        experts_per_device * hidden_dim);
-    ptr16 += experts_per_device * hidden_dim;
+        e16, w->b_mlp2 + 1ll * l * E * H + 1ll * worker->expert_start * H,
+        (size_t)experts_per_device * (size_t)H);
+    e16 += (size_t)experts_per_device * (size_t)H;
   }
 }
 
 void init_device_run_state(RunState *s, Config *p) {
   int kv_dim = p->head_dim * p->n_kv_heads;
-  HIP_CHECK(hipMalloc(&s->x, BATCH_SIZE * p->hidden_dim * sizeof(float))); // (batch, hidden_dim)
-  HIP_CHECK(hipMalloc(&s->t, BATCH_SIZE * p->hidden_dim * sizeof(float))); // (batch, hidden_dim)
-  HIP_CHECK(hipMalloc(&s->tb, BATCH_SIZE * p->head_dim * p->n_attn_heads * sizeof(float))); // (batch, n_attn_heads, head_dim)
-  HIP_CHECK(hipMalloc(&s->tb2, BATCH_SIZE * p->hidden_dim * sizeof(float)));  // (batch, hidden_dim)
-  HIP_CHECK(hipMalloc(&s->router_score, BATCH_SIZE * p->n_experts * sizeof(float))); // (batch, n_experts)
-  HIP_CHECK(hipMalloc(&s->topk_v, BATCH_SIZE * p->experts_per_token * sizeof(float))); // (batch, experts_per_token)
-  HIP_CHECK(hipMalloc(&s->topk_i, BATCH_SIZE * p->experts_per_token * sizeof(int))); // (batch, experts_per_token)
-  HIP_CHECK(hipMalloc(&s->mlp1_out, 2 * p->intermediate_dim * sizeof(float))); // no used?
-  HIP_CHECK(hipMalloc(&s->gate, p->intermediate_dim * sizeof(float)));  // no used?
-  HIP_CHECK(hipMalloc(&s->up, p->intermediate_dim * sizeof(float))); // no used?
-  HIP_CHECK(hipMalloc(&s->gate_up, BATCH_SIZE * p->experts_per_token * p->intermediate_dim * sizeof(float)));
-  HIP_CHECK(hipMalloc(&s->e_agg, BATCH_SIZE * p->hidden_dim * sizeof(float))); // (batch, hidden_dim)
-  HIP_CHECK(hipMalloc(&s->qkv, p->head_dim * (p->n_attn_heads + 2 * p->n_kv_heads) * sizeof(float))); // no used
-  HIP_CHECK(hipMalloc(&s->q, BATCH_SIZE * p->n_attn_heads * p->head_dim * sizeof(float))); // (batch, n_attn_heads, head_dim)
-  HIP_CHECK(hipMalloc(&s->key_cache, BATCH_SIZE * p->n_layers * p->seq_len * kv_dim * sizeof(float))); // (layer, seq_len, batch, n_kv_heads, head_dim)
-  HIP_CHECK(hipMalloc(&s->value_cache, BATCH_SIZE * p->n_layers * p->seq_len * kv_dim * sizeof(float))); // (layer, seq_len, batch, n_kv_heads, head_dim)
-  HIP_CHECK(hipMalloc(&s->att, BATCH_SIZE * p->n_attn_heads * (p->seq_len + 1) * sizeof(float))); // (batch, n_attn_heads, seq_len + 1)
-  HIP_CHECK(hipMalloc(&s->logits, BATCH_SIZE * p->vocab_size * sizeof(float))); // (batch, vocab)
-  if (p->sliding_window > 0) {
-    HIP_CHECK(hipMalloc(&s->mask, p->seq_len * p->seq_len * sizeof(float)));
-    dim3 blockDim(32, 32);
-    dim3 gridDim((p->seq_len + blockDim.x - 1) / blockDim.x,
-                 (p->seq_len + blockDim.y - 1) / blockDim.y);
-    init_mask_kernel<<<gridDim, blockDim>>>(s->mask, p->seq_len,
-                                            p->sliding_window);
-  } else {
-    s->mask = NULL;
-  }
+
+  HIP_CHECK(
+      hipMalloc(&s->x, (size_t)BATCH_SIZE * p->hidden_dim * sizeof(float)));
+  HIP_CHECK(
+      hipMalloc(&s->t, (size_t)BATCH_SIZE * p->hidden_dim * sizeof(float)));
+  HIP_CHECK(hipMalloc(&s->tb, (size_t)BATCH_SIZE * p->head_dim *
+                                  p->n_attn_heads * sizeof(float)));
+  HIP_CHECK(
+      hipMalloc(&s->tb2, (size_t)BATCH_SIZE * p->hidden_dim * sizeof(float)));
+  HIP_CHECK(hipMalloc(&s->router_score,
+                      (size_t)BATCH_SIZE * p->n_experts * sizeof(float)));
+  HIP_CHECK(hipMalloc(
+      &s->topk_v, (size_t)BATCH_SIZE * p->experts_per_token * sizeof(float)));
+  HIP_CHECK(hipMalloc(&s->topk_i,
+                      (size_t)BATCH_SIZE * p->experts_per_token * sizeof(int)));
+  HIP_CHECK(
+      hipMalloc(&s->mlp1_out, (size_t)2 * p->intermediate_dim * sizeof(float)));
+  HIP_CHECK(hipMalloc(&s->gate, (size_t)p->intermediate_dim * sizeof(float)));
+  HIP_CHECK(hipMalloc(&s->up, (size_t)p->intermediate_dim * sizeof(float)));
+  HIP_CHECK(hipMalloc(&s->gate_up, (size_t)BATCH_SIZE * p->experts_per_token *
+                                       p->intermediate_dim * sizeof(float)));
+  HIP_CHECK(
+      hipMalloc(&s->e_agg, (size_t)BATCH_SIZE * p->hidden_dim * sizeof(float)));
+  s->qkv = nullptr;
+  HIP_CHECK(hipMalloc(&s->q, (size_t)BATCH_SIZE * p->n_attn_heads *
+                                 p->head_dim * sizeof(float)));
+
+  const int even_layers = (p->n_layers + 1) / 2;
+  const int even_tcap = (p->sliding_window > 0 ? p->sliding_window : 1);
+  const int odd_tcap = 1;
+  const size_t total_t = (size_t)even_layers * (size_t)even_tcap +
+                         (size_t)(p->n_layers - even_layers) * (size_t)odd_tcap;
+
+  HIP_CHECK(hipMalloc(&s->key_cache, (size_t)BATCH_SIZE * total_t *
+                                         (size_t)kv_dim * sizeof(float)));
+  HIP_CHECK(hipMalloc(&s->value_cache, (size_t)BATCH_SIZE * total_t *
+                                           (size_t)kv_dim * sizeof(float)));
+
+  s->att = nullptr;
+  HIP_CHECK(hipMalloc(&s->logits,
+                      (size_t)BATCH_SIZE * p->vocab_size * sizeof(float)));
+  s->mask = NULL;
+}
+
+static inline size_t kv_total_t(const Config *p) {
+  const int even_layers = (p->n_layers + 1) / 2;
+  const int even_tcap =
+      (p->sliding_window > 0 ? p->sliding_window : p->seq_len);
+  return (size_t)even_layers * (size_t)even_tcap +
+         (size_t)(p->n_layers - even_layers) * (size_t)p->seq_len;
+}
+
+void resize_kv_cache(DeviceTransformer *dev, int seq_len_eff) {
+  HIP_CHECK(hipSetDevice(dev->device_index));
+  dev->config.seq_len = seq_len_eff;
+  const int kv_dim = dev->config.head_dim * dev->config.n_kv_heads;
+  const size_t total_t = kv_total_t(&dev->config);
+  HIP_CHECK(hipFree(dev->state.key_cache));
+  HIP_CHECK(hipFree(dev->state.value_cache));
+  HIP_CHECK(
+      hipMalloc(&dev->state.key_cache,
+                (size_t)BATCH_SIZE * total_t * (size_t)kv_dim * sizeof(float)));
+  HIP_CHECK(
+      hipMalloc(&dev->state.value_cache,
+                (size_t)BATCH_SIZE * total_t * (size_t)kv_dim * sizeof(float)));
 }
 
 void free_device_run_state(RunState *s) {
@@ -231,9 +268,9 @@ void free_device_run_state(RunState *s) {
   HIP_CHECK(hipFree(s->up));
   HIP_CHECK(hipFree(s->gate_up));
   HIP_CHECK(hipFree(s->e_agg));
-  HIP_CHECK(hipFree(s->qkv));
+  if (s->qkv) HIP_CHECK(hipFree(s->qkv));
   HIP_CHECK(hipFree(s->q));
-  HIP_CHECK(hipFree(s->att));
+  if (s->att) HIP_CHECK(hipFree(s->att));
   HIP_CHECK(hipFree(s->logits));
   HIP_CHECK(hipFree(s->key_cache));
   HIP_CHECK(hipFree(s->value_cache));
@@ -241,14 +278,12 @@ void free_device_run_state(RunState *s) {
 }
 
 void upload_transformer(Transformer *transformer,
-                        DeviceTransformer *dev_transformer, 
-                        GPUWorker *worker) {
+                        DeviceTransformer *dev_transformer, GPUWorker *worker) {
   dev_transformer->config = transformer->config;
   upload_weights(
       &transformer->weights, &dev_transformer->weights, &transformer->config,
       &dev_transformer->dev_data, &dev_transformer->dev_experts,
-      &dev_transformer->dev_linear_bf16, 
-      worker, dev_transformer->device_index);
+      &dev_transformer->dev_linear_bf16, worker, dev_transformer->device_index);
   init_device_run_state(&dev_transformer->state, &dev_transformer->config);
 }
 
