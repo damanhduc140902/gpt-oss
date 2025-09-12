@@ -104,11 +104,10 @@ long long simple_getp_generate(Transformer *transformer, Tokenizer *tokenizer,
 
   // Inference here
 
-  // const char *empty_prompt = "";
-  const char *hello_prompt = "Hello";
+  const char *empty_prompt = "";
   for (int b = 0; b < BATCH_SIZE; ++b) {
     if (inputs_seq[b] == NULL) {
-      inputs_seq[b] = hello_prompt;
+      inputs_seq[b] = empty_prompt;
     }
   }
 
@@ -139,7 +138,7 @@ long long simple_getp_generate(Transformer *transformer, Tokenizer *tokenizer,
   for (int b = 0; b < BATCH_SIZE; ++b) {
     token[b] = prompts_tokens[b][0];
     epos[b] = -1;
-    mask[b] = outputs_tokens[b] ? 1 : 0;
+    mask[b] = 1;
   }
 
   // print the very first token
@@ -163,7 +162,7 @@ long long simple_getp_generate(Transformer *transformer, Tokenizer *tokenizer,
     // advance the state machine
     pos++;
     for (int b = 0; b < BATCH_SIZE; ++b) {
-      if (!mask[b] || !outputs_tokens[b]) continue;
+      if (!mask[b]) continue;
       epos[b] = pos;
       if (pos < nums_prompt_tokens[b]) {
         next[b] = prompts_tokens[b][pos];
@@ -204,7 +203,6 @@ long long simple_getp_generate(Transformer *transformer, Tokenizer *tokenizer,
 
   // Marker for end of sequence
   for (int b = 0; b < BATCH_SIZE; ++b) {
-    if (!outputs_tokens[b]) continue;
     if (epos[b] == -1) {
       fprintf(stderr, "something is wrong, epos can not recieve value -1\n");
       exit(EXIT_FAILURE);
@@ -219,7 +217,6 @@ long long simple_getp_generate(Transformer *transformer, Tokenizer *tokenizer,
 
   int acc = 0;
   for (int b = 0; b < BATCH_SIZE; ++b) {
-    if (!outputs_tokens[b]) continue;
     acc += epos[b] - nums_prompt_tokens[b] + 1;
   }
 
@@ -246,14 +243,9 @@ void single_thread_generate(Transformer *transformer,
   int idx0 = worker->request_start;
   int requests_per_thread = worker->request_end - worker->request_start;
   for (int idx = 0; idx < requests_per_thread; idx += BATCH_SIZE) {
-    int b;
-    for (b = 0; b < BATCH_SIZE && idx + b < requests_per_thread; ++b) {
+    for (int b = 0; b < BATCH_SIZE; ++b) {
       inputs_seq[b] = get_str_req_ptr(requests, idx0 + idx + b);
       outputs_tokens[b] = get_tok_gen_ptr(requests, idx0 + idx + b);
-    }
-    for (; b < BATCH_SIZE; ++b) {
-      inputs_seq[b] = NULL;
-      outputs_tokens[b] = NULL;
     }
     num_token_out +=
         simple_getp_generate(transformer, tokenizer, local_sampler, worker, inputs_seq,
@@ -284,7 +276,7 @@ long long inference(Transformer *transformer, Tokenizer *tokenizer,
     workers[i].request_start = i * num_reqs_per_device;
     workers[i].request_end = (i + 1) * num_reqs_per_device;
     if (i == n_devices - 1) workers[i].request_end = requests->num_reqs;
-    // assert((workers[i].request_end - workers[i].request_start) % BATCH_SIZE == 0);
+    assert((workers[i].request_end - workers[i].request_start) % BATCH_SIZE == 0);
   }
   
   std::vector<long long> nums_token_out(n_devices);
