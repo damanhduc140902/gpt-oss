@@ -153,7 +153,7 @@ long long simple_getp_generate(Transformer *transformer, Tokenizer *tokenizer,
     exit(EXIT_FAILURE);
   }
 
-  while (pos < steps) {
+  while (pos + 1 < steps) {
 
     // forward the transformer to get logits for the next token
     int *next_gpu = getp_forward(transformer, dev_transformers, worker, token, pos);
