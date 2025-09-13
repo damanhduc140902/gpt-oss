@@ -1,5 +1,6 @@
 #pragma once
 #include <hip/hip_runtime.h>
+
 #include <cstdlib>
 
 struct RunStateExt {
@@ -15,6 +16,7 @@ struct RunStateExt {
 };
 
 void ext_create(int n_devices);
-void ext_alloc_device(int device_index, int batch_size, int k_per_tok, int n_experts, int hidden_dim);
+void ext_alloc_device(int device_index, int batch_size, int k_per_tok,
+                      int n_experts, int hidden_dim);
 void ext_free_all(int n_devices);
-RunStateExt* ext_get(int device_index);
+RunStateExt *ext_get(int device_index);

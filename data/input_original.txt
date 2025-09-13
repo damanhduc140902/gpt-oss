@@ -1,4 +1,420 @@
-32
+448
+Hello
+Hello world
+Write a short haiku about the ocean.
+ฉันรักทะเล
+naïve façade — déjà vu
+🍣 sushi and 🍜 ramen
+email: test@example.com
+newlines:
+line2
+line3
+tabs	and	spaces
+JSON: {"a": 1, "b": [2,3,4]}
+混ぜるな危険
+The quick brown fox jumps over the lazy dog.
+1234567890
+!@#$%^&*()_+-=[]{}|;:',.<>/?
+你好，世界
+Привет, мир
+مرحبا بالعالم
+こんにちは世界
+¿Cómo estás?
+L'été arrive bientôt.
+“Smart quotes” and ‘single quotes’ test.
+Emoji test: 😀😂👍🏽🔥💯
+Long prompt: This is a long prompt to test the tokenizer's ability to handle longer sequences of text, including punctuation, numbers (12345), and special symbols like ©, ™, and ∞.
+Write a short story about a detective who solves crimes using AI.
+Describe a future where gravity stops working for 24 hours.
+Write a letter from a cat to its human explaining why it knocks things over.
+Invent a new holiday and explain how it’s celebrated.
+Write a poem in the style of Shakespeare about pizza.
+Create a backstory for a superhero whose only power is baking bread.
+Write a scene where two strangers accidentally swap phones.
+Hello
+Hello world
+Write a short haiku about the ocean.
+ฉันรักทะเล
+naïve façade — déjà vu
+🍣 sushi and 🍜 ramen
+email: test@example.com
+newlines:
+line2
+line3
+tabs	and	spaces
+JSON: {"a": 1, "b": [2,3,4]}
+混ぜるな危険
+The quick brown fox jumps over the lazy dog.
+1234567890
+!@#$%^&*()_+-=[]{}|;:',.<>/?
+你好，世界
+Привет, мир
+مرحبا بالعالم
+こんにちは世界
+¿Cómo estás?
+L'été arrive bientôt.
+“Smart quotes” and ‘single quotes’ test.
+Emoji test: 😀😂👍🏽🔥💯
+Long prompt: This is a long prompt to test the tokenizer's ability to handle longer sequences of text, including punctuation, numbers (12345), and special symbols like ©, ™, and ∞.
+Write a short story about a detective who solves crimes using AI.
+Describe a future where gravity stops working for 24 hours.
+Write a letter from a cat to its human explaining why it knocks things over.
+Invent a new holiday and explain how it’s celebrated.
+Write a poem in the style of Shakespeare about pizza.
+Create a backstory for a superhero whose only power is baking bread.
+Write a scene where two strangers accidentally swap phones.
+Hello
+Hello world
+Write a short haiku about the ocean.
+ฉันรักทะเล
+naïve façade — déjà vu
+🍣 sushi and 🍜 ramen
+email: test@example.com
+newlines:
+line2
+line3
+tabs	and	spaces
+JSON: {"a": 1, "b": [2,3,4]}
+混ぜるな危険
+The quick brown fox jumps over the lazy dog.
+1234567890
+!@#$%^&*()_+-=[]{}|;:',.<>/?
+你好，世界
+Привет, мир
+مرحبا بالعالم
+こんにちは世界
+¿Cómo estás?
+L'été arrive bientôt.
+“Smart quotes” and ‘single quotes’ test.
+Emoji test: 😀😂👍🏽🔥💯
+Long prompt: This is a long prompt to test the tokenizer's ability to handle longer sequences of text, including punctuation, numbers (12345), and special symbols like ©, ™, and ∞.
+Write a short story about a detective who solves crimes using AI.
+Describe a future where gravity stops working for 24 hours.
+Write a letter from a cat to its human explaining why it knocks things over.
+Invent a new holiday and explain how it’s celebrated.
+Write a poem in the style of Shakespeare about pizza.
+Create a backstory for a superhero whose only power is baking bread.
+Write a scene where two strangers accidentally swap phones.
+Hello
+Hello world
+Write a short haiku about the ocean.
+ฉันรักทะเล
+naïve façade — déjà vu
+🍣 sushi and 🍜 ramen
+email: test@example.com
+newlines:
+line2
+line3
+tabs	and	spaces
+JSON: {"a": 1, "b": [2,3,4]}
+混ぜるな危険
+The quick brown fox jumps over the lazy dog.
+1234567890
+!@#$%^&*()_+-=[]{}|;:',.<>/?
+你好，世界
+Привет, мир
+مرحبا بالعالم
+こんにちは世界
+¿Cómo estás?
+L'été arrive bientôt.
+“Smart quotes” and ‘single quotes’ test.
+Emoji test: 😀😂👍🏽🔥💯
+Long prompt: This is a long prompt to test the tokenizer's ability to handle longer sequences of text, including punctuation, numbers (12345), and special symbols like ©, ™, and ∞.
+Write a short story about a detective who solves crimes using AI.
+Describe a future where gravity stops working for 24 hours.
+Write a letter from a cat to its human explaining why it knocks things over.
+Invent a new holiday and explain how it’s celebrated.
+Write a poem in the style of Shakespeare about pizza.
+Create a backstory for a superhero whose only power is baking bread.
+Write a scene where two strangers accidentally swap phones.
+Hello
+Hello world
+Write a short haiku about the ocean.
+ฉันรักทะเล
+naïve façade — déjà vu
+🍣 sushi and 🍜 ramen
+email: test@example.com
+newlines:
+line2
+line3
+tabs	and	spaces
+JSON: {"a": 1, "b": [2,3,4]}
+混ぜるな危険
+The quick brown fox jumps over the lazy dog.
+1234567890
+!@#$%^&*()_+-=[]{}|;:',.<>/?
+你好，世界
+Привет, мир
+مرحبا بالعالم
+こんにちは世界
+¿Cómo estás?
+L'été arrive bientôt.
+“Smart quotes” and ‘single quotes’ test.
+Emoji test: 😀😂👍🏽🔥💯
+Long prompt: This is a long prompt to test the tokenizer's ability to handle longer sequences of text, including punctuation, numbers (12345), and special symbols like ©, ™, and ∞.
+Write a short story about a detective who solves crimes using AI.
+Describe a future where gravity stops working for 24 hours.
+Write a letter from a cat to its human explaining why it knocks things over.
+Invent a new holiday and explain how it’s celebrated.
+Write a poem in the style of Shakespeare about pizza.
+Create a backstory for a superhero whose only power is baking bread.
+Write a scene where two strangers accidentally swap phones.
+Hello
+Hello world
+Write a short haiku about the ocean.
+ฉันรักทะเล
+naïve façade — déjà vu
+🍣 sushi and 🍜 ramen
+email: test@example.com
+newlines:
+line2
+line3
+tabs	and	spaces
+JSON: {"a": 1, "b": [2,3,4]}
+混ぜるな危険
+The quick brown fox jumps over the lazy dog.
+1234567890
+!@#$%^&*()_+-=[]{}|;:',.<>/?
+你好，世界
+Привет, мир
+مرحبا بالعالم
+こんにちは世界
+¿Cómo estás?
+L'été arrive bientôt.
+“Smart quotes” and ‘single quotes’ test.
+Emoji test: 😀😂👍🏽🔥💯
+Long prompt: This is a long prompt to test the tokenizer's ability to handle longer sequences of text, including punctuation, numbers (12345), and special symbols like ©, ™, and ∞.
+Write a short story about a detective who solves crimes using AI.
+Describe a future where gravity stops working for 24 hours.
+Write a letter from a cat to its human explaining why it knocks things over.
+Invent a new holiday and explain how it’s celebrated.
+Write a poem in the style of Shakespeare about pizza.
+Create a backstory for a superhero whose only power is baking bread.
+Write a scene where two strangers accidentally swap phones.
+Hello
+Hello world
+Write a short haiku about the ocean.
+ฉันรักทะเล
+naïve façade — déjà vu
+🍣 sushi and 🍜 ramen
+email: test@example.com
+newlines:
+line2
+line3
+tabs	and	spaces
+JSON: {"a": 1, "b": [2,3,4]}
+混ぜるな危険
+The quick brown fox jumps over the lazy dog.
+1234567890
+!@#$%^&*()_+-=[]{}|;:',.<>/?
+你好，世界
+Привет, мир
+مرحبا بالعالم
+こんにちは世界
+¿Cómo estás?
+L'été arrive bientôt.
+“Smart quotes” and ‘single quotes’ test.
+Emoji test: 😀😂👍🏽🔥💯
+Long prompt: This is a long prompt to test the tokenizer's ability to handle longer sequences of text, including punctuation, numbers (12345), and special symbols like ©, ™, and ∞.
+Write a short story about a detective who solves crimes using AI.
+Describe a future where gravity stops working for 24 hours.
+Write a letter from a cat to its human explaining why it knocks things over.
+Invent a new holiday and explain how it’s celebrated.
+Write a poem in the style of Shakespeare about pizza.
+Create a backstory for a superhero whose only power is baking bread.
+Write a scene where two strangers accidentally swap phones.
+Hello
+Hello world
+Write a short haiku about the ocean.
+ฉันรักทะเล
+naïve façade — déjà vu
+🍣 sushi and 🍜 ramen
+email: test@example.com
+newlines:
+line2
+line3
+tabs	and	spaces
+JSON: {"a": 1, "b": [2,3,4]}
+混ぜるな危険
+The quick brown fox jumps over the lazy dog.
+1234567890
+!@#$%^&*()_+-=[]{}|;:',.<>/?
+你好，世界
+Привет, мир
+مرحبا بالعالم
+こんにちは世界
+¿Cómo estás?
+L'été arrive bientôt.
+“Smart quotes” and ‘single quotes’ test.
+Emoji test: 😀😂👍🏽🔥💯
+Long prompt: This is a long prompt to test the tokenizer's ability to handle longer sequences of text, including punctuation, numbers (12345), and special symbols like ©, ™, and ∞.
+Write a short story about a detective who solves crimes using AI.
+Describe a future where gravity stops working for 24 hours.
+Write a letter from a cat to its human explaining why it knocks things over.
+Invent a new holiday and explain how it’s celebrated.
+Write a poem in the style of Shakespeare about pizza.
+Create a backstory for a superhero whose only power is baking bread.
+Write a scene where two strangers accidentally swap phones.
+Hello
+Hello world
+Write a short haiku about the ocean.
+ฉันรักทะเล
+naïve façade — déjà vu
+🍣 sushi and 🍜 ramen
+email: test@example.com
+newlines:
+line2
+line3
+tabs	and	spaces
+JSON: {"a": 1, "b": [2,3,4]}
+混ぜるな危険
+The quick brown fox jumps over the lazy dog.
+1234567890
+!@#$%^&*()_+-=[]{}|;:',.<>/?
+你好，世界
+Привет, мир
+مرحبا بالعالم
+こんにちは世界
+¿Cómo estás?
+L'été arrive bientôt.
+“Smart quotes” and ‘single quotes’ test.
+Emoji test: 😀😂👍🏽🔥💯
+Long prompt: This is a long prompt to test the tokenizer's ability to handle longer sequences of text, including punctuation, numbers (12345), and special symbols like ©, ™, and ∞.
+Write a short story about a detective who solves crimes using AI.
+Describe a future where gravity stops working for 24 hours.
+Write a letter from a cat to its human explaining why it knocks things over.
+Invent a new holiday and explain how it’s celebrated.
+Write a poem in the style of Shakespeare about pizza.
+Create a backstory for a superhero whose only power is baking bread.
+Write a scene where two strangers accidentally swap phones.
+Hello
+Hello world
+Write a short haiku about the ocean.
+ฉันรักทะเล
+naïve façade — déjà vu
+🍣 sushi and 🍜 ramen
+email: test@example.com
+newlines:
+line2
+line3
+tabs	and	spaces
+JSON: {"a": 1, "b": [2,3,4]}
+混ぜるな危険
+The quick brown fox jumps over the lazy dog.
+1234567890
+!@#$%^&*()_+-=[]{}|;:',.<>/?
+你好，世界
+Привет, мир
+مرحبا بالعالم
+こんにちは世界
+¿Cómo estás?
+L'été arrive bientôt.
+“Smart quotes” and ‘single quotes’ test.
+Emoji test: 😀😂👍🏽🔥💯
+Long prompt: This is a long prompt to test the tokenizer's ability to handle longer sequences of text, including punctuation, numbers (12345), and special symbols like ©, ™, and ∞.
+Write a short story about a detective who solves crimes using AI.
+Describe a future where gravity stops working for 24 hours.
+Write a letter from a cat to its human explaining why it knocks things over.
+Invent a new holiday and explain how it’s celebrated.
+Write a poem in the style of Shakespeare about pizza.
+Create a backstory for a superhero whose only power is baking bread.
+Write a scene where two strangers accidentally swap phones.
+Hello
+Hello world
+Write a short haiku about the ocean.
+ฉันรักทะเล
+naïve façade — déjà vu
+🍣 sushi and 🍜 ramen
+email: test@example.com
+newlines:
+line2
+line3
+tabs	and	spaces
+JSON: {"a": 1, "b": [2,3,4]}
+混ぜるな危険
+The quick brown fox jumps over the lazy dog.
+1234567890
+!@#$%^&*()_+-=[]{}|;:',.<>/?
+你好，世界
+Привет, мир
+مرحبا بالعالم
+こんにちは世界
+¿Cómo estás?
+L'été arrive bientôt.
+“Smart quotes” and ‘single quotes’ test.
+Emoji test: 😀😂👍🏽🔥💯
+Long prompt: This is a long prompt to test the tokenizer's ability to handle longer sequences of text, including punctuation, numbers (12345), and special symbols like ©, ™, and ∞.
+Write a short story about a detective who solves crimes using AI.
+Describe a future where gravity stops working for 24 hours.
+Write a letter from a cat to its human explaining why it knocks things over.
+Invent a new holiday and explain how it’s celebrated.
+Write a poem in the style of Shakespeare about pizza.
+Create a backstory for a superhero whose only power is baking bread.
+Write a scene where two strangers accidentally swap phones.
+Hello
+Hello world
+Write a short haiku about the ocean.
+ฉันรักทะเล
+naïve façade — déjà vu
+🍣 sushi and 🍜 ramen
+email: test@example.com
+newlines:
+line2
+line3
+tabs	and	spaces
+JSON: {"a": 1, "b": [2,3,4]}
+混ぜるな危険
+The quick brown fox jumps over the lazy dog.
+1234567890
+!@#$%^&*()_+-=[]{}|;:',.<>/?
+你好，世界
+Привет, мир
+مرحبا بالعالم
+こんにちは世界
+¿Cómo estás?
+L'été arrive bientôt.
+“Smart quotes” and ‘single quotes’ test.
+Emoji test: 😀😂👍🏽🔥💯
+Long prompt: This is a long prompt to test the tokenizer's ability to handle longer sequences of text, including punctuation, numbers (12345), and special symbols like ©, ™, and ∞.
+Write a short story about a detective who solves crimes using AI.
+Describe a future where gravity stops working for 24 hours.
+Write a letter from a cat to its human explaining why it knocks things over.
+Invent a new holiday and explain how it’s celebrated.
+Write a poem in the style of Shakespeare about pizza.
+Create a backstory for a superhero whose only power is baking bread.
+Write a scene where two strangers accidentally swap phones.
+Hello
+Hello world
+Write a short haiku about the ocean.
+ฉันรักทะเล
+naïve façade — déjà vu
+🍣 sushi and 🍜 ramen
+email: test@example.com
+newlines:
+line2
+line3
+tabs	and	spaces
+JSON: {"a": 1, "b": [2,3,4]}
+混ぜるな危険
+The quick brown fox jumps over the lazy dog.
+1234567890
+!@#$%^&*()_+-=[]{}|;:',.<>/?
+你好，世界
+Привет, мир
+مرحبا بالعالم
+こんにちは世界
+¿Cómo estás?
+L'été arrive bientôt.
+“Smart quotes” and ‘single quotes’ test.
+Emoji test: 😀😂👍🏽🔥💯
+Long prompt: This is a long prompt to test the tokenizer's ability to handle longer sequences of text, including punctuation, numbers (12345), and special symbols like ©, ™, and ∞.
+Write a short story about a detective who solves crimes using AI.
+Describe a future where gravity stops working for 24 hours.
+Write a letter from a cat to its human explaining why it knocks things over.
+Invent a new holiday and explain how it’s celebrated.
+Write a poem in the style of Shakespeare about pizza.
+Create a backstory for a superhero whose only power is baking bread.
+Write a scene where two strangers accidentally swap phones.
 Hello
 Hello world
 Write a short haiku about the ocean.

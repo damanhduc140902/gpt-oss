@@ -170,7 +170,7 @@ long long simple_getp_generate(Transformer *transformer, Tokenizer *tokenizer,
     exit(EXIT_FAILURE);
   }
 
-  while (pos < steps) {
+  while (pos + 1 < steps) {
 
     // forward the transformer to get logits for the next token
     int *next_gpu = getp_forward(transformer, dev_transformers, worker, token, pos);
@@ -282,6 +282,12 @@ long long inference(Transformer *transformer, Tokenizer *tokenizer,
 
   int n_devices;
   HIP_CHECK(hipGetDeviceCount(&n_devices));
+
+  int seq_len_eff = std::min(transformer->config.seq_len, requests->max_seq_len);
+  for (int i = 0; i < n_devices; ++i) {
+    resize_kv_cache(dev_transformers[i], seq_len_eff);
+  }
+  
   
   int n_parallel_models = n_devices / EXPERT_PARALLELISM;
 
