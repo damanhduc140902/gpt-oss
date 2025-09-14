@@ -58,11 +58,11 @@ __global__ void rmsnorm_kernel(float *o, float *x, float *weight, int size) {
     }
   }
 }
-void getp_rmsnorm(float *o, float *x, float *weight, int batch_size, int dim) {
+void getp_rmsnorm(float *o, float *x, float *weight, int batch_size, int dim, hipStream_t stream) {
   PROFILE_FUNCTION();
   dim3 blockDim(1024);
   dim3 gridDim(1, batch_size);
-  rmsnorm_kernel<<<gridDim, blockDim, sizeof(float) * (blockDim.x + 1)>>>(
+  rmsnorm_kernel<<<gridDim, blockDim, sizeof(float) * (blockDim.x + 1), stream>>>(
       o, x, weight, dim);
   // HIP_CHECK(hipDeviceSynchronize());
 }
@@ -159,6 +159,7 @@ static inline int build_moe_buckets_local_pos(const int *local_ids,
   moe_fill_local_pos_kernel<<<dim3(B), dim3(128), 0, stream>>>(
       local_ids, local_wts, n_local, B, K, E, e_offsets, e_counts, tok_idx_out,
       w_out, pair_pos);
+  HIP_CHECK(hipStreamSynchronize(stream));
   return cap_pairs;
 }
 
@@ -375,7 +376,7 @@ static inline void launch_mlp1_swiglu_bf16_bucketed(
   dim3 block(256);
   int by = (cap_pairs + BM - 1) / BM;
   dim3 grid((I + BN - 1) / BN, E * by);
-  mlp1_swiglu_bf16_bucketed_kernel<<<grid, block>>>(
+  mlp1_swiglu_bf16_bucketed_kernel<<<grid, block, 0, stream>>>(
       gate_up_all, x, w1_layer, b1_layer, offsets, tok_idx, H, I, E, cap_pairs,
       swiglu_limit);
   // HIP_CHECK(hipDeviceSynchronize());
@@ -544,7 +545,7 @@ static inline void launch_mlp2_partial_bf16_bucketed_mfma(
     float *z_partial, const float *gate_up_all, const __hip_bfloat16 *w2_layer,
     const __hip_bfloat16 *b2_layer, const float *w_by_bucket,
     const int *offsets, const int *tok_idx, int I, int H, int E,
-    int cap_pairs) {
+    int cap_pairs, hipStream_t stream) {
   PROFILE_FUNCTION();
 
   constexpr int BN = 32, BM = 32, BK = 32;
@@ -568,16 +569,17 @@ static inline void launch_mlp2_partial_bf16_bucketed_mfma(
 
   if (splits > 1) {
     int total_pairs = 0;
-    HIP_CHECK(hipMemcpy(&total_pairs, offsets + E, sizeof(int),
-                        hipMemcpyDeviceToHost));
-    HIP_CHECK(hipMemset(z_partial, 0,
-                        (size_t)total_pairs * (size_t)H * sizeof(float)));
+    HIP_CHECK(hipMemcpyAsync(&total_pairs, offsets + E, sizeof(int),
+                             hipMemcpyDeviceToHost, stream));
+    HIP_CHECK(hipMemsetAsync(z_partial, 0,
+                             (size_t)total_pairs * (size_t)H * sizeof(float), 
+                             stream));
   }
 
   dim3 block(256);
   dim3 grid(gx, gy, splits);
   const size_t shmem = (size_t)BK * (BM + BN) * sizeof(float);
-  mlp2_partial_bf16_bucketed_splitk_kernel<<<grid, block, shmem>>>(
+  mlp2_partial_bf16_bucketed_splitk_kernel<<<grid, block, shmem, stream>>>(
       z_partial, gate_up_all, w2_layer, b2_layer, w_by_bucket, offsets, tok_idx,
       I, H, E, cap_pairs, splits);
   // HIP_CHECK(hipDeviceSynchronize());
@@ -703,7 +705,7 @@ __global__ void matmul_qkv_fused_kernel(
 static inline void getp_matmul_qkv_fused_bf16(
     float *q, float *k, float *v, float *x, const __hip_bfloat16 *w_qkv_bf16,
     const __hip_bfloat16 *b_qkv_bf16, int n, int head_dim, int n_attn_heads,
-    int n_kv_heads, int batch_size) {
+    int n_kv_heads, int batch_size, hipStream_t stream) {
   PROFILE_FUNCTION();
   const int q_len = head_dim * n_attn_heads;
   const int k_len = head_dim * n_kv_heads;
@@ -719,8 +721,9 @@ static inline void getp_matmul_qkv_fused_bf16(
 
   dim3 block(256);
   dim3 grid((N + BN - 1) / BN, (M + BM - 1) / BM);
-  matmul_qkv_fused_kernel<<<grid, block>>>(q, k, v, x, w_qkv_bf16, b_qkv_bf16,
-                                           n, q_len, k_len, v_len, batch_size);
+  matmul_qkv_fused_kernel<<<grid, block, 0, stream>>>
+    (q, k, v, x, w_qkv_bf16, b_qkv_bf16,
+     n, q_len, k_len, v_len, batch_size);
   // HIP_CHECK(hipDeviceSynchronize());
 }
 
@@ -914,7 +917,7 @@ __global__ void reduce_splitk_with_bias(float *__restrict__ out,
   out[idx] = s;
 }
 template <typename T>
-void getp_matmul(float* xout, float* x, T* w, T* b, int n, int d, int batch_size) {
+void getp_matmul(float* xout, float* x, T* w, T* b, int n, int d, int batch_size, hipStream_t stream) {
   PROFILE_FUNCTION();
   const int M = batch_size, N = d, K = n;
 
@@ -940,7 +943,7 @@ void getp_matmul(float* xout, float* x, T* w, T* b, int n, int d, int batch_size
 
   if (splits == 1) {
     dim3 grid(gx, gy);
-    matmul_kernel_nosplit<<<grid, block, shmem>>>(
+    matmul_kernel_nosplit<<<grid, block, shmem, stream>>>(
         xout, x, reinterpret_cast<const __hip_bfloat16 *>(w),
         reinterpret_cast<const __hip_bfloat16 *>(b), M, N, K);
     // HIP_CHECK(hipDeviceSynchronize());
@@ -948,20 +951,20 @@ void getp_matmul(float* xout, float* x, T* w, T* b, int n, int d, int batch_size
   }
 
   float *partial = nullptr;
-  HIP_CHECK(hipMalloc(&partial,
-                      (size_t)splits * (size_t)M * (size_t)N * sizeof(float)));
+  HIP_CHECK(hipMallocAsync(&partial,
+                           (size_t)splits * (size_t)M * (size_t)N * sizeof(float), stream));
 
   dim3 grid(gx, gy, splits);
-  matmul_kernel_splitk_store<<<grid, block, shmem>>>(
+  matmul_kernel_splitk_store<<<grid, block, shmem, stream>>>(
       partial, x, reinterpret_cast<const __hip_bfloat16 *>(w), M, N, K, splits);
 
   const int total = M * N;
   dim3 rBlock(256);
   dim3 rGrid((total + rBlock.x - 1) / rBlock.x);
-  reduce_splitk_with_bias<<<rGrid, rBlock>>>(
+  reduce_splitk_with_bias<<<rGrid, rBlock, 0, stream>>>(
       xout, partial, reinterpret_cast<const __hip_bfloat16 *>(b), M, N, splits);
 
-  HIP_CHECK(hipFree(partial));
+  HIP_CHECK(hipFreeAsync(partial, stream));
   // HIP_CHECK(hipDeviceSynchronize());
 }
 
@@ -1007,7 +1010,7 @@ __global__ void compute_cos_sin_kernel(float *cos_out, float *sin_out,
 void getp_compute_cos_sin(int pos, float base, int head_dim,
                           float scaling_factor, float initial_context_length,
                           float ntk_beta, float ntk_alpha, float *cos_out,
-                          float *sin_out, float *inv_freq) {
+                          float *sin_out, float *inv_freq, hipStream_t stream) {
   PROFILE_FUNCTION();
   int d_half = head_dim / 2;
   float concentration =
@@ -1015,15 +1018,15 @@ void getp_compute_cos_sin(int pos, float base, int head_dim,
   {
     dim3 blockDim(256);
     dim3 gridDim((head_dim / 2 + blockDim.x - 1) / blockDim.x);
-    compute_inv_freq_kernel<<<gridDim, blockDim>>>(
+    compute_inv_freq_kernel<<<gridDim, blockDim, 0, stream>>>(
         base, head_dim, scaling_factor, initial_context_length, ntk_beta,
         ntk_alpha, inv_freq);
   }
   {
     dim3 blockDim(256);
     dim3 gridDim((head_dim / 2 + blockDim.x - 1) / blockDim.x);
-    compute_cos_sin_kernel<<<gridDim, blockDim>>>(cos_out, sin_out, inv_freq,
-                                                  concentration, pos, d_half);
+    compute_cos_sin_kernel<<<gridDim, blockDim, 0, stream>>>
+      (cos_out, sin_out, inv_freq, concentration, pos, d_half);
   }
   // HIP_CHECK(hipDeviceSynchronize());
 }
@@ -1047,13 +1050,13 @@ __global__ void apply_rotary_emb_kernel(float *x, float *cos, float *sin,
   x[h * head_dim + half + i] = o2;
 }
 void getp_apply_rotary_emb(float *x, float *cos, float *sin, int n_heads,
-                           int head_dim, int batch_size) {
+                           int head_dim, int batch_size, hipStream_t stream) {
   PROFILE_FUNCTION();
   dim3 blockDim(16, 16);
   dim3 gridDim((head_dim / 2 + blockDim.x - 1) / blockDim.x,
                (n_heads + blockDim.y - 1) / blockDim.y, batch_size);
-  apply_rotary_emb_kernel<<<gridDim, blockDim>>>(x, cos, sin, n_heads,
-                                                 head_dim);
+  apply_rotary_emb_kernel<<<gridDim, blockDim, 0, stream>>>
+    (x, cos, sin, n_heads, head_dim);
   // HIP_CHECK(hipDeviceSynchronize());
 }
 
@@ -1137,7 +1140,7 @@ __global__ void router_topk_softmax_batch_kernel(
 
 static inline void getp_router_topk_softmax_batch(
     const float *router_score, int n_experts, int experts_per_token,
-    float *topk_v_out, int *topk_i_out, int batch_size) {
+    float *topk_v_out, int *topk_i_out, int batch_size, hipStream_t stream) {
   PROFILE_FUNCTION();
   const int BLK = 1024;
   const dim3 block(BLK);
@@ -1145,7 +1148,7 @@ static inline void getp_router_topk_softmax_batch(
   const size_t shmem = (size_t)n_experts * sizeof(float) +
                        (size_t)BLK * (sizeof(float) + sizeof(int)) +
                        GETP_ROUTER_TOPK_MAXK * (sizeof(float) + sizeof(int));
-  router_topk_softmax_batch_kernel<<<grid, block, shmem>>>(
+  router_topk_softmax_batch_kernel<<<grid, block, shmem, stream>>>(
       router_score, n_experts, experts_per_token, topk_v_out, topk_i_out);
   // HIP_CHECK(hipDeviceSynchronize());
 }
@@ -1198,11 +1201,11 @@ __global__ void vecadd_kernel(float *x, float *y, int size) {
   if (i >= size) return;
   x[i] += y[i];
 }
-void getp_vecadd(float *x, float *y, int size, int batch_size) {
+void getp_vecadd(float *x, float *y, int size, int batch_size, hipStream_t stream) {
   PROFILE_FUNCTION();
   dim3 blockDim(1024);
   dim3 gridDim((size + blockDim.x - 1) / blockDim.x, batch_size);
-  vecadd_kernel<<<gridDim, blockDim>>>(x, y, size);
+  vecadd_kernel<<<gridDim, blockDim, 0, stream>>>(x, y, size);
   // HIP_CHECK(hipDeviceSynchronize());
 }
 
@@ -1310,7 +1313,7 @@ static inline void getp_flash_attn_decode(
     float *tb, const float *key_cache_layer, const float *value_cache_layer,
     const float *q, const float *attn_sinks_layer, int head_dim,
     int n_attn_heads, int n_kv_heads, int pos, int seq_len, int sliding_window,
-    int layer_id, int batch_size, int cache_tcap) {
+    int layer_id, int batch_size, int cache_tcap, hipStream_t stream) {
   PROFILE_FUNCTION();
   const int kv_dim = head_dim * n_kv_heads;
   const int kv_mul = n_attn_heads / n_kv_heads;
@@ -1324,7 +1327,7 @@ static inline void getp_flash_attn_decode(
   dim3 block(64, kv_mul);
   dim3 grid(n_kv_heads, batch_size);
   size_t shmem = (size_t)2 * T * head_dim * sizeof(float);
-  flash_attn_decode_kernel<<<grid, block, shmem>>>(
+  flash_attn_decode_kernel<<<grid, block, shmem, stream>>>(
       tb, key_cache_layer, value_cache_layer, q, attn_sinks_layer, head_dim,
       n_attn_heads, n_kv_heads, pos, seq_len, sliding_window, apply_mask,
       batch_size, kv_dim, kv_mul, invsd, T, cache_tcap);
@@ -1385,14 +1388,17 @@ __global__ void argmax_rows_kernel(const float *__restrict__ logits, int V,
     }
     __syncthreads();
   }
-  if (tid == 0) out[b] = sidx[0];
+  if (tid == 0) {
+    assert(sidx[0] >= 0 && sidx[0] < V);
+    out[b] = sidx[0];
+  }
 }
 
 static inline void getp_argmax_rows(const float *logits, int V, int *out,
-                                    int B) {
+                                    int B, hipStream_t stream) {
   PROFILE_FUNCTION();
   dim3 grid(B), block(1024);
-  argmax_rows_kernel<<<grid, block>>>(logits, V, out);
+  argmax_rows_kernel<<<grid, block, 0, stream>>>(logits, V, out);
   // HIP_CHECK(hipDeviceSynchronize());
 }
 
@@ -1409,9 +1415,20 @@ __global__ void gather_embedding_bf16_kernel(float *x,
 
 static inline void getp_gather_embedding_bf16(float *x,
                                               const __hip_bfloat16 *table,
-                                              const int *tok, int H, int B) {
+                                              const int *tok, int H, int B, hipStream_t stream) {
   dim3 block(256), grid(B);
-  gather_embedding_bf16_kernel<<<grid, block>>>(x, table, tok, H);
+  gather_embedding_bf16_kernel<<<grid, block, 0, stream>>>(x, table, tok, H);
+}
+
+inline void sync_workers(DeviceTransformer **dev_transformers, GPUWorker *workers) {
+  for (int i = 0; i < EXPERT_PARALLELISM; ++i) {
+    GPUWorker *worker = &workers[i];
+    int device_index = worker->device_index;
+    hipStream_t compute_stream = dev_transformers[device_index]->compute_stream;
+    
+    HIP_CHECK(hipSetDevice(device_index));
+    HIP_CHECK(hipStreamSynchronize(compute_stream));
+  }
 }
 
 int *getp_forward(Transformer * /*transformer*/,
@@ -1419,158 +1436,253 @@ int *getp_forward(Transformer * /*transformer*/,
                   int token[], int pos) {
   PROFILE_FUNCTION();
 
-  GPUWorker *main_worker = workers; // execute non-expert layers
-  int device_index = main_worker->device_index;
-
-  Config *p = &dev_transformers[device_index]->config;
-  DeviceTransformerWeights *dev_w = &dev_transformers[device_index]->weights;
-  RunState *dev_s = &dev_transformers[device_index]->state;
-
-  float *dev_x = dev_s->x;
+  Config *p = &dev_transformers[0]->config;
   int head_dim = p->head_dim;
   int hidden_dim = p->hidden_dim;
   int kv_dim = p->head_dim * p->n_kv_heads;
   int n_experts = p->n_experts;
 
-  HIP_CHECK(hipSetDevice(device_index));
+  for (int i = 0; i < EXPERT_PARALLELISM; ++i) {
+    // GPUWorker *main_worker = workers; // execute non-expert layers
+    // int device_index = main_worker->device_index;
+    GPUWorker *worker = &workers[i];
+    int device_index = worker->device_index;
 
-  HIP_CHECK(hipMemcpy(dev_s->topk_i, token, sizeof(int) * BATCH_SIZE,
-                      hipMemcpyHostToDevice));
-  getp_gather_embedding_bf16(dev_x, dev_w->token_embedding_table_bf16,
-                             dev_s->topk_i, hidden_dim, BATCH_SIZE);
+    DeviceTransformerWeights *dev_w = &dev_transformers[device_index]->weights;
+    RunState *dev_s = &dev_transformers[device_index]->state;
+    hipStream_t compute_stream = dev_transformers[device_index]->compute_stream;
 
-  float *dev_cos_vals = dev_s->mlp1_out;
-  float *dev_sin_vals = dev_s->gate;
-  float *dev_inv_freq = dev_s->up;
-  float ntk_beta = 32.0f, ntk_alpha = 1.0f;
-  getp_compute_cos_sin(pos, p->rope_theta, head_dim, p->rope_scaling_factor,
-                       p->initial_context_length, ntk_beta, ntk_alpha,
-                       dev_cos_vals, dev_sin_vals, dev_inv_freq);
+    float *dev_x = dev_s->x;
+  
+    HIP_CHECK(hipSetDevice(device_index));
+  
+    HIP_CHECK(hipMemcpyAsync(dev_s->topk_i, token + i * BATCH_SIZE, sizeof(int) * BATCH_SIZE,
+                             hipMemcpyHostToDevice, compute_stream));
+    getp_gather_embedding_bf16(dev_x, dev_w->token_embedding_table_bf16,
+                               dev_s->topk_i, hidden_dim, BATCH_SIZE, compute_stream);
+  
+    float *dev_cos_vals = dev_s->mlp1_out;
+    float *dev_sin_vals = dev_s->gate;
+    float *dev_inv_freq = dev_s->up;
+    float ntk_beta = 32.0f, ntk_alpha = 1.0f;
+    getp_compute_cos_sin(pos, p->rope_theta, head_dim, p->rope_scaling_factor,
+                         p->initial_context_length, ntk_beta, ntk_alpha,
+                         dev_cos_vals, dev_sin_vals, dev_inv_freq, compute_stream);
+  }
+
+  // TODO: Remove below synchronization
+  sync_workers(dev_transformers, workers);
 
   for (unsigned long long l = 0; l < p->n_layers; l++) {
-    getp_rmsnorm(dev_s->t, dev_x, dev_w->rms_attn_w + 1ll * l * hidden_dim,
-                 BATCH_SIZE, hidden_dim);
+    for (int i = 0; i < EXPERT_PARALLELISM; ++i) {
+      GPUWorker *worker = &workers[i];
+      int device_index = worker->device_index;
+    
+      DeviceTransformerWeights *dev_w = &dev_transformers[device_index]->weights;
+      RunState *dev_s = &dev_transformers[device_index]->state;
+      hipStream_t compute_stream = dev_transformers[device_index]->compute_stream;
 
-    int loff = l * p->seq_len * BATCH_SIZE * kv_dim;
-    const int n_even = (p->n_layers + 1) / 2;
-    const int is_even = (((int)l & 1) == 0);
-    const int idx_even = ((int)l) >> 1;
-    const int idx_odd = ((int)l) >> 1;
-    const int tcap =
-        (is_even && p->sliding_window > 0) ? p->sliding_window : p->seq_len;
-    const size_t layer_toff = is_even
-                                  ? (size_t)idx_even * (size_t)p->sliding_window
-                                  : (size_t)n_even * (size_t)p->sliding_window +
-                                        (size_t)idx_odd * (size_t)p->seq_len;
-    const int tslot =
-        (is_even && p->sliding_window > 0) ? (pos % p->sliding_window) : pos;
-    const size_t base_off = layer_toff * (size_t)BATCH_SIZE * (size_t)kv_dim;
-    dev_s->k = dev_s->key_cache + base_off +
-               (size_t)tslot * (size_t)BATCH_SIZE * (size_t)kv_dim;
-    dev_s->v = dev_s->value_cache + base_off +
-               (size_t)tslot * (size_t)BATCH_SIZE * (size_t)kv_dim;
+      float *dev_x = dev_s->x;
 
-    __hip_bfloat16 *dev_w_qkv =
-        dev_w->w_qkv_bf16 +
-        1ll * l * hidden_dim *
-            (head_dim * p->n_attn_heads + 2 * head_dim * p->n_kv_heads);
-    __hip_bfloat16 *dev_b_qkv =
-        dev_w->b_qkv_bf16 +
-        1ll * l * (head_dim * p->n_attn_heads + 2 * head_dim * p->n_kv_heads);
-    getp_matmul_qkv_fused_bf16(dev_s->q, dev_s->k, dev_s->v, dev_s->t,
-                               dev_w_qkv, dev_b_qkv, hidden_dim, head_dim,
-                               p->n_attn_heads, p->n_kv_heads, BATCH_SIZE);
+      float *dev_cos_vals = dev_s->mlp1_out;
+      float *dev_sin_vals = dev_s->gate;
+    
+      HIP_CHECK(hipSetDevice(device_index));
 
-    getp_apply_rotary_emb(dev_s->q, dev_cos_vals, dev_sin_vals, p->n_attn_heads,
-                          head_dim, BATCH_SIZE);
-    getp_apply_rotary_emb(dev_s->k, dev_cos_vals, dev_sin_vals, p->n_kv_heads,
-                          head_dim, BATCH_SIZE);
-    {
-      float *k_layer = dev_s->key_cache + base_off;
-      float *v_layer = dev_s->value_cache + base_off;
-      float *q_ptr = dev_s->q;
-      const float *attn_sinks_layer =
-          dev_w->attn_sinks + (size_t)l * p->n_attn_heads;
-      getp_flash_attn_decode(dev_s->tb, k_layer, v_layer, q_ptr,
-                             attn_sinks_layer, head_dim, p->n_attn_heads,
-                             p->n_kv_heads, pos, p->seq_len, p->sliding_window,
-                             (int)l, BATCH_SIZE, tcap);
+      getp_rmsnorm(dev_s->t, dev_x, dev_w->rms_attn_w + 1ll * l * hidden_dim,
+                   BATCH_SIZE, hidden_dim, compute_stream);
+  
+      int loff = l * p->seq_len * BATCH_SIZE * kv_dim;
+      const int n_even = (p->n_layers + 1) / 2;
+      const int is_even = (((int)l & 1) == 0);
+      const int idx_even = ((int)l) >> 1;
+      const int idx_odd = ((int)l) >> 1;
+      const int tcap =
+          (is_even && p->sliding_window > 0) ? p->sliding_window : p->seq_len;
+      const size_t layer_toff = is_even
+                                    ? (size_t)idx_even * (size_t)p->sliding_window
+                                    : (size_t)n_even * (size_t)p->sliding_window +
+                                          (size_t)idx_odd * (size_t)p->seq_len;
+      const int tslot =
+          (is_even && p->sliding_window > 0) ? (pos % p->sliding_window) : pos;
+      const size_t base_off = layer_toff * (size_t)BATCH_SIZE * (size_t)kv_dim;
+      dev_s->k = dev_s->key_cache + base_off +
+                 (size_t)tslot * (size_t)BATCH_SIZE * (size_t)kv_dim;
+      dev_s->v = dev_s->value_cache + base_off +
+                 (size_t)tslot * (size_t)BATCH_SIZE * (size_t)kv_dim;
+  
+      __hip_bfloat16 *dev_w_qkv =
+          dev_w->w_qkv_bf16 +
+          1ll * l * hidden_dim *
+              (head_dim * p->n_attn_heads + 2 * head_dim * p->n_kv_heads);
+      __hip_bfloat16 *dev_b_qkv =
+          dev_w->b_qkv_bf16 +
+          1ll * l * (head_dim * p->n_attn_heads + 2 * head_dim * p->n_kv_heads);
+      getp_matmul_qkv_fused_bf16(dev_s->q, dev_s->k, dev_s->v, dev_s->t,
+                                 dev_w_qkv, dev_b_qkv, hidden_dim, head_dim,
+                                 p->n_attn_heads, p->n_kv_heads, BATCH_SIZE, compute_stream);
+  
+      getp_apply_rotary_emb(dev_s->q, dev_cos_vals, dev_sin_vals, p->n_attn_heads,
+                            head_dim, BATCH_SIZE, compute_stream);
+      getp_apply_rotary_emb(dev_s->k, dev_cos_vals, dev_sin_vals, p->n_kv_heads,
+                            head_dim, BATCH_SIZE, compute_stream);
+      {
+        float *k_layer = dev_s->key_cache + base_off;
+        float *v_layer = dev_s->value_cache + base_off;
+        float *q_ptr = dev_s->q;
+        const float *attn_sinks_layer =
+            dev_w->attn_sinks + (size_t)l * p->n_attn_heads;
+        getp_flash_attn_decode(dev_s->tb, k_layer, v_layer, q_ptr,
+                               attn_sinks_layer, head_dim, p->n_attn_heads,
+                               p->n_kv_heads, pos, p->seq_len, p->sliding_window,
+                               (int)l, BATCH_SIZE, tcap, compute_stream);
+      }
+  
+      __hip_bfloat16 *dev_w_o =
+          dev_w->w_o_bf16 + 1ll * l * (head_dim * p->n_attn_heads) * hidden_dim;
+      __hip_bfloat16 *dev_b_o = dev_w->b_o_bf16 + 1ll * l * hidden_dim;
+      getp_matmul<__hip_bfloat16>(dev_s->tb2, dev_s->tb, dev_w_o, dev_b_o,
+                                  head_dim * p->n_attn_heads, hidden_dim,
+                                  BATCH_SIZE, compute_stream);
+  
+      getp_vecadd(dev_x, dev_s->tb2, hidden_dim, BATCH_SIZE, compute_stream);
+  
+      getp_rmsnorm(dev_s->t, dev_x, dev_w->rms_ffn_w + 1ll * l * hidden_dim,
+                   BATCH_SIZE, hidden_dim, compute_stream);
+
     }
 
-    __hip_bfloat16 *dev_w_o =
-        dev_w->w_o_bf16 + 1ll * l * (head_dim * p->n_attn_heads) * hidden_dim;
-    __hip_bfloat16 *dev_b_o = dev_w->b_o_bf16 + 1ll * l * hidden_dim;
-    getp_matmul<__hip_bfloat16>(dev_s->tb2, dev_s->tb, dev_w_o, dev_b_o,
-                                head_dim * p->n_attn_heads, hidden_dim,
-                                BATCH_SIZE);
+    // Brief explain: Main device 0 gathers all dev_s->t from other devices then scatters it to others
+    // Now there are totally BATCH_SIZE * EXPERT_PARALLELISM tokens input
+    // Evaluate router score and distribute the tokens to the experts as the same as in the previous commit
 
-    getp_vecadd(dev_x, dev_s->tb2, hidden_dim, BATCH_SIZE);
+    // Make sure that output of previous layers from other devices is ready
+    sync_workers(dev_transformers, workers);
 
-    getp_rmsnorm(dev_s->t, dev_x, dev_w->rms_ffn_w + 1ll * l * hidden_dim,
-                 BATCH_SIZE, hidden_dim);
+    {
+      GPUWorker *worker = &workers[0];
+      int device_index = worker->device_index;
+    
+      DeviceTransformerWeights *dev_w = &dev_transformers[device_index]->weights;
+      RunState *dev_s = &dev_transformers[device_index]->state;
+      RunStateExt *ext = ext_get(device_index);
+      hipStream_t compute_stream = dev_transformers[device_index]->compute_stream;
+    
+      HIP_CHECK(hipSetDevice(device_index));
 
-    __hip_bfloat16 *dev_w_router =
-        dev_w->w_router_bf16 + 1ll * l * hidden_dim * n_experts;
-    __hip_bfloat16 *dev_b_router = dev_w->b_router_bf16 + 1ll * l * n_experts;
-    getp_matmul<__hip_bfloat16>(dev_s->router_score, dev_s->t, dev_w_router,
-                                dev_b_router, hidden_dim, n_experts,
-                                BATCH_SIZE);
+      // Gather output t
+      for (int i = 0; i < EXPERT_PARALLELISM; ++i) {
+        GPUWorker *peer_worker = &workers[i];
+        int peer_device_index = peer_worker->device_index;
 
-    getp_router_topk_softmax_batch(dev_s->router_score, n_experts,
-                                   p->experts_per_token, dev_s->topk_v,
-                                   dev_s->topk_i, BATCH_SIZE);
+        RunState *peer_dev_s = &dev_transformers[peer_device_index]->state;
 
-    HIP_CHECK(hipMemset(dev_s->e_agg, 0,
-                        (size_t)BATCH_SIZE * hidden_dim * sizeof(float)));
+        if (peer_device_index == device_index) {
+          HIP_CHECK(hipMemcpyAsync(
+            ext->ext_t + (size_t)i * BATCH_SIZE * hidden_dim, peer_dev_s->t, 
+            sizeof(float) * BATCH_SIZE * hidden_dim, 
+            hipMemcpyDeviceToDevice, compute_stream));
+        }
+        else {
+          HIP_CHECK(hipMemcpyPeerAsync(
+            ext->ext_t + (size_t)i * BATCH_SIZE * hidden_dim, device_index,
+            peer_dev_s->t, peer_device_index, 
+            sizeof(float) * BATCH_SIZE * hidden_dim, 
+            compute_stream));
+        }
+      }
 
-    float *buffers_t[EXPERT_PARALLELISM];
+      HIP_CHECK(hipStreamSynchronize(compute_stream));
+
+      // Send to other devices
+      for (int i = 1; i < EXPERT_PARALLELISM; ++i) {
+        GPUWorker *peer_worker = &workers[i];
+        int peer_device_index = peer_worker->device_index;
+
+        RunStateExt *peer_ext = ext_get(peer_device_index);
+        hipStream_t peer_compute_stream = dev_transformers[peer_device_index]->compute_stream;
+
+        HIP_CHECK(hipSetDevice(peer_device_index));
+        HIP_CHECK(hipMemcpyPeerAsync(
+          peer_ext->ext_t, peer_device_index,
+          ext->ext_t, 0,
+          sizeof(float) * EXPERT_PARALLELISM * BATCH_SIZE * hidden_dim, 
+          peer_compute_stream));
+      }
+
+      HIP_CHECK(hipSetDevice(0));
+  
+      // Compute router score
+      __hip_bfloat16 *dev_w_router =
+          dev_w->w_router_bf16 + 1ll * l * hidden_dim * n_experts;
+      __hip_bfloat16 *dev_b_router = dev_w->b_router_bf16 + 1ll * l * n_experts;
+      getp_matmul<__hip_bfloat16>(ext->ext_router_score, ext->ext_t, dev_w_router,
+                                  dev_b_router, hidden_dim, n_experts,
+                                  EXPERT_PARALLELISM * BATCH_SIZE, compute_stream);
+  
+      // Get topk
+      getp_router_topk_softmax_batch(ext->ext_router_score, n_experts,
+                                     p->experts_per_token, ext->ext_topk_v,
+                                     ext->ext_topk_i, EXPERT_PARALLELISM * BATCH_SIZE, compute_stream);
+    }
+
+    for (int i = 0; i < EXPERT_PARALLELISM; ++i) {
+      GPUWorker *worker = &workers[i];
+      int device_index = worker->device_index;
+    
+      DeviceTransformerWeights *dev_w = &dev_transformers[device_index]->weights;
+      RunState *dev_s = &dev_transformers[device_index]->state;
+      RunStateExt *ext = ext_get(device_index);
+      hipStream_t compute_stream = dev_transformers[device_index]->compute_stream;
+
+      HIP_CHECK(hipSetDevice(device_index));
+
+      HIP_CHECK(hipMemsetAsync(ext->ext_e_agg, 0,
+                               (size_t)EXPERT_PARALLELISM * BATCH_SIZE * hidden_dim * sizeof(float), compute_stream));
+    }
+
     int *buffers_topk_i[EXPERT_PARALLELISM];
     float *buffers_topk_v[EXPERT_PARALLELISM];
 
     for (int i = 0; i < EXPERT_PARALLELISM; ++i) {
-      GPUWorker *expert_worker = workers + i;
-      int expert_device_index = expert_worker->device_index;
+      GPUWorker *worker = &workers[i];
+      int device_index = worker->device_index;
 
-      assert(expert_device_index == i);
+      assert(device_index == i);
 
-      RunState *expert_dev_s = &dev_transformers[expert_device_index]->state;
+      RunStateExt *ext = ext_get(device_index);
 
-      buffers_t[i] = expert_dev_s->t;
-      buffers_topk_i[i] = expert_dev_s->topk_i;
-      buffers_topk_v[i] = expert_dev_s->topk_v;
+      buffers_topk_i[i] = ext->ext_topk_i;
+      buffers_topk_v[i] = ext->ext_topk_v;
     }
 
-    assert(device_index == 0);
-    HIP_CHECK(hipDeviceSynchronize());
-    cgBroadcast<float>(g_world, buffers_t, BATCH_SIZE * hidden_dim, 0);
-    cgBroadcast<int>(g_world, buffers_topk_i, BATCH_SIZE * p->experts_per_token, 0);
-    cgBroadcast<float>(g_world, buffers_topk_v, BATCH_SIZE * p->experts_per_token, 0);
+    // TODO: Remove this sync?
+    sync_workers(dev_transformers, workers);
+    
+    cgBroadcast<int>(g_world, buffers_topk_i, EXPERT_PARALLELISM * BATCH_SIZE * p->experts_per_token, 0);
+    cgBroadcast<float>(g_world, buffers_topk_v, EXPERT_PARALLELISM * BATCH_SIZE * p->experts_per_token, 0);
 
-    // TODO: Add async memcpy and kernel launch in MOE using stream
     for (int i = 0; i < EXPERT_PARALLELISM; ++i) {
       GPUWorker *expert_worker = workers + i;
       int experts_per_device = expert_worker->expert_end - expert_worker->expert_start;
       int expert_device_index = expert_worker->device_index;
 
       DeviceTransformerWeights *expert_dev_w = &dev_transformers[expert_device_index]->weights;
-      RunState *expert_dev_s = &dev_transformers[expert_device_index]->state;
+      // RunState *expert_dev_s = &dev_transformers[expert_device_index]->state;
       RunStateExt *expert_ext = ext_get(expert_device_index);
       hipStream_t expert_compute_stream = dev_transformers[expert_device_index]->compute_stream;
 
       HIP_CHECK(hipSetDevice(expert_device_index));
 
-      getp_map_global_to_local_batch(expert_dev_s->topk_i, expert_dev_s->topk_v, expert_ext->local_ids,
+      getp_map_global_to_local_batch(expert_ext->ext_topk_i, expert_ext->ext_topk_v, expert_ext->local_ids,
                                      expert_ext->local_wts, expert_ext->n_local,
                                      p->experts_per_token, expert_worker->expert_start,
-                                     expert_worker->expert_end, BATCH_SIZE, expert_compute_stream);
+                                     expert_worker->expert_end, EXPERT_PARALLELISM * BATCH_SIZE, expert_compute_stream);
   
       int cap_pairs = build_moe_buckets_local_pos(
-          expert_ext->local_ids, expert_ext->local_wts, expert_ext->n_local, BATCH_SIZE,
+          expert_ext->local_ids, expert_ext->local_wts, expert_ext->n_local, EXPERT_PARALLELISM * BATCH_SIZE,
           p->experts_per_token, experts_per_device, expert_ext->e_counts, expert_ext->e_offsets,
           expert_ext->e_dev, expert_ext->w_dev, expert_ext->pair_pos, expert_compute_stream);
-  
-      HIP_CHECK(hipMemsetAsync(expert_dev_s->e_agg, 0, 
-                               (size_t)BATCH_SIZE * hidden_dim * sizeof(float), expert_compute_stream));
   
       __hip_bfloat16 *w1_base = expert_dev_w->w_mlp1 + 1ll * l * experts_per_device * 2 *
                                                           p->intermediate_dim *
@@ -1578,7 +1690,7 @@ int *getp_forward(Transformer * /*transformer*/,
       __hip_bfloat16 *b1_base =
           expert_dev_w->b_mlp1 + 1ll * l * experts_per_device * 2 * p->intermediate_dim;
   
-      launch_mlp1_swiglu_bf16_bucketed(expert_dev_s->gate_up, expert_dev_s->t, w1_base, b1_base,
+      launch_mlp1_swiglu_bf16_bucketed(expert_ext->ext_gate_up, expert_ext->ext_t, w1_base, b1_base,
                                        expert_ext->e_offsets, expert_ext->e_dev, hidden_dim,
                                        p->intermediate_dim, experts_per_device,
                                        cap_pairs, p->swiglu_limit, expert_compute_stream);
@@ -1590,47 +1702,119 @@ int *getp_forward(Transformer * /*transformer*/,
           expert_dev_w->b_mlp2 + 1ll * l * experts_per_device * hidden_dim;
   
       launch_mlp2_partial_bf16_bucketed_mfma(
-          expert_ext->z_partial, expert_dev_s->gate_up, w2_base, b2_base, expert_ext->w_dev,
+          expert_ext->z_partial, expert_ext->ext_gate_up, w2_base, b2_base, expert_ext->w_dev,
           expert_ext->e_offsets, expert_ext->e_dev, p->intermediate_dim, hidden_dim,
           experts_per_device, cap_pairs, expert_compute_stream);
   
-      moe_gather_pairs(expert_dev_s->e_agg, expert_ext->z_partial, expert_ext->pair_pos, hidden_dim,
-                       p->experts_per_token, BATCH_SIZE, expert_compute_stream);
+      moe_gather_pairs(expert_ext->ext_e_agg, expert_ext->z_partial, expert_ext->pair_pos, hidden_dim,
+                       p->experts_per_token, EXPERT_PARALLELISM * BATCH_SIZE, expert_compute_stream);
     }
 
-    for (int i = 0; i < EXPERT_PARALLELISM; ++i) {
-      GPUWorker *expert_worker = workers + i;
-      int expert_device_index = expert_worker->device_index;
-      hipStream_t expert_compute_stream = dev_transformers[expert_device_index]->compute_stream;
-      HIP_CHECK(hipSetDevice(expert_device_index));
-      HIP_CHECK(hipStreamSynchronize(expert_compute_stream));
-    }
-
-    HIP_CHECK(hipSetDevice(device_index));
+    sync_workers(dev_transformers, workers);
 
     float *buffers_e_agg[EXPERT_PARALLELISM];
     for (int i = 0; i < EXPERT_PARALLELISM; ++i) {
-      GPUWorker *expert_worker = workers + i;
-      int expert_device_index = expert_worker->device_index;
-      RunState *expert_dev_s = &dev_transformers[expert_device_index]->state;
+      GPUWorker *worker = &workers[i];
+      int device_index = worker->device_index;
 
-      buffers_e_agg[i] = expert_dev_s->e_agg;
+      RunStateExt *ext = ext_get(device_index);
+
+      buffers_e_agg[i] = ext->ext_e_agg;
     }
-    cgReduceSumF32(g_world, buffers_e_agg, BATCH_SIZE * hidden_dim);
+    cgReduceSumF32(g_world, buffers_e_agg, EXPERT_PARALLELISM * BATCH_SIZE * hidden_dim);
 
-    getp_vecadd(dev_x, dev_s->e_agg, hidden_dim, BATCH_SIZE);
+    // Scatter results from MOE to other workers
+
+    float *reduce_e_agg;
+
+    {
+      RunStateExt *ext = ext_get(0);
+      reduce_e_agg = ext->ext_e_agg;
+    }
+
+    for (int i = 0; i < EXPERT_PARALLELISM; ++i) {
+      GPUWorker *worker = &workers[i];
+      int device_index = worker->device_index;
+    
+      RunState *dev_s = &dev_transformers[device_index]->state;
+      hipStream_t compute_stream = dev_transformers[device_index]->compute_stream;
+
+      float *dev_x = dev_s->x;
+
+      HIP_CHECK(hipSetDevice(device_index));
+
+      if (device_index == 0) {
+        HIP_CHECK(hipMemcpyAsync(dev_s->e_agg, reduce_e_agg, sizeof(float) * BATCH_SIZE * hidden_dim, hipMemcpyDeviceToDevice, compute_stream));
+      }
+      else {
+        HIP_CHECK(hipMemcpyPeerAsync(
+          dev_s->e_agg, device_index, 
+          reduce_e_agg + (size_t)i * BATCH_SIZE * hidden_dim, 0, 
+          sizeof(float) * BATCH_SIZE * hidden_dim,
+          compute_stream
+        ));
+      }
+
+      getp_vecadd(dev_x, dev_s->e_agg, hidden_dim, BATCH_SIZE, compute_stream);
+    }
+
+    // TODO: Is it necessary?
+    sync_workers(dev_transformers, workers);
   }
 
-  getp_rmsnorm(dev_x, dev_x, dev_w->rms_out_w, BATCH_SIZE, hidden_dim);
-  getp_matmul<__hip_bfloat16>(dev_s->logits, dev_x, dev_w->out_bf16,
-                              (__hip_bfloat16 *)NULL, hidden_dim, p->vocab_size,
-                              BATCH_SIZE);
+  for (int i = 0; i < EXPERT_PARALLELISM; ++i) {
+    GPUWorker *worker = &workers[i];
+    int device_index = worker->device_index;
+  
+    DeviceTransformerWeights *dev_w = &dev_transformers[device_index]->weights;
+    RunState *dev_s = &dev_transformers[device_index]->state;
+    hipStream_t compute_stream = dev_transformers[device_index]->compute_stream;
 
-  getp_argmax_rows(dev_s->logits, p->vocab_size, dev_s->topk_i, BATCH_SIZE);
+    float *dev_x = dev_s->x;
+  
+    HIP_CHECK(hipSetDevice(device_index));
 
-  int *next_host = (int *)malloc(sizeof(int) * BATCH_SIZE);
-  HIP_CHECK(hipMemcpy(next_host, dev_s->topk_i, sizeof(int) * BATCH_SIZE,
-                      hipMemcpyDeviceToHost));
+    getp_rmsnorm(dev_x, dev_x, dev_w->rms_out_w, BATCH_SIZE, hidden_dim, compute_stream);
+    getp_matmul<__hip_bfloat16>(dev_s->logits, dev_x, dev_w->out_bf16,
+                                (__hip_bfloat16 *)NULL, hidden_dim, p->vocab_size,
+                                BATCH_SIZE, compute_stream);
+  
+    getp_argmax_rows(dev_s->logits, p->vocab_size, dev_s->topk_i, BATCH_SIZE, compute_stream);
+
+    // HIP_CHECK(hipMemcpyAsync(next_host + sizeof(int) * i * BATCH_SIZE, dev_s->topk_i, sizeof(int) * BATCH_SIZE,
+    //                          hipMemcpyDeviceToHost, compute_stream));
+  }
+
+  sync_workers(dev_transformers, workers);
+
+  int *next_host = (int *)malloc(sizeof(int) * EXPERT_PARALLELISM * BATCH_SIZE);
+  for (int i = 0; i < EXPERT_PARALLELISM * BATCH_SIZE; ++i) {
+    next_host[i] = -1;
+  }
+
+  for (int i = 0; i < EXPERT_PARALLELISM; ++i) {
+    GPUWorker *worker = &workers[i];
+    int device_index = worker->device_index;
+
+    RunState *dev_s = &dev_transformers[device_index]->state;
+    hipStream_t compute_stream = dev_transformers[device_index]->compute_stream;
+
+    HIP_CHECK(hipSetDevice(device_index));
+
+    HIP_CHECK(hipMemcpyAsync(next_host + i * BATCH_SIZE, dev_s->topk_i, 
+                             sizeof(int) * BATCH_SIZE,
+                             hipMemcpyDeviceToHost, compute_stream));
+  }
+
+  for (int i = 0; i < EXPERT_PARALLELISM; ++i) {
+    GPUWorker *worker = &workers[i];
+    int device_index = worker->device_index;
+
+    HIP_CHECK(hipSetDevice(device_index));
+
+    HIP_CHECK(hipDeviceSynchronize());  
+  }
+
   // HIP_CHECK(hipDeviceSynchronize());
   return next_host;
 }

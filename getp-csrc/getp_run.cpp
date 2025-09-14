@@ -75,7 +75,7 @@ void warm_up(Transformer *transformer, Tokenizer *tokenizer) {
 
   ext_create(n_devices);
   for (int i = 0; i < n_devices; ++i) {
-    ext_alloc_device(i, BATCH_SIZE, p->experts_per_token, p->n_experts, p->hidden_dim);
+    ext_alloc_device(i, BATCH_SIZE, EXPERT_PARALLELISM, p);
   }
 
   cgCreate(g_world, devices);
@@ -122,22 +122,22 @@ long long simple_getp_generate(Transformer *transformer, Tokenizer *tokenizer,
   // Inference here
 
   const char *empty_prompt = "";
-  for (int b = 0; b < BATCH_SIZE; ++b) {
+  for (int b = 0; b < EXPERT_PARALLELISM * BATCH_SIZE; ++b) {
     if (inputs_seq[b] == NULL) {
       inputs_seq[b] = empty_prompt;
     }
   }
 
   // encode the (string) prompt into tokens sequence
-  int nums_prompt_tokens[BATCH_SIZE];
-  memset(nums_prompt_tokens, 0, sizeof(int) * BATCH_SIZE);
-  int *prompts_tokens[BATCH_SIZE];
-  for (int b = 0; b < BATCH_SIZE; ++b) {
+  int nums_prompt_tokens[EXPERT_PARALLELISM * BATCH_SIZE];
+  memset(nums_prompt_tokens, 0, sizeof(int) * EXPERT_PARALLELISM * BATCH_SIZE);
+  int *prompts_tokens[EXPERT_PARALLELISM * BATCH_SIZE];
+  for (int b = 0; b < EXPERT_PARALLELISM * BATCH_SIZE; ++b) {
     prompts_tokens[b] = (int *)malloc((strlen(inputs_seq[b]) + 3) *
                                       sizeof(int)); // +3 for '\0', ?BOS, ?EOS 
   }
 
-  for (int b = 0; b < BATCH_SIZE; ++b) {
+  for (int b = 0; b < EXPERT_PARALLELISM * BATCH_SIZE; ++b) {
     encode(tokenizer, inputs_seq[b], -1, -1, prompts_tokens[b], &nums_prompt_tokens[b],
            transformer->config.initial_context_length);  
     if (nums_prompt_tokens[b] < 1) {
@@ -147,12 +147,12 @@ long long simple_getp_generate(Transformer *transformer, Tokenizer *tokenizer,
   }
 
   // start the main loop
-  int next[BATCH_SIZE];  // will store the next token in the sequence
-  int token[BATCH_SIZE]; // kick off with the first token in the prompt
+  int next[EXPERT_PARALLELISM * BATCH_SIZE];  // will store the next token in the sequence
+  int token[EXPERT_PARALLELISM * BATCH_SIZE]; // kick off with the first token in the prompt
   int pos = 0;           // position in the sequence
-  int epos[BATCH_SIZE];  // position where the sequence of each batch ends
-  int mask[BATCH_SIZE];  // store running state of each batch (0 - done, 1 - otherwise)
-  for (int b = 0; b < BATCH_SIZE; ++b) {
+  int epos[EXPERT_PARALLELISM * BATCH_SIZE];  // position where the sequence of each batch ends
+  int mask[EXPERT_PARALLELISM * BATCH_SIZE];  // store running state of each batch (0 - done, 1 - otherwise)
+  for (int b = 0; b < EXPERT_PARALLELISM * BATCH_SIZE; ++b) {
     token[b] = prompts_tokens[b][0];
     epos[b] = -1;
     mask[b] = 1;
@@ -178,7 +178,7 @@ long long simple_getp_generate(Transformer *transformer, Tokenizer *tokenizer,
 
     // advance the state machine
     pos++;
-    for (int b = 0; b < BATCH_SIZE; ++b) {
+    for (int b = 0; b < EXPERT_PARALLELISM * BATCH_SIZE; ++b) {
       if (!mask[b]) continue;
       epos[b] = pos;
       if (pos < nums_prompt_tokens[b]) {
@@ -192,13 +192,13 @@ long long simple_getp_generate(Transformer *transformer, Tokenizer *tokenizer,
 
     // data-dependent terminating condition: the EOS (=199999 or =200002) token
     // delimits sequences
-    for (int b = 0; b < BATCH_SIZE; ++b) {
+    for (int b = 0; b < EXPERT_PARALLELISM * BATCH_SIZE; ++b) {
       if (!mask[b]) continue;
       if (next[b] == 199999 || next[b] == 200002) {
         mask[b] = 0;
       }
     }
-    if (is_all_zero(mask, BATCH_SIZE)) {
+    if (is_all_zero(mask, EXPERT_PARALLELISM * BATCH_SIZE)) {
       break;
     }
 
@@ -208,7 +208,7 @@ long long simple_getp_generate(Transformer *transformer, Tokenizer *tokenizer,
     // safe_printf(piece); // same as printf("%s", piece), but skips "unsafe" bytes
     // fflush(stdout);
 
-    for (int b = 0; b < BATCH_SIZE; ++b) {
+    for (int b = 0; b < EXPERT_PARALLELISM * BATCH_SIZE; ++b) {
       token[b] = next[b];
     }
 
@@ -219,7 +219,7 @@ long long simple_getp_generate(Transformer *transformer, Tokenizer *tokenizer,
   // printf("\n");
 
   // Marker for end of sequence
-  for (int b = 0; b < BATCH_SIZE; ++b) {
+  for (int b = 0; b < EXPERT_PARALLELISM * BATCH_SIZE; ++b) {
     if (epos[b] == -1) {
       fprintf(stderr, "something is wrong, epos can not recieve value -1\n");
       exit(EXIT_FAILURE);
@@ -227,13 +227,13 @@ long long simple_getp_generate(Transformer *transformer, Tokenizer *tokenizer,
     outputs_tokens[b][epos[b] - nums_prompt_tokens[b] + 1] = -1;
   }
 
-  for (int b = 0; b < BATCH_SIZE; ++b) {
+  for (int b = 0; b < EXPERT_PARALLELISM * BATCH_SIZE; ++b) {
     free(prompts_tokens[b]);
   }
   HIP_CHECK(hipDeviceSynchronize());
 
   int acc = 0;
-  for (int b = 0; b < BATCH_SIZE; ++b) {
+  for (int b = 0; b < EXPERT_PARALLELISM * BATCH_SIZE; ++b) {
     acc += epos[b] - nums_prompt_tokens[b] + 1;
   }
 
@@ -246,7 +246,8 @@ void single_thread_generate(Transformer *transformer,
                             Requests *requests,
                             GPUWorker *workers,
                             long long *num_token_out_ptr,
-                            int thread_idx
+                            int thread_idx,
+                            int n_devices
 ) {
   Sampler *local_sampler = 
     reinterpret_cast<Sampler *>(malloc(sizeof(Sampler)));
@@ -254,14 +255,14 @@ void single_thread_generate(Transformer *transformer,
     sampler->temperature, sampler->topp, sampler->rng_state + thread_idx);
 
   long long num_token_out = 0;
-  const char *inputs_seq[BATCH_SIZE];
-  int *outputs_tokens[BATCH_SIZE];
+  const char *inputs_seq[EXPERT_PARALLELISM * BATCH_SIZE];
+  int *outputs_tokens[EXPERT_PARALLELISM * BATCH_SIZE];
 
   GPUWorker *main_worker = workers;
   int idx0 = main_worker->request_start;
   int requests_per_thread = main_worker->request_end - main_worker->request_start;
-  for (int idx = 0; idx < requests_per_thread; idx += BATCH_SIZE) {
-    for (int b = 0; b < BATCH_SIZE; ++b) {
+  for (int idx = 0; idx < requests_per_thread; idx += EXPERT_PARALLELISM * BATCH_SIZE) {
+    for (int b = 0; b < EXPERT_PARALLELISM * BATCH_SIZE; ++b) {
       inputs_seq[b] = get_str_req_ptr(requests, idx0 + idx + b);
       outputs_tokens[b] = get_tok_gen_ptr(requests, idx0 + idx + b);
     }
@@ -283,6 +284,8 @@ long long inference(Transformer *transformer, Tokenizer *tokenizer,
   int n_devices;
   HIP_CHECK(hipGetDeviceCount(&n_devices));
 
+  assert(n_devices == EXPERT_PARALLELISM);
+
   int seq_len_eff = std::min(transformer->config.seq_len, requests->max_seq_len);
   for (int i = 0; i < n_devices; ++i) {
     resize_kv_cache(dev_transformers[i], seq_len_eff);
@@ -297,7 +300,7 @@ long long inference(Transformer *transformer, Tokenizer *tokenizer,
       workers[i + j].request_start = (i / EXPERT_PARALLELISM) * num_reqs_per_device;
       workers[i + j].request_end = (i / EXPERT_PARALLELISM + 1) * num_reqs_per_device;
       if (i == n_parallel_models - 1) workers[i].request_end = requests->num_reqs;
-      assert((workers[i].request_end - workers[i].request_start) % BATCH_SIZE == 0);
+      assert((workers[i].request_end - workers[i].request_start) % (EXPERT_PARALLELISM * BATCH_SIZE) == 0);
     }
   }
 
@@ -306,7 +309,7 @@ long long inference(Transformer *transformer, Tokenizer *tokenizer,
 
   for (int i = 0; i < n_devices; i += EXPERT_PARALLELISM) {
     threads[i / EXPERT_PARALLELISM] = std::thread(single_thread_generate, 
-      transformer, tokenizer, sampler, requests, &workers[i], &nums_token_out[i / EXPERT_PARALLELISM], i / EXPERT_PARALLELISM);
+      transformer, tokenizer, sampler, requests, &workers[i], &nums_token_out[i / EXPERT_PARALLELISM], i / EXPERT_PARALLELISM, n_devices);
   }
 
   for (int i = 0; i < n_parallel_models; ++i) {

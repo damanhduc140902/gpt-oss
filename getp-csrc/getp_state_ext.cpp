@@ -1,4 +1,5 @@
 #include "getp_state_ext.hpp"
+#include "getp_transformer.cpp"
 
 #ifndef HIP_CHECK
 #define HIP_CHECK(expr) do { hipError_t _e = (expr); if (_e != hipSuccess) { \
@@ -23,17 +24,29 @@ void ext_create(int n_devices) {
   }
 }
 
-void ext_alloc_device(int device_index, int batch_size, int k_per_tok, int n_experts, int hidden_dim) {
+void ext_alloc_device(int device_index, int batch_size, int expert_parallelism, Config *p) {
+  int experts_per_token = p->experts_per_token;
+  int n_experts = p->n_experts;
+  int hidden_dim = p->hidden_dim;
+  int intermediate_dim = p->intermediate_dim;
+
   HIP_CHECK(hipSetDevice(device_index));
-  HIP_CHECK(hipMalloc(&g_ext[device_index].local_ids, sizeof(int)   * (size_t)batch_size * k_per_tok));
-  HIP_CHECK(hipMalloc(&g_ext[device_index].local_wts, sizeof(float) * (size_t)batch_size * k_per_tok));
-  HIP_CHECK(hipMalloc(&g_ext[device_index].n_local,   sizeof(int)   * (size_t)batch_size));
+  HIP_CHECK(hipMalloc(&g_ext[device_index].local_ids, sizeof(int)   * (size_t)expert_parallelism * batch_size * experts_per_token));
+  HIP_CHECK(hipMalloc(&g_ext[device_index].local_wts, sizeof(float) * (size_t)expert_parallelism * batch_size * experts_per_token));
+  HIP_CHECK(hipMalloc(&g_ext[device_index].n_local,   sizeof(int)   * (size_t)expert_parallelism * batch_size));
   HIP_CHECK(hipMalloc(&g_ext[device_index].e_counts,  sizeof(int)   * (size_t)n_experts));
   HIP_CHECK(hipMalloc(&g_ext[device_index].e_offsets, sizeof(int)   * ((size_t)n_experts + 1)));
-  HIP_CHECK(hipMalloc(&g_ext[device_index].e_dev,     sizeof(int)   * (size_t)batch_size * k_per_tok));
-  HIP_CHECK(hipMalloc(&g_ext[device_index].w_dev,     sizeof(float) * (size_t)batch_size * k_per_tok));
-  HIP_CHECK(hipMalloc(&g_ext[device_index].pair_pos,  sizeof(int)   * (size_t)batch_size * k_per_tok));
-  HIP_CHECK(hipMalloc(&g_ext[device_index].z_partial, sizeof(float) * (size_t)batch_size * k_per_tok * hidden_dim));
+  HIP_CHECK(hipMalloc(&g_ext[device_index].e_dev,     sizeof(int)   * (size_t)expert_parallelism * batch_size * experts_per_token));
+  HIP_CHECK(hipMalloc(&g_ext[device_index].w_dev,     sizeof(float) * (size_t)expert_parallelism * batch_size * experts_per_token));
+  HIP_CHECK(hipMalloc(&g_ext[device_index].pair_pos,  sizeof(int)   * (size_t)expert_parallelism * batch_size * experts_per_token));
+  HIP_CHECK(hipMalloc(&g_ext[device_index].z_partial, sizeof(float) * (size_t)expert_parallelism * batch_size * experts_per_token * hidden_dim));
+
+  HIP_CHECK(hipMalloc(&g_ext[device_index].ext_topk_i,       sizeof(int)   * (size_t)expert_parallelism * batch_size * experts_per_token));
+  HIP_CHECK(hipMalloc(&g_ext[device_index].ext_topk_v,       sizeof(float) * (size_t)expert_parallelism * batch_size * experts_per_token));
+  HIP_CHECK(hipMalloc(&g_ext[device_index].ext_router_score, sizeof(float) * (size_t)expert_parallelism * batch_size * n_experts));
+  HIP_CHECK(hipMalloc(&g_ext[device_index].ext_gate_up,      sizeof(float) * (size_t)expert_parallelism * batch_size * experts_per_token * intermediate_dim));
+  HIP_CHECK(hipMalloc(&g_ext[device_index].ext_t,            sizeof(float) * (size_t)expert_parallelism * batch_size * hidden_dim));
+  HIP_CHECK(hipMalloc(&g_ext[device_index].ext_e_agg,        sizeof(float) * (size_t)expert_parallelism * batch_size * hidden_dim));
 }
 
 void ext_free_all(int n_devices) {
@@ -48,6 +61,13 @@ void ext_free_all(int n_devices) {
     if (g_ext[i].w_dev)     HIP_CHECK(hipFree(g_ext[i].w_dev));
     if (g_ext[i].pair_pos)  HIP_CHECK(hipFree(g_ext[i].pair_pos));
     if (g_ext[i].z_partial) HIP_CHECK(hipFree(g_ext[i].z_partial));
+
+    if (g_ext[i].ext_topk_i)        HIP_CHECK(hipFree(g_ext[i].ext_topk_i))
+    if (g_ext[i].ext_topk_v)        HIP_CHECK(hipFree(g_ext[i].ext_topk_v))
+    if (g_ext[i].ext_router_score)  HIP_CHECK(hipFree(g_ext[i].ext_router_score));
+    if (g_ext[i].ext_gate_up)       HIP_CHECK(hipFree(g_ext[i].ext_gate_up));
+    if (g_ext[i].ext_t)             HIP_CHECK(hipFree(g_ext[i].ext_t));
+    if (g_ext[i].ext_e_agg)         HIP_CHECK(hipFree(g_ext[i].ext_e_agg));
   }
   free(g_ext);
   g_ext = nullptr;
