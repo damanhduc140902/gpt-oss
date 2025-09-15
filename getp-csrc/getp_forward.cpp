@@ -7,6 +7,7 @@
 #include <iostream>
 
 #include "collectives.hpp"
+#include "getp_barrier.hpp"
 #include "getp_state_ext.hpp"
 #include "getp_transformer.cpp"
 #include "getp_transformer.hpp"
@@ -159,7 +160,6 @@ static inline int build_moe_buckets_local_pos(const int *local_ids,
   moe_fill_local_pos_kernel<<<dim3(B), dim3(128), 0, stream>>>(
       local_ids, local_wts, n_local, B, K, E, e_offsets, e_counts, tok_idx_out,
       w_out, pair_pos);
-  HIP_CHECK(hipStreamSynchronize(stream));
   return cap_pairs;
 }
 
@@ -1420,75 +1420,65 @@ static inline void getp_gather_embedding_bf16(float *x,
   gather_embedding_bf16_kernel<<<grid, block, 0, stream>>>(x, table, tok, H);
 }
 
-inline void sync_workers(DeviceTransformer **dev_transformers, GPUWorker *workers) {
-  for (int i = 0; i < EXPERT_PARALLELISM; ++i) {
-    GPUWorker *worker = &workers[i];
-    int device_index = worker->device_index;
-    hipStream_t compute_stream = dev_transformers[device_index]->compute_stream;
-    
-    HIP_CHECK(hipSetDevice(device_index));
-    HIP_CHECK(hipStreamSynchronize(compute_stream));
-  }
+inline void sync_workers(hipStream_t stream, Barrier &sync_point) {
+  /**
+    This implement makes sure that threads are synchronized to this point, 
+    and the stream corresponding to the thread is finished its work after the return
+    of this function
+   */
+  HIP_CHECK(hipStreamSynchronize(stream));
+  sync_point.wait();
+  HIP_CHECK(hipStreamSynchronize(stream)); // for multi-thread access the same stream
 }
 
 int *getp_forward(Transformer * /*transformer*/,
                   DeviceTransformer **dev_transformers, GPUWorker *workers,
-                  int token[], int pos) {
+                  Barrier &sync_point, int thread_idx, 
+                  int token[], int pos
+) {
   PROFILE_FUNCTION();
 
-  Config *p = &dev_transformers[0]->config;
+  Config *p = &dev_transformers[thread_idx]->config;
   int head_dim = p->head_dim;
   int hidden_dim = p->hidden_dim;
   int kv_dim = p->head_dim * p->n_kv_heads;
   int n_experts = p->n_experts;
 
-  for (int i = 0; i < EXPERT_PARALLELISM; ++i) {
-    // GPUWorker *main_worker = workers; // execute non-expert layers
-    // int device_index = main_worker->device_index;
-    GPUWorker *worker = &workers[i];
-    int device_index = worker->device_index;
+  GPUWorker *worker = &workers[thread_idx];
 
-    DeviceTransformerWeights *dev_w = &dev_transformers[device_index]->weights;
-    RunState *dev_s = &dev_transformers[device_index]->state;
-    hipStream_t compute_stream = dev_transformers[device_index]->compute_stream;
+  int device_index = worker->device_index;
 
-    float *dev_x = dev_s->x;
-  
-    HIP_CHECK(hipSetDevice(device_index));
-  
-    HIP_CHECK(hipMemcpyAsync(dev_s->topk_i, token + i * BATCH_SIZE, sizeof(int) * BATCH_SIZE,
-                             hipMemcpyHostToDevice, compute_stream));
-    getp_gather_embedding_bf16(dev_x, dev_w->token_embedding_table_bf16,
-                               dev_s->topk_i, hidden_dim, BATCH_SIZE, compute_stream);
-  
-    float *dev_cos_vals = dev_s->mlp1_out;
-    float *dev_sin_vals = dev_s->gate;
-    float *dev_inv_freq = dev_s->up;
-    float ntk_beta = 32.0f, ntk_alpha = 1.0f;
-    getp_compute_cos_sin(pos, p->rope_theta, head_dim, p->rope_scaling_factor,
-                         p->initial_context_length, ntk_beta, ntk_alpha,
-                         dev_cos_vals, dev_sin_vals, dev_inv_freq, compute_stream);
-  }
+  assert(device_index == thread_idx);
+
+  DeviceTransformerWeights *dev_w = &dev_transformers[device_index]->weights;
+  RunState *dev_s = &dev_transformers[device_index]->state;
+  RunStateExt *ext = ext_get(device_index);
+  hipStream_t compute_stream = dev_transformers[device_index]->compute_stream;
+
+  float *dev_x = dev_s->x;
+
+  // Note: 1 thread - 1 gpu => only need to set device once
+  HIP_CHECK(hipSetDevice(device_index));
+
+  HIP_CHECK(hipMemcpyAsync(dev_s->topk_i, token, sizeof(int) * BATCH_SIZE,
+                           hipMemcpyHostToDevice, compute_stream));
+  getp_gather_embedding_bf16(dev_x, dev_w->token_embedding_table_bf16,
+                             dev_s->topk_i, hidden_dim, BATCH_SIZE, compute_stream);
+
+  float *dev_cos_vals = dev_s->mlp1_out;
+  float *dev_sin_vals = dev_s->gate;
+  float *dev_inv_freq = dev_s->up;
+  float ntk_beta = 32.0f, ntk_alpha = 1.0f;
+  getp_compute_cos_sin(pos, p->rope_theta, head_dim, p->rope_scaling_factor,
+                       p->initial_context_length, ntk_beta, ntk_alpha,
+                       dev_cos_vals, dev_sin_vals, dev_inv_freq, compute_stream);
 
   // TODO: Remove below synchronization
-  sync_workers(dev_transformers, workers);
+  sync_workers(compute_stream, sync_point);
 
   for (unsigned long long l = 0; l < p->n_layers; l++) {
-    for (int i = 0; i < EXPERT_PARALLELISM; ++i) {
-      GPUWorker *worker = &workers[i];
-      int device_index = worker->device_index;
-    
-      DeviceTransformerWeights *dev_w = &dev_transformers[device_index]->weights;
-      RunState *dev_s = &dev_transformers[device_index]->state;
-      hipStream_t compute_stream = dev_transformers[device_index]->compute_stream;
-
-      float *dev_x = dev_s->x;
-
-      float *dev_cos_vals = dev_s->mlp1_out;
-      float *dev_sin_vals = dev_s->gate;
-    
-      HIP_CHECK(hipSetDevice(device_index));
-
+    // rmsnorm, attention, ... layers
+    {
       getp_rmsnorm(dev_s->t, dev_x, dev_w->rms_attn_w + 1ll * l * hidden_dim,
                    BATCH_SIZE, hidden_dim, compute_stream);
   
@@ -1549,7 +1539,6 @@ int *getp_forward(Transformer * /*transformer*/,
   
       getp_rmsnorm(dev_s->t, dev_x, dev_w->rms_ffn_w + 1ll * l * hidden_dim,
                    BATCH_SIZE, hidden_dim, compute_stream);
-
     }
 
     // Brief explain: Main device 0 gathers all dev_s->t from other devices then scatters it to others
@@ -1557,19 +1546,9 @@ int *getp_forward(Transformer * /*transformer*/,
     // Evaluate router score and distribute the tokens to the experts as the same as in the previous commit
 
     // Make sure that output of previous layers from other devices is ready
-    sync_workers(dev_transformers, workers);
+    sync_workers(compute_stream, sync_point);
 
-    {
-      GPUWorker *worker = &workers[0];
-      int device_index = worker->device_index;
-    
-      DeviceTransformerWeights *dev_w = &dev_transformers[device_index]->weights;
-      RunState *dev_s = &dev_transformers[device_index]->state;
-      RunStateExt *ext = ext_get(device_index);
-      hipStream_t compute_stream = dev_transformers[device_index]->compute_stream;
-    
-      HIP_CHECK(hipSetDevice(device_index));
-
+    if (device_index == 0) {
       // Gather output t
       for (int i = 0; i < EXPERT_PARALLELISM; ++i) {
         GPUWorker *peer_worker = &workers[i];
@@ -1595,6 +1574,7 @@ int *getp_forward(Transformer * /*transformer*/,
       HIP_CHECK(hipStreamSynchronize(compute_stream));
 
       // Send to other devices
+      // Note: stream seems to be thread-safe, so multiple threads can use the same stream
       for (int i = 1; i < EXPERT_PARALLELISM; ++i) {
         GPUWorker *peer_worker = &workers[i];
         int peer_device_index = peer_worker->device_index;
@@ -1610,7 +1590,7 @@ int *getp_forward(Transformer * /*transformer*/,
           peer_compute_stream));
       }
 
-      HIP_CHECK(hipSetDevice(0));
+      HIP_CHECK(hipSetDevice(device_index));
   
       // Compute router score
       __hip_bfloat16 *dev_w_router =
@@ -1625,196 +1605,134 @@ int *getp_forward(Transformer * /*transformer*/,
                                      p->experts_per_token, ext->ext_topk_v,
                                      ext->ext_topk_i, EXPERT_PARALLELISM * BATCH_SIZE, compute_stream);
     }
-
-    for (int i = 0; i < EXPERT_PARALLELISM; ++i) {
-      GPUWorker *worker = &workers[i];
-      int device_index = worker->device_index;
     
-      DeviceTransformerWeights *dev_w = &dev_transformers[device_index]->weights;
-      RunState *dev_s = &dev_transformers[device_index]->state;
-      RunStateExt *ext = ext_get(device_index);
-      hipStream_t compute_stream = dev_transformers[device_index]->compute_stream;
-
-      HIP_CHECK(hipSetDevice(device_index));
-
-      HIP_CHECK(hipMemsetAsync(ext->ext_e_agg, 0,
-                               (size_t)EXPERT_PARALLELISM * BATCH_SIZE * hidden_dim * sizeof(float), compute_stream));
-    }
-
-    int *buffers_topk_i[EXPERT_PARALLELISM];
-    float *buffers_topk_v[EXPERT_PARALLELISM];
-
-    for (int i = 0; i < EXPERT_PARALLELISM; ++i) {
-      GPUWorker *worker = &workers[i];
-      int device_index = worker->device_index;
-
-      assert(device_index == i);
-
-      RunStateExt *ext = ext_get(device_index);
-
-      buffers_topk_i[i] = ext->ext_topk_i;
-      buffers_topk_v[i] = ext->ext_topk_v;
-    }
+    HIP_CHECK(hipSetDevice(device_index));
+    HIP_CHECK(hipMemsetAsync(ext->ext_e_agg, 0,
+                             (size_t)EXPERT_PARALLELISM * BATCH_SIZE * hidden_dim * sizeof(float), compute_stream));
 
     // TODO: Remove this sync?
-    sync_workers(dev_transformers, workers);
-    
-    cgBroadcast<int>(g_world, buffers_topk_i, EXPERT_PARALLELISM * BATCH_SIZE * p->experts_per_token, 0);
-    cgBroadcast<float>(g_world, buffers_topk_v, EXPERT_PARALLELISM * BATCH_SIZE * p->experts_per_token, 0);
+    sync_workers(compute_stream, sync_point);
 
-    for (int i = 0; i < EXPERT_PARALLELISM; ++i) {
-      GPUWorker *expert_worker = workers + i;
-      int experts_per_device = expert_worker->expert_end - expert_worker->expert_start;
-      int expert_device_index = expert_worker->device_index;
-
-      DeviceTransformerWeights *expert_dev_w = &dev_transformers[expert_device_index]->weights;
-      // RunState *expert_dev_s = &dev_transformers[expert_device_index]->state;
-      RunStateExt *expert_ext = ext_get(expert_device_index);
-      hipStream_t expert_compute_stream = dev_transformers[expert_device_index]->compute_stream;
-
-      HIP_CHECK(hipSetDevice(expert_device_index));
-
-      getp_map_global_to_local_batch(expert_ext->ext_topk_i, expert_ext->ext_topk_v, expert_ext->local_ids,
-                                     expert_ext->local_wts, expert_ext->n_local,
-                                     p->experts_per_token, expert_worker->expert_start,
-                                     expert_worker->expert_end, EXPERT_PARALLELISM * BATCH_SIZE, expert_compute_stream);
+    if (device_index == 0) {
+      int *buffers_topk_i[EXPERT_PARALLELISM];
+      float *buffers_topk_v[EXPERT_PARALLELISM];
   
-      int cap_pairs = build_moe_buckets_local_pos(
-          expert_ext->local_ids, expert_ext->local_wts, expert_ext->n_local, EXPERT_PARALLELISM * BATCH_SIZE,
-          p->experts_per_token, experts_per_device, expert_ext->e_counts, expert_ext->e_offsets,
-          expert_ext->e_dev, expert_ext->w_dev, expert_ext->pair_pos, expert_compute_stream);
+      for (int i = 0; i < EXPERT_PARALLELISM; ++i) {
+        GPUWorker *worker = &workers[i];
+        int device_index = worker->device_index;
   
-      __hip_bfloat16 *w1_base = expert_dev_w->w_mlp1 + 1ll * l * experts_per_device * 2 *
-                                                          p->intermediate_dim *
-                                                          hidden_dim;
-      __hip_bfloat16 *b1_base =
-          expert_dev_w->b_mlp1 + 1ll * l * experts_per_device * 2 * p->intermediate_dim;
+        assert(device_index == i);
   
-      launch_mlp1_swiglu_bf16_bucketed(expert_ext->ext_gate_up, expert_ext->ext_t, w1_base, b1_base,
-                                       expert_ext->e_offsets, expert_ext->e_dev, hidden_dim,
-                                       p->intermediate_dim, experts_per_device,
-                                       cap_pairs, p->swiglu_limit, expert_compute_stream);
+        RunStateExt *ext = ext_get(device_index);
   
-      __hip_bfloat16 *w2_base = expert_dev_w->w_mlp2 + 1ll * l * experts_per_device *
-                                                          hidden_dim *
-                                                          p->intermediate_dim;
-      __hip_bfloat16 *b2_base =
-          expert_dev_w->b_mlp2 + 1ll * l * experts_per_device * hidden_dim;
-  
-      launch_mlp2_partial_bf16_bucketed_mfma(
-          expert_ext->z_partial, expert_ext->ext_gate_up, w2_base, b2_base, expert_ext->w_dev,
-          expert_ext->e_offsets, expert_ext->e_dev, p->intermediate_dim, hidden_dim,
-          experts_per_device, cap_pairs, expert_compute_stream);
-  
-      moe_gather_pairs(expert_ext->ext_e_agg, expert_ext->z_partial, expert_ext->pair_pos, hidden_dim,
-                       p->experts_per_token, EXPERT_PARALLELISM * BATCH_SIZE, expert_compute_stream);
+        buffers_topk_i[i] = ext->ext_topk_i;
+        buffers_topk_v[i] = ext->ext_topk_v;
+      }
+      
+      cgBroadcast<int>(g_world, buffers_topk_i, EXPERT_PARALLELISM * BATCH_SIZE * p->experts_per_token, 0);
+      cgBroadcast<float>(g_world, buffers_topk_v, EXPERT_PARALLELISM * BATCH_SIZE * p->experts_per_token, 0);
     }
 
-    sync_workers(dev_transformers, workers);
+    sync_workers(compute_stream, sync_point);
 
-    float *buffers_e_agg[EXPERT_PARALLELISM];
-    for (int i = 0; i < EXPERT_PARALLELISM; ++i) {
-      GPUWorker *worker = &workers[i];
-      int device_index = worker->device_index;
+    // MOE 
+    HIP_CHECK(hipSetDevice(device_index));
 
-      RunStateExt *ext = ext_get(device_index);
+    getp_map_global_to_local_batch(ext->ext_topk_i, ext->ext_topk_v, ext->local_ids,
+                                   ext->local_wts, ext->n_local,
+                                   p->experts_per_token, worker->expert_start,
+                                   worker->expert_end, EXPERT_PARALLELISM * BATCH_SIZE, compute_stream);
 
-      buffers_e_agg[i] = ext->ext_e_agg;
+    int experts_per_device = worker->expert_end - worker->expert_start;
+    int cap_pairs = build_moe_buckets_local_pos(
+        ext->local_ids, ext->local_wts, ext->n_local, EXPERT_PARALLELISM * BATCH_SIZE,
+        p->experts_per_token, experts_per_device, ext->e_counts, ext->e_offsets,
+        ext->e_dev, ext->w_dev, ext->pair_pos, compute_stream);
+
+    __hip_bfloat16 *w1_base = dev_w->w_mlp1 + 1ll * l * experts_per_device * 2 *
+                                                  p->intermediate_dim *
+                                                  hidden_dim;
+    __hip_bfloat16 *b1_base =
+        dev_w->b_mlp1 + 1ll * l * experts_per_device * 2 * p->intermediate_dim;
+
+    launch_mlp1_swiglu_bf16_bucketed(ext->ext_gate_up, ext->ext_t, w1_base, b1_base,
+                                     ext->e_offsets, ext->e_dev, hidden_dim,
+                                     p->intermediate_dim, experts_per_device,
+                                     cap_pairs, p->swiglu_limit, compute_stream);
+
+    __hip_bfloat16 *w2_base = dev_w->w_mlp2 + 1ll * l * experts_per_device *
+                                                  hidden_dim *
+                                                  p->intermediate_dim;
+    __hip_bfloat16 *b2_base =
+        dev_w->b_mlp2 + 1ll * l * experts_per_device * hidden_dim;
+
+    launch_mlp2_partial_bf16_bucketed_mfma(
+        ext->z_partial, ext->ext_gate_up, w2_base, b2_base, ext->w_dev,
+        ext->e_offsets, ext->e_dev, p->intermediate_dim, hidden_dim,
+        experts_per_device, cap_pairs, compute_stream);
+
+    moe_gather_pairs(ext->ext_e_agg, ext->z_partial, ext->pair_pos, hidden_dim,
+                     p->experts_per_token, EXPERT_PARALLELISM * BATCH_SIZE, compute_stream);
+
+    sync_workers(compute_stream, sync_point);
+
+    if (device_index == 0) {
+      float *buffers_e_agg[EXPERT_PARALLELISM];
+      for (int i = 0; i < EXPERT_PARALLELISM; ++i) {
+        GPUWorker *worker = &workers[i];
+        int device_index = worker->device_index;
+  
+        RunStateExt *ext = ext_get(device_index);
+  
+        buffers_e_agg[i] = ext->ext_e_agg;
+      }
+      cgReduceSumF32(g_world, buffers_e_agg, EXPERT_PARALLELISM * BATCH_SIZE * hidden_dim);
     }
-    cgReduceSumF32(g_world, buffers_e_agg, EXPERT_PARALLELISM * BATCH_SIZE * hidden_dim);
+
+    // Make sure that the reduction in device 0 is done
+    sync_workers(compute_stream, sync_point);
 
     // Scatter results from MOE to other workers
-
     float *reduce_e_agg;
-
+    
     {
       RunStateExt *ext = ext_get(0);
       reduce_e_agg = ext->ext_e_agg;
     }
-
-    for (int i = 0; i < EXPERT_PARALLELISM; ++i) {
-      GPUWorker *worker = &workers[i];
-      int device_index = worker->device_index;
     
-      RunState *dev_s = &dev_transformers[device_index]->state;
-      hipStream_t compute_stream = dev_transformers[device_index]->compute_stream;
-
-      float *dev_x = dev_s->x;
-
-      HIP_CHECK(hipSetDevice(device_index));
-
-      if (device_index == 0) {
-        HIP_CHECK(hipMemcpyAsync(dev_s->e_agg, reduce_e_agg, sizeof(float) * BATCH_SIZE * hidden_dim, hipMemcpyDeviceToDevice, compute_stream));
-      }
-      else {
-        HIP_CHECK(hipMemcpyPeerAsync(
-          dev_s->e_agg, device_index, 
-          reduce_e_agg + (size_t)i * BATCH_SIZE * hidden_dim, 0, 
-          sizeof(float) * BATCH_SIZE * hidden_dim,
-          compute_stream
-        ));
-      }
-
-      getp_vecadd(dev_x, dev_s->e_agg, hidden_dim, BATCH_SIZE, compute_stream);
+    if (device_index == 0) {
+      HIP_CHECK(hipMemcpyAsync(dev_s->e_agg, reduce_e_agg, sizeof(float) * BATCH_SIZE * hidden_dim, hipMemcpyDeviceToDevice, compute_stream));
+    }
+    else {
+      HIP_CHECK(hipMemcpyPeerAsync(
+        dev_s->e_agg, device_index, 
+        reduce_e_agg + (size_t)device_index * BATCH_SIZE * hidden_dim, 0, 
+        sizeof(float) * BATCH_SIZE * hidden_dim,
+        compute_stream
+      ));
     }
 
+    getp_vecadd(dev_x, dev_s->e_agg, hidden_dim, BATCH_SIZE, compute_stream);
+
     // TODO: Is it necessary?
-    sync_workers(dev_transformers, workers);
+    sync_workers(compute_stream, sync_point);
   }
 
-  for (int i = 0; i < EXPERT_PARALLELISM; ++i) {
-    GPUWorker *worker = &workers[i];
-    int device_index = worker->device_index;
+  getp_rmsnorm(dev_x, dev_x, dev_w->rms_out_w, BATCH_SIZE, hidden_dim, compute_stream);
+  getp_matmul<__hip_bfloat16>(dev_s->logits, dev_x, dev_w->out_bf16,
+                              (__hip_bfloat16 *)NULL, hidden_dim, p->vocab_size,
+                              BATCH_SIZE, compute_stream);
+
+  getp_argmax_rows(dev_s->logits, p->vocab_size, dev_s->topk_i, BATCH_SIZE, compute_stream);
+
+  int *next_host = (int *)malloc(sizeof(int) * BATCH_SIZE);
   
-    DeviceTransformerWeights *dev_w = &dev_transformers[device_index]->weights;
-    RunState *dev_s = &dev_transformers[device_index]->state;
-    hipStream_t compute_stream = dev_transformers[device_index]->compute_stream;
+  HIP_CHECK(hipMemcpyAsync(next_host, dev_s->topk_i, 
+                           sizeof(int) * BATCH_SIZE,
+                           hipMemcpyDeviceToHost, compute_stream));
 
-    float *dev_x = dev_s->x;
-  
-    HIP_CHECK(hipSetDevice(device_index));
+  // TODO: Is it necesssary?
+  sync_workers(compute_stream, sync_point);
 
-    getp_rmsnorm(dev_x, dev_x, dev_w->rms_out_w, BATCH_SIZE, hidden_dim, compute_stream);
-    getp_matmul<__hip_bfloat16>(dev_s->logits, dev_x, dev_w->out_bf16,
-                                (__hip_bfloat16 *)NULL, hidden_dim, p->vocab_size,
-                                BATCH_SIZE, compute_stream);
-  
-    getp_argmax_rows(dev_s->logits, p->vocab_size, dev_s->topk_i, BATCH_SIZE, compute_stream);
-
-    // HIP_CHECK(hipMemcpyAsync(next_host + sizeof(int) * i * BATCH_SIZE, dev_s->topk_i, sizeof(int) * BATCH_SIZE,
-    //                          hipMemcpyDeviceToHost, compute_stream));
-  }
-
-  sync_workers(dev_transformers, workers);
-
-  int *next_host = (int *)malloc(sizeof(int) * EXPERT_PARALLELISM * BATCH_SIZE);
-  for (int i = 0; i < EXPERT_PARALLELISM * BATCH_SIZE; ++i) {
-    next_host[i] = -1;
-  }
-
-  for (int i = 0; i < EXPERT_PARALLELISM; ++i) {
-    GPUWorker *worker = &workers[i];
-    int device_index = worker->device_index;
-
-    RunState *dev_s = &dev_transformers[device_index]->state;
-    hipStream_t compute_stream = dev_transformers[device_index]->compute_stream;
-
-    HIP_CHECK(hipSetDevice(device_index));
-
-    HIP_CHECK(hipMemcpyAsync(next_host + i * BATCH_SIZE, dev_s->topk_i, 
-                             sizeof(int) * BATCH_SIZE,
-                             hipMemcpyDeviceToHost, compute_stream));
-  }
-
-  for (int i = 0; i < EXPERT_PARALLELISM; ++i) {
-    GPUWorker *worker = &workers[i];
-    int device_index = worker->device_index;
-
-    HIP_CHECK(hipSetDevice(device_index));
-
-    HIP_CHECK(hipDeviceSynchronize());  
-  }
-
-  // HIP_CHECK(hipDeviceSynchronize());
   return next_host;
 }
