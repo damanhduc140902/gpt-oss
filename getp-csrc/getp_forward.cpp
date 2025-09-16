@@ -1676,41 +1676,22 @@ int *getp_forward(Transformer * /*transformer*/,
 
     sync_workers(compute_stream, sync_point);
 
-    if (device_index == 0) {
-      float *buffers_e_agg[EXPERT_PARALLELISM];
-      for (int i = 0; i < EXPERT_PARALLELISM; ++i) {
-        GPUWorker *worker = &workers[i];
-        int device_index = worker->device_index;
-  
-        RunStateExt *ext = ext_get(device_index);
-  
-        buffers_e_agg[i] = ext->ext_e_agg;
-      }
-      cgReduceSumF32(g_world, buffers_e_agg, EXPERT_PARALLELISM * BATCH_SIZE * hidden_dim);
+    float *buffers_e_agg[EXPERT_PARALLELISM];
+    for (int i = 0; i < EXPERT_PARALLELISM; ++i) {
+      GPUWorker *peer_worker = &workers[i];
+      int peer_device_index = peer_worker->device_index;
+
+      RunStateExt *peer_ext = ext_get(peer_device_index);
+
+      buffers_e_agg[i] = peer_ext->ext_e_agg + (size_t)device_index * BATCH_SIZE * hidden_dim;
     }
+
+    cgReduceSumF32(g_world, buffers_e_agg, BATCH_SIZE * (size_t)hidden_dim, device_index);
 
     // Make sure that the reduction in device 0 is done
     sync_workers(compute_stream, sync_point);
 
-    // Scatter results from MOE to other workers
-    float *reduce_e_agg;
-    
-    {
-      RunStateExt *ext = ext_get(0);
-      reduce_e_agg = ext->ext_e_agg;
-    }
-    
-    if (device_index == 0) {
-      HIP_CHECK(hipMemcpyAsync(dev_s->e_agg, reduce_e_agg, sizeof(float) * BATCH_SIZE * hidden_dim, hipMemcpyDeviceToDevice, compute_stream));
-    }
-    else {
-      HIP_CHECK(hipMemcpyPeerAsync(
-        dev_s->e_agg, device_index, 
-        reduce_e_agg + (size_t)device_index * BATCH_SIZE * hidden_dim, 0, 
-        sizeof(float) * BATCH_SIZE * hidden_dim,
-        compute_stream
-      ));
-    }
+    HIP_CHECK(hipMemcpyAsync(dev_s->e_agg, buffers_e_agg[device_index], sizeof(float) * BATCH_SIZE * hidden_dim, hipMemcpyDeviceToDevice, compute_stream));
 
     getp_vecadd(dev_x, dev_s->e_agg, hidden_dim, BATCH_SIZE, compute_stream);
 
