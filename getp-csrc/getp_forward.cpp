@@ -22,6 +22,13 @@
 #ifndef GETP_ROUTER_TOPK_MAXK
 #define GETP_ROUTER_TOPK_MAXK 4
 #endif
+
+
+
+#ifndef GETP_BN_AGG
+#define GETP_BN_AGG 4
+#endif
+
 extern CollectiveGroup g_world;
 
 #define MAX(x, y) (((x) > (y)) ? (x) : (y))
@@ -581,9 +588,9 @@ static inline void moe_gather_pairs(float *e_agg, const float *z_partial,
 }
 
 __global__ void matmul_qkv_fused_kernel(
-    float *__restrict__ q_out, float *__restrict__ k_out, float *__restrict__ v_out,
-    const float *__restrict__ x, const __hip_bfloat16 *__restrict__ W,
-    const __hip_bfloat16 *__restrict__ B, int n, int q_len, int k_len, int v_len,
+    float* __restrict__ q_out, float* __restrict__ k_out, float* __restrict__ v_out,
+    const float* __restrict__ x, const __hip_bfloat16* __restrict__ W,
+    const __hip_bfloat16* __restrict__ B, int n, int q_len, int k_len, int v_len,
     int batch_size) {
   constexpr int BLOCK_SIZE = 256;
   const int M = batch_size;
@@ -592,12 +599,12 @@ __global__ void matmul_qkv_fused_kernel(
   constexpr int BM = 32, BN = 32, BK = 32;
   constexpr int WM = 16, WN = 16;
 
-  const int waveIdx = threadIdx.x / warpSize;
+  const int waveIdx = threadIdx.x >> 6;
   const int xTile = waveIdx % (BM / WM);
   const int yTile = waveIdx / (BM / WM);
-  const int lane = threadIdx.x % warpSize;
-  const int xMF = lane % 16;
-  const int yMF = lane / 16;
+  const int lane = threadIdx.x & 63;
+  const int xMF = lane & 15;
+  const int yMF = lane >> 4;
 
   const int loadX_x = threadIdx.x % (BK / 4);
   const int loadX_y = threadIdx.x / (BK / 4);
@@ -606,12 +613,12 @@ __global__ void matmul_qkv_fused_kernel(
   constexpr int strideX = BLOCK_SIZE / (BK / 4);
   constexpr int strideW = BLOCK_SIZE / (BK / 8);
 
-  __shared__ unsigned short sx[BK * BM];
-  __shared__ unsigned short sw[BK * BN];
+  __shared__ unsigned short sx[2 * BK * BM];
+  __shared__ unsigned short sw[2 * BK * BN];
 
   f32x4 dmn = {0, 0, 0, 0};
 
-  for (int bk = 0; bk < K; bk += BK) {
+  auto prefetch = [&](int bk, unsigned short* psx, unsigned short* psw) {
     for (int off = 0; off < BM; off += strideX) {
       if (loadX_y + off >= BM) break;
       const int kk = bk + 4 * loadX_x;
@@ -619,15 +626,15 @@ __global__ void matmul_qkv_fused_kernel(
       if (row < M) {
         if (kk + 3 < K) {
           float4 v = *reinterpret_cast<const float4 *>(x + (size_t)row * K + kk);
-          sx[(4 * loadX_x + 0) * BM + (loadX_y + off)] = f32_to_bf16bits(v.x);
-          sx[(4 * loadX_x + 1) * BM + (loadX_y + off)] = f32_to_bf16bits(v.y);
-          sx[(4 * loadX_x + 2) * BM + (loadX_y + off)] = f32_to_bf16bits(v.z);
-          sx[(4 * loadX_x + 3) * BM + (loadX_y + off)] = f32_to_bf16bits(v.w);
+          psx[(4 * loadX_x + 0) * BM + (loadX_y + off)] = f32_to_bf16bits(v.x);
+          psx[(4 * loadX_x + 1) * BM + (loadX_y + off)] = f32_to_bf16bits(v.y);
+          psx[(4 * loadX_x + 2) * BM + (loadX_y + off)] = f32_to_bf16bits(v.z);
+          psx[(4 * loadX_x + 3) * BM + (loadX_y + off)] = f32_to_bf16bits(v.w);
         } else {
           for (int t = 0; t < 4; ++t) {
             int kx = kk + t; unsigned short val = 0;
             if (kx < K) val = f32_to_bf16bits(x[(size_t)row * K + kx]);
-            sx[(4 * loadX_x + t) * BM + (loadX_y + off)] = val;
+            psx[(4 * loadX_x + t) * BM + (loadX_y + off)] = val;
           }
         }
       }
@@ -636,7 +643,7 @@ __global__ void matmul_qkv_fused_kernel(
       if (loadW_y + off >= BN) break;
       const int kk = bk + 8 * loadW_x;
       const int col = BN * blockIdx.x + loadW_y + off;
-      unsigned short *dst = sw + (size_t)(8 * loadW_x) * BN + (loadW_y + off);
+      unsigned short *dst = psw + (size_t)(8 * loadW_x) * BN + (loadW_y + off);
       if (col < N) {
         if (kk + 7 < K) {
           uint4 t = *reinterpret_cast<const uint4 *>(W + (size_t)col * K + kk);
@@ -659,23 +666,35 @@ __global__ void matmul_qkv_fused_kernel(
         for (int t = 0; t < 8; ++t) dst[t * BN] = 0;
       }
     }
-    __syncthreads();
+  };
 
+  int bk = 0;
+  prefetch(0, sx + 0, sw + 0);
+  __syncthreads();
+  bool ping = true;
+
+  for (; bk < K; bk += BK) {
+    unsigned short* psx = ping ? (sx + 0) : (sx + BK * BM);
+    unsigned short* psw = ping ? (sw + 0) : (sw + BK * BN);
+    int nxt = bk + BK;
+    if (nxt < K) prefetch(nxt, ping ? (sx + BK * BM) : (sx + 0),
+                              ping ? (sw + BK * BN) : (sw + 0));
     for (int k = 0; k < BK; k += 16) {
       const int basek = k + yMF * 4;
       const int row = yTile * WM + xMF;
       const int col = xTile * WN + xMF;
-      bf16x4 av = {sx[(basek + 0) * BM + row], sx[(basek + 1) * BM + row],
-                   sx[(basek + 2) * BM + row], sx[(basek + 3) * BM + row]};
-      bf16x4 bv = {sw[(basek + 0) * BN + col], sw[(basek + 1) * BN + col],
-                   sw[(basek + 2) * BN + col], sw[(basek + 3) * BN + col]};
+      bf16x4 av = {psx[(basek + 0) * BM + row], psx[(basek + 1) * BM + row],
+                   psx[(basek + 2) * BM + row], psx[(basek + 3) * BM + row]};
+      bf16x4 bv = {psw[(basek + 0) * BN + col], psw[(basek + 1) * BN + col],
+                   psw[(basek + 2) * BN + col], psw[(basek + 3) * BN + col]};
       dmn = __builtin_amdgcn_mfma_f32_16x16x16bf16_1k(av, bv, dmn, 0, 0, 0);
     }
     __syncthreads();
+    ping = !ping;
   }
 
-  const int xD = lane % 16;
-  const int yD = 4 * (lane / 16);
+  const int xD = lane & 15;
+  const int yD = 4 * (lane >> 4);
   for (int i = 0; i < 4; ++i) {
     const int xOut = blockIdx.x * BN + xTile * WN + xD;
     const int yOut = blockIdx.y * BM + yTile * WM + (yD + i);
@@ -690,6 +709,7 @@ __global__ void matmul_qkv_fused_kernel(
     }
   }
 }
+
 
 
 static inline void getp_matmul_qkv_fused_bf16(
@@ -717,216 +737,271 @@ static inline void getp_matmul_qkv_fused_bf16(
 }
 
 __global__ void __launch_bounds__(256)
-matmul_kernel_nosplit(float *__restrict__ xout, const float *__restrict__ x,
-                      const __hip_bfloat16 *__restrict__ w,
-                      const __hip_bfloat16 *__restrict__ b, int M, int N, int K) {
-  constexpr int BLOCK_SIZE = 256;
-  constexpr int BM = 32, BN = 32, BK = 32;
-  constexpr int WM = 16, WN = 16;
-
-  const int waveIdx = threadIdx.x / warpSize;
-  const int xTile = waveIdx % (BM / WM);
-  const int yTile = waveIdx / (BM / WM);
-  const int lane = threadIdx.x % warpSize;
-  const int xMF = lane % 16;
-  const int yMF = lane / 16;
-
-  const int loadX_x = threadIdx.x % (BK / 4);
-  const int loadX_y = threadIdx.x / (BK / 4);
-  const int loadW_x = threadIdx.x % (BK / 8);
-  const int loadW_y = threadIdx.x / (BK / 8);
-  constexpr int strideX = BLOCK_SIZE / (BK / 4);
-  constexpr int strideW = BLOCK_SIZE / (BK / 8);
+matmul_kernel_nosplit(float* __restrict__ xout,
+                      const float* __restrict__ x,
+                      const __hip_bfloat16* __restrict__ w,
+                      const __hip_bfloat16* __restrict__ b,
+                      int M, int N, int K) {
+  constexpr int BM=32, BN=32, BK=32, WM=16, WN=16;
+  const int BNt = BN * GETP_BN_AGG;
+  const int wave = threadIdx.x >> 6;
+  const int lane = threadIdx.x & 63;
+  const int xTile = wave % (BM/WM);
+  const int yTile = wave / (BM/WM);
+  const int xMF = lane & 15;
+  const int yMF = lane >> 4;
+  const int loadX_x = threadIdx.x % (BK/4);
+  const int loadX_y = threadIdx.x / (BK/4);
+  const int loadW_x = threadIdx.x % (BK/8);
+  const int loadW_y = threadIdx.x / (BK/8);
+  constexpr int strideX = 256/(BK/4);
+  constexpr int strideW = 256/(BK/8);
 
   extern __shared__ unsigned short sm[];
-  unsigned short *sx = sm;
-  unsigned short *sw = sm + (size_t)BK * BM;
+  unsigned short* sx0 = sm;
+  unsigned short* sw0 = sx0 + (size_t)BK*BM;
+  unsigned short* sx1 = sw0 + (size_t)BK*BNt;
+  unsigned short* sw1 = sx1 + (size_t)BK*BM;
 
-  f32x4 dmn = {0, 0, 0, 0};
+  f32x4 d0={0,0,0,0}, d1={0,0,0,0}, d2={0,0,0,0}, d3={0,0,0,0};
 
-  for (int bk = 0; bk < K; bk += BK) {
-    for (int off = 0; off < BM; off += strideX) {
+  const int rowBase = blockIdx.y * BM;
+  const int colBase = blockIdx.x * BNt;
+
+  auto prefetch = [&](int bk, unsigned short* sx, unsigned short* sw){
+    for (int off=0; off<BM; off+=strideX) {
       if (loadX_y + off >= BM) break;
-      const int kk = bk + 4 * loadX_x;
-      const int row = blockIdx.y * BM + loadX_y + off;
+      const int kk = bk + 4*loadX_x;
+      const int row = rowBase + loadX_y + off;
       if (row < M) {
         if (kk + 3 < K) {
-          float4 v = *reinterpret_cast<const float4 *>(x + (size_t)row * K + kk);
-          sx[(4 * loadX_x + 0) * BM + (loadX_y + off)] = f32_to_bf16bits(v.x);
-          sx[(4 * loadX_x + 1) * BM + (loadX_y + off)] = f32_to_bf16bits(v.y);
-          sx[(4 * loadX_x + 2) * BM + (loadX_y + off)] = f32_to_bf16bits(v.z);
-          sx[(4 * loadX_x + 3) * BM + (loadX_y + off)] = f32_to_bf16bits(v.w);
+          float4 v = *reinterpret_cast<const float4*>(x + (size_t)row*K + kk);
+          sx[(4*loadX_x+0)*BM + (loadX_y+off)] = f32_to_bf16bits(v.x);
+          sx[(4*loadX_x+1)*BM + (loadX_y+off)] = f32_to_bf16bits(v.y);
+          sx[(4*loadX_x+2)*BM + (loadX_y+off)] = f32_to_bf16bits(v.z);
+          sx[(4*loadX_x+3)*BM + (loadX_y+off)] = f32_to_bf16bits(v.w);
         } else {
-          for (int t = 0; t < 4; ++t) {
+          for (int t=0;t<4;++t) {
             int kx = kk + t; unsigned short val = 0;
-            if (kx < K) val = f32_to_bf16bits(x[(size_t)row * K + kx]);
-            sx[(4 * loadX_x + t) * BM + (loadX_y + off)] = val;
+            if (kx < K) val = f32_to_bf16bits(x[(size_t)row*K + kx]);
+            sx[(4*loadX_x+t)*BM + (loadX_y+off)] = val;
           }
         }
       }
     }
-    for (int off = 0; off < BN; off += strideW) {
-      if (loadW_y + off >= BN) break;
-      const int kk = bk + 8 * loadW_x;
-      const int col = blockIdx.x * BN + loadW_y + off;
-      unsigned short *dst = sw + (size_t)(8 * loadW_x) * BN + (loadW_y + off);
+    for (int off=0; off<BNt; off+=strideW) {
+      if (loadW_y + off >= BNt) break;
+      const int kk = bk + 8*loadW_x;
+      const int col = colBase + loadW_y + off;
+      unsigned short* dst = sw + (size_t)(8*loadW_x)*BNt + (loadW_y+off);
       if (col < N) {
         if (kk + 7 < K) {
-          uint4 t = *reinterpret_cast<const uint4 *>(w + (size_t)col * K + kk);
-          dst[0 * BN] = (unsigned short)(t.x & 0xFFFF);
-          dst[1 * BN] = (unsigned short)(t.x >> 16);
-          dst[2 * BN] = (unsigned short)(t.y & 0xFFFF);
-          dst[3 * BN] = (unsigned short)(t.y >> 16);
-          dst[4 * BN] = (unsigned short)(t.z & 0xFFFF);
-          dst[5 * BN] = (unsigned short)(t.z >> 16);
-          dst[6 * BN] = (unsigned short)(t.w & 0xFFFF);
-          dst[7 * BN] = (unsigned short)(t.w >> 16);
+          uint4 t = *reinterpret_cast<const uint4*>(w + (size_t)col*K + kk);
+          dst[0*BNt] = (unsigned short)(t.x & 0xFFFF);
+          dst[1*BNt] = (unsigned short)(t.x >> 16);
+          dst[2*BNt] = (unsigned short)(t.y & 0xFFFF);
+          dst[3*BNt] = (unsigned short)(t.y >> 16);
+          dst[4*BNt] = (unsigned short)(t.z & 0xFFFF);
+          dst[5*BNt] = (unsigned short)(t.z >> 16);
+          dst[6*BNt] = (unsigned short)(t.w & 0xFFFF);
+          dst[7*BNt] = (unsigned short)(t.w >> 16);
         } else {
-          for (int t = 0; t < 8; ++t) {
-            int kx = kk + t; unsigned short val = 0;
-            if (kx < K) val = reinterpret_cast<const unsigned short *>(w + (size_t)col * K + kx)[0];
-            dst[t * BN] = val;
+          for (int t=0;t<8;++t) {
+            int kx = kk + t; unsigned short val=0;
+            if (kx < K) val = reinterpret_cast<const unsigned short*>(w + (size_t)col*K + kx)[0];
+            dst[t*BNt] = val;
           }
         }
       } else {
-        for (int t = 0; t < 8; ++t) dst[t * BN] = 0;
+        for (int t=0;t<8;++t) dst[t*BNt]=0;
       }
     }
-    __syncthreads();
+  };
 
-    for (int k = 0; k < BK; k += 16) {
-      const int basek = k + yMF * 4;
-      const int row = yTile * WM + xMF;
-      const int col = xTile * WN + xMF;
-      bf16x4 av = {sx[(basek + 0) * BM + row], sx[(basek + 1) * BM + row],
-                   sx[(basek + 2) * BM + row], sx[(basek + 3) * BM + row]};
-      bf16x4 bv = {sw[(basek + 0) * BN + col], sw[(basek + 1) * BN + col],
-                   sw[(basek + 2) * BN + col], sw[(basek + 3) * BN + col]};
-      dmn = __builtin_amdgcn_mfma_f32_16x16x16bf16_1k(av, bv, dmn, 0, 0, 0);
+  int bk = 0;
+  if (K > 0) prefetch(0, sx0, sw0);
+  __syncthreads();
+  bool ping = true;
+
+  for (; bk < K; bk += BK) {
+    unsigned short* sx = ping ? sx0 : sx1;
+    unsigned short* sw = ping ? sw0 : sw1;
+    int nxt = bk + BK;
+    if (nxt < K) prefetch(nxt, ping ? sx1 : sx0, ping ? sw1 : sw0);
+    for (int k=0; k<BK; k+=16) {
+      const int basek = k + yMF*4;
+      const int row = yTile*WM + xMF;
+      const int c = xTile*WN + xMF;
+      bf16x4 av = {sx[(basek+0)*BM+row], sx[(basek+1)*BM+row], sx[(basek+2)*BM+row], sx[(basek+3)*BM+row]};
+      bf16x4 b0 = {sw[(basek+0)*BNt + c + 0*BN], sw[(basek+1)*BNt + c + 0*BN], sw[(basek+2)*BNt + c + 0*BN], sw[(basek+3)*BNt + c + 0*BN]};
+      bf16x4 b1 = {sw[(basek+0)*BNt + c + 1*BN], sw[(basek+1)*BNt + c + 1*BN], sw[(basek+2)*BNt + c + 1*BN], sw[(basek+3)*BNt + c + 1*BN]};
+      bf16x4 b2 = {sw[(basek+0)*BNt + c + 2*BN], sw[(basek+1)*BNt + c + 2*BN], sw[(basek+2)*BNt + c + 2*BN], sw[(basek+3)*BNt + c + 2*BN]};
+      bf16x4 b3 = {sw[(basek+0)*BNt + c + 3*BN], sw[(basek+1)*BNt + c + 3*BN], sw[(basek+2)*BNt + c + 3*BN], sw[(basek+3)*BNt + c + 3*BN]};
+      d0 = __builtin_amdgcn_mfma_f32_16x16x16bf16_1k(av, b0, d0, 0, 0, 0);
+      d1 = __builtin_amdgcn_mfma_f32_16x16x16bf16_1k(av, b1, d1, 0, 0, 0);
+      d2 = __builtin_amdgcn_mfma_f32_16x16x16bf16_1k(av, b2, d2, 0, 0, 0);
+      d3 = __builtin_amdgcn_mfma_f32_16x16x16bf16_1k(av, b3, d3, 0, 0, 0);
     }
     __syncthreads();
+    ping = !ping;
   }
 
-  const int xD = lane % 16;
-  const int yD = 4 * (lane / 16);
-  for (int i = 0; i < 4; ++i) {
-    const int col = blockIdx.x * BN + xTile * WN + xD;
-    const int row = blockIdx.y * BM + yTile * WM + (yD + i);
-    if (row < M && col < N) {
-      float v = dmn[i];
-      if (b) v += __bfloat162float(b[col]);
-      xout[(size_t)row * N + col] = v;
-    }
+  const int xD = lane & 15;
+  const int yD = 4 * (lane >> 4);
+  for (int i=0;i<4;++i) {
+    const int row = rowBase + yTile*WM + (yD + i);
+    if (row >= M) continue;
+    int c0 = colBase + xTile*WN + xD + 0*BN;
+    int c1 = colBase + xTile*WN + xD + 1*BN;
+    int c2 = colBase + xTile*WN + xD + 2*BN;
+    int c3 = colBase + xTile*WN + xD + 3*BN;
+    if (c0 < N) { float v = d0[i]; if (b) v += __bfloat162float(b[c0]); xout[(size_t)row*N + c0] = v; }
+    if (c1 < N) { float v = d1[i]; if (b) v += __bfloat162float(b[c1]); xout[(size_t)row*N + c1] = v; }
+    if (c2 < N) { float v = d2[i]; if (b) v += __bfloat162float(b[c2]); xout[(size_t)row*N + c2] = v; }
+    if (c3 < N) { float v = d3[i]; if (b) v += __bfloat162float(b[c3]); xout[(size_t)row*N + c3] = v; }
   }
 }
+
 __global__ void __launch_bounds__(256)
-matmul_kernel_splitk_store(float *__restrict__ partial,
-                           const float *__restrict__ x,
-                           const __hip_bfloat16 *__restrict__ w, int M, int N,
-                           int K, int splits) {
-  constexpr int BLOCK_SIZE = 256;
-  constexpr int BM = 32, BN = 32, BK = 32;
-  constexpr int WM = 16, WN = 16;
+matmul_kernel_splitk_store(float* __restrict__ partial,
+                           const float* __restrict__ x,
+                           const __hip_bfloat16* __restrict__ w,
+                           int M, int N, int K, int splits) {
+  constexpr int BM=32, BN=32, BK=32, WM=16, WN=16;
+  const int BNt = BN * GETP_BN_AGG;
 
-  const int waveIdx = threadIdx.x / warpSize;
-  const int xTile = waveIdx % (BM / WM);
-  const int yTile = waveIdx / (BM / WM);
-  const int lane0 = threadIdx.x % warpSize;
-  const int xMF = lane0 % 16;
-  const int yMF = lane0 / 16;
+  const int wave = threadIdx.x >> 6;
+  const int lane = threadIdx.x & 63;
+  const int xTile = wave % (BM/WM);
+  const int yTile = wave / (BM/WM);
+  const int xMF = lane & 15;
+  const int yMF = lane >> 4;
 
-  const int loadX_x = threadIdx.x % (BK / 4);
-  const int loadX_y = threadIdx.x / (BK / 4);
-  const int loadW_x = threadIdx.x % (BK / 8);
-  const int loadW_y = threadIdx.x / (BK / 8);
-  constexpr int strideX = BLOCK_SIZE / (BK / 4);
-  constexpr int strideW = BLOCK_SIZE / (BK / 8);
+  const int loadX_x = threadIdx.x % (BK/4);
+  const int loadX_y = threadIdx.x / (BK/4);
+  const int loadW_x = threadIdx.x % (BK/8);
+  const int loadW_y = threadIdx.x / (BK/8);
+  constexpr int strideX = 256/(BK/4);
+  constexpr int strideW = 256/(BK/8);
 
   extern __shared__ unsigned short sm[];
-  unsigned short *sx = sm;
-  unsigned short *sw = sm + (size_t)BK * BM;
+  unsigned short* sx0 = sm;
+  unsigned short* sw0 = sx0 + (size_t)BK*BM;
+  unsigned short* sx1 = sw0 + (size_t)BK*BNt;
+  unsigned short* sw1 = sx1 + (size_t)BK*BM;
 
-  f32x4 dmn = {0, 0, 0, 0};
+  f32x4 d0={0,0,0,0}, d1={0,0,0,0}, d2={0,0,0,0}, d3={0,0,0,0};
+
+  const int rowBase = blockIdx.y * BM;
+  const int colBase = blockIdx.x * BNt;
 
   const int split = blockIdx.z;
   const int kChunk = (K + splits - 1) / splits;
   const int kBeg = split * kChunk;
   const int kEnd = min(K, kBeg + kChunk);
 
-  for (int bk = kBeg; bk < kEnd; bk += BK) {
-    for (int off = 0; off < BM; off += strideX) {
+  auto prefetch = [&](int bk, unsigned short* sx, unsigned short* sw){
+    for (int off=0; off<BM; off+=strideX) {
       if (loadX_y + off >= BM) break;
-      const int kk = bk + 4 * loadX_x;
-      const int row = blockIdx.y * BM + loadX_y + off;
+      const int kk = bk + 4*loadX_x;
+      const int row = rowBase + loadX_y + off;
       if (row < M) {
         if (kk + 3 < kEnd) {
-          float4 v = *reinterpret_cast<const float4 *>(x + (size_t)row * K + kk);
-          sx[(4 * loadX_x + 0) * BM + (loadX_y + off)] = f32_to_bf16bits(v.x);
-          sx[(4 * loadX_x + 1) * BM + (loadX_y + off)] = f32_to_bf16bits(v.y);
-          sx[(4 * loadX_x + 2) * BM + (loadX_y + off)] = f32_to_bf16bits(v.z);
-          sx[(4 * loadX_x + 3) * BM + (loadX_y + off)] = f32_to_bf16bits(v.w);
+          float4 v = *reinterpret_cast<const float4*>(x + (size_t)row*K + kk);
+          sx[(4*loadX_x+0)*BM + (loadX_y+off)] = f32_to_bf16bits(v.x);
+          sx[(4*loadX_x+1)*BM + (loadX_y+off)] = f32_to_bf16bits(v.y);
+          sx[(4*loadX_x+2)*BM + (loadX_y+off)] = f32_to_bf16bits(v.z);
+          sx[(4*loadX_x+3)*BM + (loadX_y+off)] = f32_to_bf16bits(v.w);
         } else {
-          for (int t = 0; t < 4; ++t) {
-            int kx = kk + t; unsigned short val = 0;
-            if (kx < kEnd) val = f32_to_bf16bits(x[(size_t)row * K + kx]);
-            sx[(4 * loadX_x + t) * BM + (loadX_y + off)] = val;
-          }
+          const int kk0 = kk;
+          unsigned short v0=0,v1=0,v2=0,v3=0;
+          if (kk0+0 < kEnd) v0 = f32_to_bf16bits(x[(size_t)row*K + kk0+0]);
+          if (kk0+1 < kEnd) v1 = f32_to_bf16bits(x[(size_t)row*K + kk0+1]);
+          if (kk0+2 < kEnd) v2 = f32_to_bf16bits(x[(size_t)row*K + kk0+2]);
+          if (kk0+3 < kEnd) v3 = f32_to_bf16bits(x[(size_t)row*K + kk0+3]);
+          sx[(4*loadX_x+0)*BM + (loadX_y+off)] = v0;
+          sx[(4*loadX_x+1)*BM + (loadX_y+off)] = v1;
+          sx[(4*loadX_x+2)*BM + (loadX_y+off)] = v2;
+          sx[(4*loadX_x+3)*BM + (loadX_y+off)] = v3;
         }
       }
     }
-    for (int off = 0; off < BN; off += strideW) {
-      if (loadW_y + off >= BN) break;
-      const int kk = bk + 8 * loadW_x;
-      const int col = blockIdx.x * BN + loadW_y + off;
-      unsigned short *dst = sw + (size_t)(8 * loadW_x) * BN + (loadW_y + off);
-      if (col < N) {
+    for (int off=0; off<BNt; off+=strideW) {
+      if (loadW_y + off >= BNt) break;
+      const int kk = bk + 8*loadW_x;
+      const int col = colBase + loadW_y + off;
+      unsigned short* dst = sw + (size_t)(8*loadW_x)*BNt + (loadW_y+off);
+      if (col < N && kk < kEnd) {
         if (kk + 7 < kEnd) {
-          uint4 t = *reinterpret_cast<const uint4 *>(w + (size_t)col * K + kk);
-          dst[0 * BN] = (unsigned short)(t.x & 0xFFFF);
-          dst[1 * BN] = (unsigned short)(t.x >> 16);
-          dst[2 * BN] = (unsigned short)(t.y & 0xFFFF);
-          dst[3 * BN] = (unsigned short)(t.y >> 16);
-          dst[4 * BN] = (unsigned short)(t.z & 0xFFFF);
-          dst[5 * BN] = (unsigned short)(t.z >> 16);
-          dst[6 * BN] = (unsigned short)(t.w & 0xFFFF);
-          dst[7 * BN] = (unsigned short)(t.w >> 16);
+          uint4 t = *reinterpret_cast<const uint4*>(w + (size_t)col*K + kk);
+          dst[0*BNt] = (unsigned short)(t.x & 0xFFFF);
+          dst[1*BNt] = (unsigned short)(t.x >> 16);
+          dst[2*BNt] = (unsigned short)(t.y & 0xFFFF);
+          dst[3*BNt] = (unsigned short)(t.y >> 16);
+          dst[4*BNt] = (unsigned short)(t.z & 0xFFFF);
+          dst[5*BNt] = (unsigned short)(t.z >> 16);
+          dst[6*BNt] = (unsigned short)(t.w & 0xFFFF);
+          dst[7*BNt] = (unsigned short)(t.w >> 16);
         } else {
-          for (int t = 0; t < 8; ++t) {
-            int kx = kk + t; unsigned short val = 0;
-            if (kx < kEnd) val = reinterpret_cast<const unsigned short *>(w + (size_t)col * K + kx)[0];
-            dst[t * BN] = val;
+          for (int t=0;t<8;++t) {
+            int kx = kk + t; unsigned short val=0;
+            if (kx < kEnd) val = reinterpret_cast<const unsigned short*>(w + (size_t)col*K + kx)[0];
+            dst[t*BNt] = val;
           }
         }
       } else {
-        for (int t = 0; t < 8; ++t) dst[t * BN] = 0;
+        for (int t=0;t<8;++t) dst[t*BNt]=0;
       }
     }
-    __syncthreads();
+  };
 
-    for (int k = 0; k < BK; k += 16) {
-      const int basek = k + yMF * 4;
-      const int row = yTile * WM + xMF;
-      const int col = xTile * WN + xMF;
-      bf16x4 av = {sx[(basek + 0) * BM + row], sx[(basek + 1) * BM + row],
-                   sx[(basek + 2) * BM + row], sx[(basek + 3) * BM + row]};
-      bf16x4 bv = {sw[(basek + 0) * BN + col], sw[(basek + 1) * BN + col],
-                   sw[(basek + 2) * BN + col], sw[(basek + 3) * BN + col]};
-      dmn = __builtin_amdgcn_mfma_f32_16x16x16bf16_1k(av, bv, dmn, 0, 0, 0);
+  int bk = kBeg;
+  if (bk < kEnd) prefetch(bk, sx0, sw0);
+  __syncthreads();
+  bool ping = true;
+
+  for (; bk < kEnd; bk += BK) {
+    unsigned short* sx = ping ? sx0 : sx1;
+    unsigned short* sw = ping ? sw0 : sw1;
+    int nxt = bk + BK;
+    if (nxt < kEnd) prefetch(nxt, ping ? sx1 : sx0, ping ? sw1 : sw0);
+    for (int k=0; k<BK; k+=16) {
+      const int basek = k + yMF*4;
+      const int row = yTile*WM + xMF;
+      const int c = xTile*WN + xMF;
+      bf16x4 av = {sx[(basek+0)*BM+row], sx[(basek+1)*BM+row], sx[(basek+2)*BM+row], sx[(basek+3)*BM+row]};
+      bf16x4 b0 = {sw[(basek+0)*BNt + c + 0*BN], sw[(basek+1)*BNt + c + 0*BN], sw[(basek+2)*BNt + c + 0*BN], sw[(basek+3)*BNt + c + 0*BN]};
+      bf16x4 b1 = {sw[(basek+0)*BNt + c + 1*BN], sw[(basek+1)*BNt + c + 1*BN], sw[(basek+2)*BNt + c + 1*BN], sw[(basek+3)*BNt + c + 1*BN]};
+      bf16x4 b2 = {sw[(basek+0)*BNt + c + 2*BN], sw[(basek+1)*BNt + c + 2*BN], sw[(basek+2)*BNt + c + 2*BN], sw[(basek+3)*BNt + c + 2*BN]};
+      bf16x4 b3 = {sw[(basek+0)*BNt + c + 3*BN], sw[(basek+1)*BNt + c + 3*BN], sw[(basek+2)*BNt + c + 3*BN], sw[(basek+3)*BNt + c + 3*BN]};
+      d0 = __builtin_amdgcn_mfma_f32_16x16x16bf16_1k(av, b0, d0, 0, 0, 0);
+      d1 = __builtin_amdgcn_mfma_f32_16x16x16bf16_1k(av, b1, d1, 0, 0, 0);
+      d2 = __builtin_amdgcn_mfma_f32_16x16x16bf16_1k(av, b2, d2, 0, 0, 0);
+      d3 = __builtin_amdgcn_mfma_f32_16x16x16bf16_1k(av, b3, d3, 0, 0, 0);
     }
     __syncthreads();
+    ping = !ping;
   }
 
   const size_t slice_stride = (size_t)M * N;
   const size_t base_out = (size_t)split * slice_stride;
-  const int xD = lane0 % 16;
-  const int yD = 4 * (lane0 / 16);
-  for (int i = 0; i < 4; ++i) {
-    const int col = blockIdx.x * BN + xTile * WN + xD;
-    const int row = blockIdx.y * BM + yTile * WM + (yD + i);
-    if (row < M && col < N)
-      partial[base_out + (size_t)row * N + col] = dmn[i];
+
+  const int xD = lane & 15;
+  const int yD = 4 * (lane >> 4);
+  for (int i=0;i<4;++i) {
+    const int row = rowBase + yTile*WM + (yD+i);
+    if (row >= M) continue;
+    int c0 = colBase + xTile*WN + xD + 0*BN;
+    int c1 = colBase + xTile*WN + xD + 1*BN;
+    int c2 = colBase + xTile*WN + xD + 2*BN;
+    int c3 = colBase + xTile*WN + xD + 3*BN;
+    if (c0 < N) partial[base_out + (size_t)row*N + c0] = d0[i];
+    if (c1 < N) partial[base_out + (size_t)row*N + c1] = d1[i];
+    if (c2 < N) partial[base_out + (size_t)row*N + c2] = d2[i];
+    if (c3 < N) partial[base_out + (size_t)row*N + c3] = d3[i];
   }
 }
+
 
 __global__ void reduce_splitk_with_bias(float *__restrict__ out,
                                         const float *__restrict__ partial,
@@ -943,12 +1018,14 @@ __global__ void reduce_splitk_with_bias(float *__restrict__ out,
 }
 
 template <typename T>
-void getp_matmul(float *xout, float *x, T *w, T *b, int n, int d, int batch_size) {
+void getp_matmul(float* xout, float* x, T* w, T* b, int n, int d, int batch_size) {
   PROFILE_FUNCTION();
   const int M = batch_size, N = d, K = n;
   constexpr int BM = 32, BN = 32, BK = 32;
+  const int BNt = BN * GETP_BN_AGG;
+
   dim3 block(256);
-  const int gx = (N + BN - 1) / BN;
+  const int gx = (N + BNt - 1) / BNt;
   const int gy = (M + BM - 1) / BM;
   const int grid_xy = max(1, gx) * max(1, gy);
 
@@ -963,31 +1040,34 @@ void getp_matmul(float *xout, float *x, T *w, T *b, int n, int d, int batch_size
   const int max_splits_by_K = max(1, (K + BK - 1) / BK);
   splits = min(splits, max_splits_by_K);
 
-  const size_t shmem = (size_t)BK * (BM + BN) * sizeof(unsigned short);
+  const size_t shmem = (size_t)2 * (size_t)BK * ((size_t)BM + (size_t)BNt) * sizeof(unsigned short);
 
   if (splits == 1) {
     dim3 grid(gx, gy);
     matmul_kernel_nosplit<<<grid, block, shmem>>>(
-        xout, x, reinterpret_cast<const __hip_bfloat16 *>(w),
-        reinterpret_cast<const __hip_bfloat16 *>(b), M, N, K);
+        xout, x,
+        reinterpret_cast<const __hip_bfloat16*>(w),
+        reinterpret_cast<const __hip_bfloat16*>(b),
+        M, N, K);
     return;
   }
 
-  float *partial = nullptr;
+  float* partial = nullptr;
   HIP_CHECK(hipMalloc(&partial, (size_t)splits * (size_t)M * (size_t)N * sizeof(float)));
 
   dim3 grid(gx, gy, splits);
   matmul_kernel_splitk_store<<<grid, block, shmem>>>(
-      partial, x, reinterpret_cast<const __hip_bfloat16 *>(w), M, N, K, splits);
+      partial, x, reinterpret_cast<const __hip_bfloat16*>(w), M, N, K, splits);
 
   const int total = M * N;
   dim3 rBlock(256);
   dim3 rGrid((total + rBlock.x - 1) / rBlock.x);
   reduce_splitk_with_bias<<<rGrid, rBlock>>>(
-      xout, partial, reinterpret_cast<const __hip_bfloat16 *>(b), M, N, splits);
+      xout, partial, reinterpret_cast<const __hip_bfloat16*>(b), M, N, splits);
 
   HIP_CHECK(hipFree(partial));
 }
+
 
 
 __global__ void compute_inv_freq_kernel(float base, int head_dim,
