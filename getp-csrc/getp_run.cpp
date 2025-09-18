@@ -1,5 +1,13 @@
 // TODO: Modify this file to optimize end-to-end throughput
+#include <hip/hip_runtime.h>
+#include <hip/driver_types.h>
+#include <cstddef>
+#include <cstring>
+#include <vector>
+
+#include "collectives.cpp"
 #include "getp_eval.cpp"
+#include "getp_state_ext.cpp"
 #include "getp_transformer.cpp"
 #include "getp_transformer.hpp"
 #include "getp_barrier.hpp"
@@ -80,7 +88,6 @@ void warm_up(Transformer *transformer, Tokenizer *tokenizer) {
   }
 
   cgCreate(g_world, devices);
-
 }
 
 void finish(Transformer *transformer, Tokenizer *tokenizer) {
@@ -150,7 +157,10 @@ void coop_getp_generate(Transformer *transformer, Tokenizer *tokenizer,
   for (int b = 0; b < BATCH_SIZE; ++b) token[b] = prompts_tokens[b][0];
 
   Config *p = &transformer->config;
-  if (!p) { fprintf(stderr, "Config missing\n"); exit(EXIT_FAILURE); }
+  if (!p) {
+    fprintf(stderr, "Config missing\n");
+    exit(EXIT_FAILURE);
+  }
 
   while (pos + 1 < steps) {
 
@@ -164,8 +174,12 @@ void coop_getp_generate(Transformer *transformer, Tokenizer *tokenizer,
     for (int b = 0; b < BATCH_SIZE; ++b) {
       if (!mask[b]) continue;
       epos[b] = pos;
-      if (pos < nums_prompt_tokens[b]) next[b] = prompts_tokens[b][pos];
-      else { next[b] = next_gpu[b]; outputs_tokens[b][pos - nums_prompt_tokens[b]] = next[b]; }
+      if (pos < nums_prompt_tokens[b])
+        next[b] = prompts_tokens[b][pos];
+      else {
+        next[b] = next_gpu[b];
+        outputs_tokens[b][pos - nums_prompt_tokens[b]] = next[b];
+      }
     }
 
     for (int b = 0; b < BATCH_SIZE; ++b) {
@@ -260,11 +274,10 @@ void distribute_requests(Transformer *transformer,
   *num_token_out_ptr = acc_token_out;
 }
 
-
 long long inference(Transformer *transformer, Tokenizer *tokenizer,
                     Sampler *sampler, Requests *requests) {
   PROFILE_FUNCTION();
-  
+
   // Reset timing at the start of inference
   reset_timing_summary();
 
@@ -299,8 +312,8 @@ long long inference(Transformer *transformer, Tokenizer *tokenizer,
   
   // Print timing summary at the end of inference
   print_timing_summary();
-  
+
   return num_token_out;
 }
 
-#endif // GETP_RUN
+#endif  // GETP_RUN

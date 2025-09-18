@@ -12,15 +12,7 @@ static RunStateExt* g_ext = nullptr;
 void ext_create(int n_devices) {
   g_ext = (RunStateExt*)malloc(sizeof(RunStateExt) * n_devices);
   for (int i = 0; i < n_devices; ++i) {
-    g_ext[i].local_ids = nullptr;
-    g_ext[i].local_wts = nullptr;
-    g_ext[i].n_local   = nullptr;
-    g_ext[i].e_counts  = nullptr;
-    g_ext[i].e_offsets = nullptr;
-    g_ext[i].e_dev     = nullptr;
-    g_ext[i].w_dev     = nullptr;
-    g_ext[i].pair_pos  = nullptr;
-    g_ext[i].z_partial = nullptr;
+    g_ext[i] = {};
   }
 }
 
@@ -73,6 +65,4 @@ void ext_free_all(int n_devices) {
   g_ext = nullptr;
 }
 
-RunStateExt* ext_get(int device_index) {
-  return &g_ext[device_index];
-}
+RunStateExt* ext_get(int device_index) { return &g_ext[device_index]; }
