@@ -121,10 +121,11 @@ __global__ void kv_store_pair_fp32_to_bf16_kernel(
   }
 }
 static inline void kv_store_pair_fp32_to_bf16(__hip_bfloat16 *kdst, __hip_bfloat16 *vdst,
-                                              const float *k, const float *v, int elems) {
+                                              const float *k, const float *v, int elems, hipStream_t stream) {
   int threads = 256;
   int blocks = ((elems + 3) / 4 + threads - 1) / threads;
-  kv_store_pair_fp32_to_bf16_kernel<<<blocks, threads>>>(k, v, kdst, vdst, elems);
+  kv_store_pair_fp32_to_bf16_kernel<<<blocks, threads, 0, stream>>>
+    (k, v, kdst, vdst, elems);
 }
 
 
@@ -1350,7 +1351,7 @@ static inline void getp_flash_attn_decode_bf16(
     float *tb, const __hip_bfloat16 *key_cache_layer, const __hip_bfloat16 *value_cache_layer,
     const float *q, const float *attn_sinks_layer, int head_dim, int n_attn_heads,
     int n_kv_heads, int pos, int seq_len, int sliding_window, int layer_id,
-    int batch_size, int cache_tcap) {
+    int batch_size, int cache_tcap, hipStream_t stream) {
   const int kv_dim = head_dim * n_kv_heads;
   const int kv_mul = n_attn_heads / n_kv_heads;
   const float invsd = 1.0f / sqrtf((float)head_dim);
@@ -1361,7 +1362,7 @@ static inline void getp_flash_attn_decode_bf16(
   dim3 block(64, kv_mul);
   dim3 grid(n_kv_heads, batch_size);
   size_t shmem = (size_t)2 * T * head_dim * sizeof(float);
-  flash_attn_decode_bf16_kernel<<<grid, block, shmem>>>(
+  flash_attn_decode_bf16_kernel<<<grid, block, shmem, stream>>>(
       tb, key_cache_layer, value_cache_layer, q, attn_sinks_layer, head_dim,
       n_attn_heads, n_kv_heads, pos, seq_len, sliding_window, apply_mask,
       batch_size, kv_dim, kv_mul, invsd, T, cache_tcap);
@@ -1656,11 +1657,19 @@ int *getp_forward(Transformer * /*transformer*/,
       const int tslot =
           (is_even && p->sliding_window > 0) ? (pos % p->sliding_window) : pos;
       const size_t base_off = layer_toff * (size_t)BATCH_SIZE * (size_t)kv_dim;
-      dev_s->k = dev_s->key_cache + base_off +
-                 (size_t)tslot * (size_t)BATCH_SIZE * (size_t)kv_dim;
-      dev_s->v = dev_s->value_cache + base_off +
-                 (size_t)tslot * (size_t)BATCH_SIZE * (size_t)kv_dim;
-  
+
+      __hip_bfloat16 *key_cache =
+          reinterpret_cast<__hip_bfloat16 *>(dev_s->key_cache);
+      __hip_bfloat16 *value_cache =
+          reinterpret_cast<__hip_bfloat16 *>(dev_s->value_cache);
+      __hip_bfloat16 *k_slot = key_cache + base_off +
+                              (size_t)tslot * (size_t)BATCH_SIZE * (size_t)kv_dim;
+      __hip_bfloat16 *v_slot = value_cache + base_off +
+                              (size_t)tslot * (size_t)BATCH_SIZE * (size_t)kv_dim;
+
+      float *k_step = dev_s->qkv;
+      float *v_step = dev_s->qkv + (size_t)BATCH_SIZE * (size_t)kv_dim;
+
       __hip_bfloat16 *dev_w_qkv =
           dev_w->w_qkv_bf16 +
           1ll * l * hidden_dim *
@@ -1668,24 +1677,27 @@ int *getp_forward(Transformer * /*transformer*/,
       __hip_bfloat16 *dev_b_qkv =
           dev_w->b_qkv_bf16 +
           1ll * l * (head_dim * p->n_attn_heads + 2 * head_dim * p->n_kv_heads);
-      getp_matmul_qkv_fused_bf16(dev_s->q, dev_s->k, dev_s->v, dev_s->t,
+      getp_matmul_qkv_fused_bf16(dev_s->q, k_step, v_step, dev_s->t,
                                  dev_w_qkv, dev_b_qkv, hidden_dim, head_dim,
                                  p->n_attn_heads, p->n_kv_heads, BATCH_SIZE, compute_stream);
   
       getp_apply_rotary_emb(dev_s->q, dev_cos_vals, dev_sin_vals, p->n_attn_heads,
                             head_dim, BATCH_SIZE, compute_stream);
-      getp_apply_rotary_emb(dev_s->k, dev_cos_vals, dev_sin_vals, p->n_kv_heads,
+      getp_apply_rotary_emb(k_step, dev_cos_vals, dev_sin_vals, p->n_kv_heads,
                             head_dim, BATCH_SIZE, compute_stream);
+
+      kv_store_pair_fp32_to_bf16(k_slot, v_slot, k_step, v_step,
+                                 BATCH_SIZE * kv_dim, compute_stream);
       {
-        float *k_layer = dev_s->key_cache + base_off;
-        float *v_layer = dev_s->value_cache + base_off;
-        float *q_ptr = dev_s->q;
+        const __hip_bfloat16 *k_layer = key_cache + base_off;
+        const __hip_bfloat16 *v_layer = value_cache + base_off;
+        const float *q_ptr = dev_s->q;
         const float *attn_sinks_layer =
             dev_w->attn_sinks + (size_t)l * p->n_attn_heads;
-        getp_flash_attn_decode(dev_s->tb, k_layer, v_layer, q_ptr,
-                               attn_sinks_layer, head_dim, p->n_attn_heads,
-                               p->n_kv_heads, pos, p->seq_len, p->sliding_window,
-                               (int)l, BATCH_SIZE, tcap, compute_stream);
+        getp_flash_attn_decode_bf16(dev_s->tb, k_layer, v_layer, q_ptr,
+                                    attn_sinks_layer, head_dim, p->n_attn_heads,
+                                    p->n_kv_heads, pos, p->seq_len,
+                                    p->sliding_window, (int)l, BATCH_SIZE, tcap, compute_stream);
       }
   
       __hip_bfloat16 *dev_w_o =
