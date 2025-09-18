@@ -9,6 +9,7 @@
 
 #include "getp_eval.cpp"
 
+#ifndef HIP_CHECK
 #define HIP_CHECK(expression)                                                  \
   {                                                                            \
     const hipError_t status = expression;                                      \
@@ -17,6 +18,7 @@
                 << " at " << __FILE__ << ":" << __LINE__ << std::endl;         \
     }                                                                          \
   }
+#endif
 
 __global__ void init_mask_kernel(float *mask, int seq_len, int sliding_window) {
   int i = blockDim.y * blockIdx.y + threadIdx.y;

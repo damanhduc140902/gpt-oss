@@ -36,9 +36,12 @@ void ext_alloc_device(int device_index, int batch_size, int expert_parallelism, 
   HIP_CHECK(hipMalloc(&g_ext[device_index].ext_topk_i,       sizeof(int)   * (size_t)expert_parallelism * batch_size * experts_per_token));
   HIP_CHECK(hipMalloc(&g_ext[device_index].ext_topk_v,       sizeof(float) * (size_t)expert_parallelism * batch_size * experts_per_token));
   HIP_CHECK(hipMalloc(&g_ext[device_index].ext_router_score, sizeof(float) * (size_t)expert_parallelism * batch_size * n_experts));
-  HIP_CHECK(hipMalloc(&g_ext[device_index].ext_gate_up,      sizeof(float) * (size_t)expert_parallelism * batch_size * experts_per_token * intermediate_dim));
+  // HIP_CHECK(hipMalloc(&g_ext[device_index].ext_gate_up,      sizeof(float) * (size_t)expert_parallelism * batch_size * experts_per_token * intermediate_dim));
   HIP_CHECK(hipMalloc(&g_ext[device_index].ext_t,            sizeof(float) * (size_t)expert_parallelism * batch_size * hidden_dim));
   HIP_CHECK(hipMalloc(&g_ext[device_index].ext_e_agg,        sizeof(float) * (size_t)expert_parallelism * batch_size * hidden_dim));
+
+  HIP_CHECK(hipMalloc(&g_ext[device_index].a_in,         sizeof(__hip_bfloat16) * (size_t)expert_parallelism * batch_size * experts_per_token * hidden_dim));
+  HIP_CHECK(hipMalloc(&g_ext[device_index].gate_up_bf16, sizeof(__hip_bfloat16) * (size_t)expert_parallelism * batch_size * experts_per_token * intermediate_dim));
 }
 
 void ext_free_all(int n_devices) {
@@ -54,12 +57,15 @@ void ext_free_all(int n_devices) {
     if (g_ext[i].pair_pos)  HIP_CHECK(hipFree(g_ext[i].pair_pos));
     if (g_ext[i].z_partial) HIP_CHECK(hipFree(g_ext[i].z_partial));
 
-    if (g_ext[i].ext_topk_i)        HIP_CHECK(hipFree(g_ext[i].ext_topk_i))
-    if (g_ext[i].ext_topk_v)        HIP_CHECK(hipFree(g_ext[i].ext_topk_v))
+    if (g_ext[i].ext_topk_i)        HIP_CHECK(hipFree(g_ext[i].ext_topk_i));
+    if (g_ext[i].ext_topk_v)        HIP_CHECK(hipFree(g_ext[i].ext_topk_v));
     if (g_ext[i].ext_router_score)  HIP_CHECK(hipFree(g_ext[i].ext_router_score));
-    if (g_ext[i].ext_gate_up)       HIP_CHECK(hipFree(g_ext[i].ext_gate_up));
+    // if (g_ext[i].ext_gate_up)       HIP_CHECK(hipFree(g_ext[i].ext_gate_up));
     if (g_ext[i].ext_t)             HIP_CHECK(hipFree(g_ext[i].ext_t));
     if (g_ext[i].ext_e_agg)         HIP_CHECK(hipFree(g_ext[i].ext_e_agg));
+
+    if (g_ext[i].a_in)          HIP_CHECK(hipFree(g_ext[i].a_in));
+    if (g_ext[i].gate_up_bf16)  HIP_CHECK(hipFree(g_ext[i].gate_up_bf16));
   }
   free(g_ext);
   g_ext = nullptr;

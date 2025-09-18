@@ -17,7 +17,7 @@ struct RunStateExt {
   int *ext_topk_i;
   float *ext_topk_v;
   float *ext_router_score;
-  float *ext_gate_up;
+  // float *ext_gate_up;
   float *ext_t;
   float *ext_e_agg;
 

@@ -249,10 +249,10 @@ __global__ void moe_scatter_acts_to_expert_bf16_kernel(__hip_bfloat16 *a_in,
 static inline void moe_scatter_acts_to_expert_bf16(__hip_bfloat16 *a_in,
                                                    const float *x,
                                                    const int *tok_idx,
-                                                   int total_pairs, int H) {
+                                                   int total_pairs, int H, hipStream_t stream) {
   dim3 block(256), grid(total_pairs);
-  moe_scatter_acts_to_expert_bf16_kernel<<<grid, block>>>(a_in, x, tok_idx,
-                                                          total_pairs, H);
+  moe_scatter_acts_to_expert_bf16_kernel<<<grid, block, 0, stream>>>
+    (a_in, x, tok_idx, total_pairs, H);
 }
 
 __global__ void __launch_bounds__(256) mlp1_swiglu_bf16_bucketed_kernel_outbf16(
@@ -499,7 +499,7 @@ static inline void launch_mlp1_swiglu_bf16_bucketed_outbf16(
     __hip_bfloat16 *gate_up_bf16, const __hip_bfloat16 *a_in,
     const __hip_bfloat16 *w1_layer, const __hip_bfloat16 *b1_layer,
     const int *offsets, int H, int I, int E, int cap_pairs,
-    float swiglu_limit) {
+    float swiglu_limit, hipStream_t stream) {
   PROFILE_FUNCTION();
   constexpr int BM = 32, BN = 32, BK = 32;
   const int BNt = BN * GETP_BN_AGG;
@@ -508,7 +508,7 @@ static inline void launch_mlp1_swiglu_bf16_bucketed_outbf16(
   dim3 grid((I + BNt - 1) / BNt, E * by);
   size_t shmem = (size_t)BK * ((size_t)BM + (size_t)BNt + (size_t)BNt) *
                  sizeof(unsigned short);
-  mlp1_swiglu_bf16_bucketed_kernel_outbf16<<<grid, block, shmem>>>(
+  mlp1_swiglu_bf16_bucketed_kernel_outbf16<<<grid, block, shmem, stream>>>(
       gate_up_bf16, a_in, w1_layer, b1_layer, offsets, H, I, E, cap_pairs,
       swiglu_limit);
   // HIP_CHECK(hipDeviceSynchronize());
@@ -706,7 +706,7 @@ static inline void launch_mlp2_partial_bf16_bucketed_frombf16(
     float *z_partial, const __hip_bfloat16 *gate_up_bf16,
     const __hip_bfloat16 *w2_layer, const __hip_bfloat16 *b2_layer,
     const float *w_by_bucket, const int *offsets, const int *tok_idx, int I,
-    int H, int E, int cap_pairs) {
+    int H, int E, int cap_pairs, hipStream_t stream) {
   PROFILE_FUNCTION();
   constexpr int BN = 32, BM = 32, BK = 32;
   const int BNt = BN * GETP_BN_AGG;
@@ -718,7 +718,7 @@ static inline void launch_mlp2_partial_bf16_bucketed_frombf16(
 
   int dev = 0, cu = 104;
   HIP_CHECK(hipGetDevice(&dev));
-  hipDeviceGetAttribute(&cu, hipDeviceAttributeMultiprocessorCount, dev);
+  HIP_CHECK(hipDeviceGetAttribute(&cu, hipDeviceAttributeMultiprocessorCount, dev));
   if (cu <= 0) cu = 104;
 
   const int target_cta = cu * 4;
@@ -742,7 +742,7 @@ static inline void launch_mlp2_partial_bf16_bucketed_frombf16(
   size_t shmem =
       (size_t)BK * ((size_t)BM + (size_t)BNt) * sizeof(unsigned short);
 
-  mlp2_partial_bf16_bucketed_splitk_kernel_inbf16<<<grid, block, shmem>>>(
+  mlp2_partial_bf16_bucketed_splitk_kernel_inbf16<<<grid, block, shmem, stream>>>(
       z_partial, gate_up_bf16, w2_layer, b2_layer, w_by_bucket, offsets,
       tok_idx, I, H, E, cap_pairs, splits);
 }
@@ -1300,7 +1300,7 @@ __global__ void reduce_splitk_with_bias(float *__restrict__ out,
 
 template <typename T>
 void getp_matmul(float *xout, float *x, T *w, T *b, int n, int d,
-                 int batch_size) {
+                 int batch_size, hipStream_t stream) {
   PROFILE_FUNCTION();
   const int M = batch_size, N = d, K = n;
   constexpr int BM = 32, BN = 32, BK = 32;
@@ -1313,7 +1313,7 @@ void getp_matmul(float *xout, float *x, T *w, T *b, int n, int d,
 
   int dev = 0, cu = 104;
   HIP_CHECK(hipGetDevice(&dev));
-  hipDeviceGetAttribute(&cu, hipDeviceAttributeMultiprocessorCount, dev);
+  HIP_CHECK(hipDeviceGetAttribute(&cu, hipDeviceAttributeMultiprocessorCount, dev));
   if (cu <= 0) cu = 104;
 
   const int target_cta = cu * 4;
@@ -1726,7 +1726,7 @@ static inline void getp_flash_attn_decode_bf16(
     const __hip_bfloat16 *value_cache_layer, const float *q,
     const float *attn_sinks_layer, int head_dim, int n_attn_heads,
     int n_kv_heads, int pos, int seq_len, int sliding_window, int layer_id,
-    int batch_size, int cache_tcap) {
+    int batch_size, int cache_tcap, hipStream_t stream) {
   const int kv_dim = head_dim * n_kv_heads;
   const int kv_mul = n_attn_heads / n_kv_heads;
   const float invsd = 1.0f / sqrtf((float)head_dim);
@@ -1752,7 +1752,7 @@ static inline void getp_flash_attn_decode_bf16(
 
   dim3 block(64, kv_mul);
   dim3 grid(n_kv_heads, batch_size);
-  flash_attn_decode_bf16_kernel<<<grid, block, shmem>>>(
+  flash_attn_decode_bf16_kernel<<<grid, block, shmem, stream>>>(
       tb, key_cache_layer, value_cache_layer, q, attn_sinks_layer, head_dim,
       n_attn_heads, n_kv_heads, pos, seq_len, sliding_window, apply_mask,
       batch_size, kv_dim, kv_mul, invsd, T, cache_tcap);
@@ -2039,20 +2039,22 @@ int *getp_forward(Transformer * /*transformer*/,
     int cap_pairs = build_moe_buckets_local_pos(
         ext->local_ids, ext->local_wts, ext->n_local, EXPERT_PARALLELISM * BATCH_SIZE,
         p->experts_per_token, experts_per_device, ext->e_counts, ext->e_offsets,
-        ext->e_dev, ext->w_dev, ext->pair_pos);
+        ext->e_dev, ext->w_dev, ext->pair_pos, compute_stream);
 
     // tổng số pair = e_offsets[E]
     int total_pairs = 0;
-    HIP_CHECK(hipMemcpy(&total_pairs, ext->e_offsets + experts_per_device,
-                        sizeof(int), hipMemcpyDeviceToHost));
+    HIP_CHECK(hipMemcpyAsync(&total_pairs, ext->e_offsets + experts_per_device,
+                             sizeof(int), hipMemcpyDeviceToHost, compute_stream));
+    
+    HIP_CHECK(hipStreamSynchronize(compute_stream));
 
     // scatter x -> a_in theo expert
-    moe_scatter_acts_to_expert_bf16(ext->a_in, dev_s->t, ext->e_dev,
-                                    total_pairs, hidden_dim);
+    moe_scatter_acts_to_expert_bf16(ext->a_in, ext->ext_t, ext->e_dev,
+                                    total_pairs, hidden_dim, compute_stream);
 
     // agg buffer
-    HIP_CHECK(hipMemset(dev_s->e_agg, 0,
-                        (size_t)batch_size * hidden_dim * sizeof(float)));
+    HIP_CHECK(hipMemsetAsync(ext->ext_e_agg, 0,
+                             (size_t)EXPERT_PARALLELISM * BATCH_SIZE * hidden_dim * sizeof(float), compute_stream));
 
     __hip_bfloat16 *w1_base = dev_w->w_mlp1 + 1ll * l * experts_per_device * 2 *
                                                   p->intermediate_dim *
@@ -2063,7 +2065,7 @@ int *getp_forward(Transformer * /*transformer*/,
     launch_mlp1_swiglu_bf16_bucketed_outbf16(
         ext->gate_up_bf16, ext->a_in, w1_base, b1_base, ext->e_offsets,
         hidden_dim, p->intermediate_dim, experts_per_device, cap_pairs,
-        p->swiglu_limit);
+        p->swiglu_limit, compute_stream);
 
     __hip_bfloat16 *w2_base = dev_w->w_mlp2 + 1ll * l * experts_per_device *
                                                   hidden_dim *

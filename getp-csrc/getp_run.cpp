@@ -1,6 +1,4 @@
 // TODO: Modify this file to optimize end-to-end throughput
-#include <hip/hip_runtime.h>
-#include <hip/driver_types.h>
 #include <cstddef>
 #include <cstring>
 #include <vector>
@@ -18,8 +16,6 @@
 #include <cstring>
 #include <hip/hip_runtime.h>
 
-#include "collectives.cpp"
-#include "getp_state_ext.cpp"
 #include <sched.h>
 #include <vector>
 
