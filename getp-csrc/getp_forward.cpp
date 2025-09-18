@@ -24,7 +24,7 @@
 #endif
 
 #ifndef GETP_BN_AGG
-#define GETP_BN_AGG 2
+#define GETP_BN_AGG 4
 #endif
 
 extern CollectiveGroup g_world;
