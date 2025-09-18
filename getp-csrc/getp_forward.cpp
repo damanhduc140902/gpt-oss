@@ -85,6 +85,50 @@ __device__ inline float bf16bits_to_f32(unsigned short u) {
   return __bfloat162float(t.b);
 }
 
+__device__ inline unsigned short f32_to_bf16bits(float v) {
+  __bf16_bits_u t; t.b = __float2bfloat16(v); return t.u;
+}
+using f32x4  = __attribute__((vector_size(16))) float;
+using bf16x4 = __attribute__((vector_size(8)))  unsigned short;
+
+
+
+
+__global__ void kv_store_pair_fp32_to_bf16_kernel(
+    const float *__restrict__ k, const float *__restrict__ v,
+    __hip_bfloat16 *__restrict__ kdst, __hip_bfloat16 *__restrict__ vdst,
+    int elems) {
+  int i = blockIdx.x * blockDim.x + threadIdx.x;
+  int i4 = i << 2;
+  if (i4 + 3 < elems) {
+    float4 kf = reinterpret_cast<const float4 *>(k)[i];
+    float4 vf = reinterpret_cast<const float4 *>(v)[i];
+    uint2 ku, vu;
+    ku.x = (unsigned)f32_to_bf16bits(kf.x) | ((unsigned)f32_to_bf16bits(kf.y) << 16);
+    ku.y = (unsigned)f32_to_bf16bits(kf.z) | ((unsigned)f32_to_bf16bits(kf.w) << 16);
+    vu.x = (unsigned)f32_to_bf16bits(vf.x) | ((unsigned)f32_to_bf16bits(vf.y) << 16);
+    vu.y = (unsigned)f32_to_bf16bits(vf.z) | ((unsigned)f32_to_bf16bits(vf.w) << 16);
+    reinterpret_cast<uint2 *>(kdst)[i] = ku;
+    reinterpret_cast<uint2 *>(vdst)[i] = vu;
+  } else {
+    for (int t = 0; t < 4; ++t) {
+      int idx = i4 + t;
+      if (idx < elems) {
+        reinterpret_cast<unsigned short *>(kdst)[idx] = f32_to_bf16bits(k[idx]);
+        reinterpret_cast<unsigned short *>(vdst)[idx] = f32_to_bf16bits(v[idx]);
+      }
+    }
+  }
+}
+static inline void kv_store_pair_fp32_to_bf16(__hip_bfloat16 *kdst, __hip_bfloat16 *vdst,
+                                              const float *k, const float *v, int elems) {
+  int threads = 256;
+  int blocks = ((elems + 3) / 4 + threads - 1) / threads;
+  kv_store_pair_fp32_to_bf16_kernel<<<blocks, threads>>>(k, v, kdst, vdst, elems);
+}
+
+
+
 __global__ void moe_count_local_kernel(const int *local_ids, const int *n_local,
                                        int B, int K, int E, int *counts) {
   int b = blockIdx.x;
@@ -169,23 +213,17 @@ __global__ void __launch_bounds__(256) mlp1_swiglu_bf16_bucketed_kernel(
     const __hip_bfloat16 *__restrict__ B1, const int *__restrict__ offsets,
     const int *__restrict__ tok_idx, int H, int I, int E, int cap_pairs,
     float swiglu_limit) {
-  constexpr int BLOCK_SIZE = 256;
-  constexpr int BM = 32, BN = 32, BK = 32;  // block tile
-  constexpr int WM = 16, WN = 16;           // wave tile
-  constexpr int MFMA_M = 16, MFMA_N = 16, MFMA_K = 4;
-  using mfloat4 =
-      __attribute__((__vector_size__(MFMA_K * sizeof(float)))) float;
-
-  const int lane = threadIdx.x % warpSize;
-  const int wave = threadIdx.x / warpSize;
-  const int xTile = wave % (BM / WM);  // 0..1
-  const int yTile = wave / (BM / WM);  // 0..1
-  const int xMF = lane % MFMA_M;
-  const int yMF = lane / MFMA_M;
+  constexpr int BM = 32, BN = 32, BK = 32;
+  constexpr int WM = 16, WN = 16;
+  const int lane = threadIdx.x & 63;
+  const int wave = threadIdx.x >> 6;
+  const int xTile = wave % (BM / WM);
+  const int yTile = wave / (BM / WM);
+  const int xMF = lane & 15;
+  const int yMF = lane >> 4;
 
   const int e = blockIdx.y % E;
   const int blk = blockIdx.y / E;
-
   const int start = offsets[e];
   const int end = offsets[e + 1];
   const int n = end - start;
@@ -197,19 +235,19 @@ __global__ void __launch_bounds__(256) mlp1_swiglu_bf16_bucketed_kernel(
   const size_t w1_e = (size_t)e * (size_t)(2 * I) * (size_t)H;
   const size_t b1_e = (size_t)e * (size_t)(2 * I);
 
-  __shared__ float sx[BK][BM];
-  __shared__ float swg[BK][BN];
-  __shared__ float swu[BK][BN];
+  __shared__ unsigned short sx[BK * BM];
+  __shared__ unsigned short swg[BK * BN];
+  __shared__ unsigned short swu[BK * BN];
 
-  mfloat4 dgn = {0, 0, 0, 0};
-  mfloat4 dun = {0, 0, 0, 0};
+  f32x4 dgn = {0, 0, 0, 0};
+  f32x4 dun = {0, 0, 0, 0};
 
   const int loadX_x = threadIdx.x % (BK / 4);
   const int loadX_y = threadIdx.x / (BK / 4);
   const int loadW_x = threadIdx.x % (BK / 8);
   const int loadW_y = threadIdx.x / (BK / 8);
-  const int strideX = BLOCK_SIZE / (BK / 4);
-  const int strideW = BLOCK_SIZE / (BK / 8);
+  constexpr int strideX = 256 / (BK / 4);
+  constexpr int strideW = 256 / (BK / 8);
 
   for (int bk = 0; bk < H; bk += BK) {
     for (int off = 0; off < BM; off += strideX) {
@@ -217,23 +255,24 @@ __global__ void __launch_bounds__(256) mlp1_swiglu_bf16_bucketed_kernel(
       const int kk = bk + 4 * loadX_x;
       const int r = loadX_y + off;
       const int pos = base + r;
-      if (r < tcnt && kk + 3 < H) {
-        const int b = tok_idx[pos];
-        float4 v = *reinterpret_cast<const float4 *>(x + (size_t)b * H + kk);
-        sx[4 * loadX_x + 0][r] = v.x;
-        sx[4 * loadX_x + 1][r] = v.y;
-        sx[4 * loadX_x + 2][r] = v.z;
-        sx[4 * loadX_x + 3][r] = v.w;
-      } else if (r < tcnt && kk < H) {
-        const int b = tok_idx[pos];
-        const float *p = x + (size_t)b * H + kk;
-        sx[4 * loadX_x + 0][r] = (kk + 0 < H) ? p[0] : 0.f;
-        sx[4 * loadX_x + 1][r] = (kk + 1 < H) ? p[1] : 0.f;
-        sx[4 * loadX_x + 2][r] = (kk + 2 < H) ? p[2] : 0.f;
-        sx[4 * loadX_x + 3][r] = (kk + 3 < H) ? p[3] : 0.f;
+      if (r < tcnt) {
+        if (kk + 3 < H) {
+          const int b = tok_idx[pos];
+          float4 v = *reinterpret_cast<const float4 *>(x + (size_t)b * H + kk);
+          sx[(4 * loadX_x + 0) * BM + r] = f32_to_bf16bits(v.x);
+          sx[(4 * loadX_x + 1) * BM + r] = f32_to_bf16bits(v.y);
+          sx[(4 * loadX_x + 2) * BM + r] = f32_to_bf16bits(v.z);
+          sx[(4 * loadX_x + 3) * BM + r] = f32_to_bf16bits(v.w);
+        } else {
+          const int b = tok_idx[pos];
+          const float *p = x + (size_t)b * H + kk;
+          sx[(4 * loadX_x + 0) * BM + r] = (kk + 0 < H) ? f32_to_bf16bits(p[0]) : 0;
+          sx[(4 * loadX_x + 1) * BM + r] = (kk + 1 < H) ? f32_to_bf16bits(p[1]) : 0;
+          sx[(4 * loadX_x + 2) * BM + r] = (kk + 2 < H) ? f32_to_bf16bits(p[2]) : 0;
+          sx[(4 * loadX_x + 3) * BM + r] = (kk + 3 < H) ? f32_to_bf16bits(p[3]) : 0;
+        }
       }
     }
-
     for (int off = 0; off < BN; off += strideW) {
       if (loadW_y + off >= BN) break;
       const int kk = bk + 8 * loadW_x;
@@ -243,129 +282,86 @@ __global__ void __launch_bounds__(256) mlp1_swiglu_bf16_bucketed_kernel(
       uint4 wu = make_uint4(0, 0, 0, 0);
       if (c < I) {
         if (kk + 7 < H) {
-          wg = *reinterpret_cast<const uint4 *>(W1 + w1_e +
-                                                (size_t)(2 * c + 0) * H + kk);
-          wu = *reinterpret_cast<const uint4 *>(W1 + w1_e +
-                                                (size_t)(2 * c + 1) * H + kk);
+          wg = *reinterpret_cast<const uint4 *>(W1 + w1_e + (size_t)(2 * c + 0) * H + kk);
+          wu = *reinterpret_cast<const uint4 *>(W1 + w1_e + (size_t)(2 * c + 1) * H + kk);
         } else if (kk < H) {
           const __hip_bfloat16 *pg = W1 + w1_e + (size_t)(2 * c + 0) * H + kk;
           const __hip_bfloat16 *pu = W1 + w1_e + (size_t)(2 * c + 1) * H + kk;
-          unsigned u0 = 0, u1 = 0, u2 = 0, u3 = 0, v0 = 0, v1 = 0, v2 = 0,
-                   v3 = 0;
-          if (kk + 0 < H) {
-            u0 |= (unsigned)(reinterpret_cast<const unsigned short *>(pg)[0]);
-            v0 |= (unsigned)(reinterpret_cast<const unsigned short *>(pu)[0]);
-          }
-          if (kk + 1 < H) {
-            u0 |= (unsigned)(reinterpret_cast<const unsigned short *>(pg)[1])
-                  << 16;
-            v0 |= (unsigned)(reinterpret_cast<const unsigned short *>(pu)[1])
-                  << 16;
-          }
-          if (kk + 2 < H) {
-            u1 |= (unsigned)(reinterpret_cast<const unsigned short *>(pg)[2]);
-            v1 |= (unsigned)(reinterpret_cast<const unsigned short *>(pu)[2]);
-          }
-          if (kk + 3 < H) {
-            u1 |= (unsigned)(reinterpret_cast<const unsigned short *>(pg)[3])
-                  << 16;
-            v1 |= (unsigned)(reinterpret_cast<const unsigned short *>(pu)[3])
-                  << 16;
-          }
-          if (kk + 4 < H) {
-            u2 |= (unsigned)(reinterpret_cast<const unsigned short *>(pg)[4]);
-            v2 |= (unsigned)(reinterpret_cast<const unsigned short *>(pu)[4]);
-          }
-          if (kk + 5 < H) {
-            u2 |= (unsigned)(reinterpret_cast<const unsigned short *>(pg)[5])
-                  << 16;
-            v2 |= (unsigned)(reinterpret_cast<const unsigned short *>(pu)[5])
-                  << 16;
-          }
-          if (kk + 6 < H) {
-            u3 |= (unsigned)(reinterpret_cast<const unsigned short *>(pg)[6]);
-            v3 |= (unsigned)(reinterpret_cast<const unsigned short *>(pu)[6]);
-          }
+          unsigned u0 = 0, u1 = 0, u2 = 0, u3 = 0, v0 = 0, v1 = 0, v2 = 0, v3 = 0;
+          if (kk + 0 < H) { u0 |= (unsigned)(reinterpret_cast<const unsigned short *>(pg)[0]); v0 |= (unsigned)(reinterpret_cast<const unsigned short *>(pu)[0]); }
+          if (kk + 1 < H) { u0 |= (unsigned)(reinterpret_cast<const unsigned short *>(pg)[1]) << 16; v0 |= (unsigned)(reinterpret_cast<const unsigned short *>(pu)[1]) << 16; }
+          if (kk + 2 < H) { u1 |= (unsigned)(reinterpret_cast<const unsigned short *>(pg)[2]); v1 |= (unsigned)(reinterpret_cast<const unsigned short *>(pu)[2]); }
+          if (kk + 3 < H) { u1 |= (unsigned)(reinterpret_cast<const unsigned short *>(pg)[3]) << 16; v1 |= (unsigned)(reinterpret_cast<const unsigned short *>(pu)[3]) << 16; }
+          if (kk + 4 < H) { u2 |= (unsigned)(reinterpret_cast<const unsigned short *>(pg)[4]); v2 |= (unsigned)(reinterpret_cast<const unsigned short *>(pu)[4]); }
+          if (kk + 5 < H) { u2 |= (unsigned)(reinterpret_cast<const unsigned short *>(pg)[5]) << 16; v2 |= (unsigned)(reinterpret_cast<const unsigned short *>(pu)[5]) << 16; }
+          if (kk + 6 < H) { u3 |= (unsigned)(reinterpret_cast<const unsigned short *>(pg)[6]); v3 |= (unsigned)(reinterpret_cast<const unsigned short *>(pu)[6]); }
           wg = make_uint4(u0, u1, u2, u3);
           wu = make_uint4(v0, v1, v2, v3);
         }
       }
-
+      unsigned short *dg = swg + (size_t)(8 * loadW_x) * BN + (loadW_y + off);
+      unsigned short *du = swu + (size_t)(8 * loadW_x) * BN + (loadW_y + off);
       if (c < I) {
-        // gate
-        swg[8 * loadW_x + 0][loadW_y + off] =
-            bf16bits_to_f32((unsigned short)(wg.x & 0xFFFF));
-        swg[8 * loadW_x + 1][loadW_y + off] =
-            bf16bits_to_f32((unsigned short)(wg.x >> 16));
-        swg[8 * loadW_x + 2][loadW_y + off] =
-            bf16bits_to_f32((unsigned short)(wg.y & 0xFFFF));
-        swg[8 * loadW_x + 3][loadW_y + off] =
-            bf16bits_to_f32((unsigned short)(wg.y >> 16));
-        swg[8 * loadW_x + 4][loadW_y + off] =
-            bf16bits_to_f32((unsigned short)(wg.z & 0xFFFF));
-        swg[8 * loadW_x + 5][loadW_y + off] =
-            bf16bits_to_f32((unsigned short)(wg.z >> 16));
-        swg[8 * loadW_x + 6][loadW_y + off] =
-            bf16bits_to_f32((unsigned short)(wg.w & 0xFFFF));
-        swg[8 * loadW_x + 7][loadW_y + off] =
-            bf16bits_to_f32((unsigned short)(wg.w >> 16));
-        // up
-        swu[8 * loadW_x + 0][loadW_y + off] =
-            bf16bits_to_f32((unsigned short)(wu.x & 0xFFFF));
-        swu[8 * loadW_x + 1][loadW_y + off] =
-            bf16bits_to_f32((unsigned short)(wu.x >> 16));
-        swu[8 * loadW_x + 2][loadW_y + off] =
-            bf16bits_to_f32((unsigned short)(wu.y & 0xFFFF));
-        swu[8 * loadW_x + 3][loadW_y + off] =
-            bf16bits_to_f32((unsigned short)(wu.y >> 16));
-        swu[8 * loadW_x + 4][loadW_y + off] =
-            bf16bits_to_f32((unsigned short)(wu.z & 0xFFFF));
-        swu[8 * loadW_x + 5][loadW_y + off] =
-            bf16bits_to_f32((unsigned short)(wu.z >> 16));
-        swu[8 * loadW_x + 6][loadW_y + off] =
-            bf16bits_to_f32((unsigned short)(wu.w & 0xFFFF));
-        swu[8 * loadW_x + 7][loadW_y + off] =
-            bf16bits_to_f32((unsigned short)(wu.w >> 16));
+        dg[0 * BN] = (unsigned short)(wg.x & 0xFFFF);
+        dg[1 * BN] = (unsigned short)(wg.x >> 16);
+        dg[2 * BN] = (unsigned short)(wg.y & 0xFFFF);
+        dg[3 * BN] = (unsigned short)(wg.y >> 16);
+        dg[4 * BN] = (unsigned short)(wg.z & 0xFFFF);
+        dg[5 * BN] = (unsigned short)(wg.z >> 16);
+        dg[6 * BN] = (unsigned short)(wg.w & 0xFFFF);
+        dg[7 * BN] = (unsigned short)(wg.w >> 16);
+        du[0 * BN] = (unsigned short)(wu.x & 0xFFFF);
+        du[1 * BN] = (unsigned short)(wu.x >> 16);
+        du[2 * BN] = (unsigned short)(wu.y & 0xFFFF);
+        du[3 * BN] = (unsigned short)(wu.y >> 16);
+        du[4 * BN] = (unsigned short)(wu.z & 0xFFFF);
+        du[5 * BN] = (unsigned short)(wu.z >> 16);
+        du[6 * BN] = (unsigned short)(wu.w & 0xFFFF);
+        du[7 * BN] = (unsigned short)(wu.w >> 16);
+      } else {
+        dg[0*BN]=dg[1*BN]=dg[2*BN]=dg[3*BN]=dg[4*BN]=dg[5*BN]=dg[6*BN]=dg[7*BN]=0;
+        du[0*BN]=du[1*BN]=du[2*BN]=du[3*BN]=du[4*BN]=du[5*BN]=du[6*BN]=du[7*BN]=0;
       }
     }
-
     __syncthreads();
 
-    for (int k = 0; k < BK; k += MFMA_K) {
-      float amk = sx[k + yMF][yTile * WM + xMF];
-      float bgk = swg[k + yMF][xTile * WN + xMF];
-      float buk = swu[k + yMF][xTile * WN + xMF];
-      dgn = __builtin_amdgcn_mfma_f32_16x16x4f32(amk, bgk, dgn, 0, 0, 0);
-      dun = __builtin_amdgcn_mfma_f32_16x16x4f32(amk, buk, dun, 0, 0, 0);
+    for (int k = 0; k < BK; k += 16) {
+      const int basek = k + yMF * 4;
+      const int row = yTile * WM + xMF;
+      const int col = xTile * WN + xMF;
+      bf16x4 av = {sx[(basek + 0) * BM + row], sx[(basek + 1) * BM + row],
+                   sx[(basek + 2) * BM + row], sx[(basek + 3) * BM + row]};
+      bf16x4 bvg = {swg[(basek + 0) * BN + col], swg[(basek + 1) * BN + col],
+                    swg[(basek + 2) * BN + col], swg[(basek + 3) * BN + col]};
+      bf16x4 bvu = {swu[(basek + 0) * BN + col], swu[(basek + 1) * BN + col],
+                    swu[(basek + 2) * BN + col], swu[(basek + 3) * BN + col]};
+      dgn = __builtin_amdgcn_mfma_f32_16x16x16bf16_1k(av, bvg, dgn, 0, 0, 0);
+      dun = __builtin_amdgcn_mfma_f32_16x16x16bf16_1k(av, bvu, dun, 0, 0, 0);
     }
     __syncthreads();
   }
 
   for (int i = 0; i < 4; ++i) {
-    const int xD = lane % MFMA_N;
-    const int yD = MFMA_K * (lane / MFMA_N) + i;
-    const int col = blockIdx.x * BN + xTile * WN + xD;  // 0..I-1
-    const int row = yTile * WM + yD;                    // 0..tcnt-1
+    const int xD = lane & 15;
+    const int yD = 4 * (lane >> 4) + i;
+    const int col = blockIdx.x * BN + xTile * WN + xD;
+    const int row = yTile * WM + yD;
     if (row < tcnt && col < I) {
       const int pos = base + row;
-      const float bg =
-          B1 ? __bfloat162float(B1[b1_e + (size_t)(2 * col + 0)]) : 0.f;
-      const float bu =
-          B1 ? __bfloat162float(B1[b1_e + (size_t)(2 * col + 1)]) : 0.f;
-
+      const float bg = B1 ? __bfloat162float(B1[b1_e + (size_t)(2 * col + 0)]) : 0.f;
+      const float bu = B1 ? __bfloat162float(B1[b1_e + (size_t)(2 * col + 1)]) : 0.f;
       float g = dgn[i] + bg;
       float u = dun[i] + bu;
-
       if (g > swiglu_limit) g = swiglu_limit;
       if (u > swiglu_limit) u = swiglu_limit;
       if (u < -swiglu_limit) u = -swiglu_limit;
-
       const float a = 1.702f;
       float s = 1.f / (1.f + __expf(-a * g));
       gate_up_all[(size_t)pos * (size_t)I + col] = (g * s) * (u + 1.f);
     }
   }
 }
+
 
 static inline void launch_mlp1_swiglu_bf16_bucketed(
     float *gate_up_all, const float *x, const __hip_bfloat16 *w1_layer,
@@ -384,37 +380,32 @@ static inline void launch_mlp1_swiglu_bf16_bucketed(
 
 
 __global__ void __launch_bounds__(256) mlp2_partial_bf16_bucketed_splitk_kernel(
-    float *__restrict__ z_partial, const float *__restrict__ gate_up_all,
-    const __hip_bfloat16 *__restrict__ W2,
-    const __hip_bfloat16 *__restrict__ B2,
-    const float *__restrict__ w_by_bucket, const int *__restrict__ offsets,
-    const int *__restrict__ tok_idx, int I, int H, int E, int cap_pairs,
-    int splits) {
-  constexpr int BLOCK_SIZE = 256;
-  constexpr int BM = 32, BN = 32, BK = 32;
-  constexpr int WM = 16, WN = 16;
-  constexpr int MFMA_M = 16, MFMA_N = 16, MFMA_K = 4;
-  using mfloat4 =
-      __attribute__((__vector_size__(MFMA_K * sizeof(float)))) float;
+    float* __restrict__ z_partial,
+    const float* __restrict__ gate_up_all,
+    const __hip_bfloat16* __restrict__ W2,
+    const __hip_bfloat16* __restrict__ B2,
+    const float* __restrict__ w_by_bucket,
+    const int* __restrict__ offsets,
+    const int* __restrict__ tok_idx,
+    int I, int H, int E, int cap_pairs, int splits) {
+  constexpr int BM=32, BN=32, BK=32;
+  constexpr int WM=16, WN=16;
+  const int lane = threadIdx.x & 63;
+  const int wave = threadIdx.x >> 6;
+  const int xTile = wave % (BM/WM);
+  const int yTile = wave / (BM/WM);
+  const int xMF = lane & 15;
+  const int yMF = lane >> 4;
 
-  const int lane = threadIdx.x % warpSize;
-  const int wave = threadIdx.x / warpSize;
-  const int xTile = wave % (BM / WM);
-  const int yTile = wave / (BM / WM);
-  const int xMF = lane % MFMA_M;
-  const int yMF = lane / MFMA_M;
-
-  extern __shared__ float smem[];
-  float *sx = smem;                    // [BK][BM]
-  float *sw = smem + (size_t)BK * BM;  // [BK][BN]
+  extern __shared__ unsigned char smem_raw[];
+  unsigned short* sx = reinterpret_cast<unsigned short*>(smem_raw);
+  unsigned short* sw = sx + (size_t)BK * BM;
 
   const int e = blockIdx.y % E;
   const int blk = blockIdx.y / E;
-
   const int start = offsets[e];
-  const int end = offsets[e + 1];
+  const int end = offsets[e+1];
   const int n = end - start;
-
   const int base_all = blk * BM;
   const int base = start + base_all;
   if (base >= end) return;
@@ -423,14 +414,14 @@ __global__ void __launch_bounds__(256) mlp2_partial_bf16_bucketed_splitk_kernel(
   const size_t w2_e = (size_t)e * (size_t)H * (size_t)I;
   const size_t b2_e = (size_t)e * (size_t)H;
 
-  mfloat4 dmn = {0, 0, 0, 0};
+  f32x4 dmn = {0,0,0,0};
 
-  const int loadX_x = threadIdx.x % (BK / 4);
-  const int loadX_y = threadIdx.x / (BK / 4);
-  const int loadW_x = threadIdx.x % (BK / 8);
-  const int loadW_y = threadIdx.x / (BK / 8);
-  const int strideX = BLOCK_SIZE / (BK / 4);
-  const int strideW = BLOCK_SIZE / (BK / 8);
+  const int loadX_x = threadIdx.x % (BK/4);
+  const int loadX_y = threadIdx.x / (BK/4);
+  const int loadW_x = threadIdx.x % (BK/8);
+  const int loadW_y = threadIdx.x / (BK/8);
+  constexpr int strideX = 256 / (BK/4);
+  constexpr int strideW = 256 / (BK/8);
 
   const int split = blockIdx.z;
   const int kChunk = (I + splits - 1) / splits;
@@ -443,23 +434,21 @@ __global__ void __launch_bounds__(256) mlp2_partial_bf16_bucketed_splitk_kernel(
       const int kk = bk + 4 * loadX_x;
       const int r = loadX_y + off;
       const int pos = base + r;
-      if (r < tcnt && kk + 3 < kEnd) {
-        float4 v = *reinterpret_cast<const float4 *>(
-            gate_up_all + (size_t)pos * (size_t)I + kk);
-        sx[(4 * loadX_x + 0) * BM + (loadX_y + off)] = v.x;
-        sx[(4 * loadX_x + 1) * BM + (loadX_y + off)] = v.y;
-        sx[(4 * loadX_x + 2) * BM + (loadX_y + off)] = v.z;
-        sx[(4 * loadX_x + 3) * BM + (loadX_y + off)] = v.w;
-      } else if (r < tcnt && kk < kEnd) {
-        const float *p = gate_up_all + (size_t)pos * (size_t)I + kk;
-        sx[(4 * loadX_x + 0) * BM + (loadX_y + off)] =
-            (kk + 0 < kEnd) ? p[0] : 0.f;
-        sx[(4 * loadX_x + 1) * BM + (loadX_y + off)] =
-            (kk + 1 < kEnd) ? p[1] : 0.f;
-        sx[(4 * loadX_x + 2) * BM + (loadX_y + off)] =
-            (kk + 2 < kEnd) ? p[2] : 0.f;
-        sx[(4 * loadX_x + 3) * BM + (loadX_y + off)] =
-            (kk + 3 < kEnd) ? p[3] : 0.f;
+      if (r < tcnt) {
+        if (kk + 3 < kEnd) {
+          float4 v = *reinterpret_cast<const float4*>(
+              gate_up_all + (size_t)pos * (size_t)I + kk);
+          sx[(4*loadX_x+0)*BM + r] = f32_to_bf16bits(v.x);
+          sx[(4*loadX_x+1)*BM + r] = f32_to_bf16bits(v.y);
+          sx[(4*loadX_x+2)*BM + r] = f32_to_bf16bits(v.z);
+          sx[(4*loadX_x+3)*BM + r] = f32_to_bf16bits(v.w);
+        } else {
+          const float* p = gate_up_all + (size_t)pos * (size_t)I + kk;
+          sx[(4*loadX_x+0)*BM + r] = (kk+0 < kEnd) ? f32_to_bf16bits(p[0]) : 0;
+          sx[(4*loadX_x+1)*BM + r] = (kk+1 < kEnd) ? f32_to_bf16bits(p[1]) : 0;
+          sx[(4*loadX_x+2)*BM + r] = (kk+2 < kEnd) ? f32_to_bf16bits(p[2]) : 0;
+          sx[(4*loadX_x+3)*BM + r] = (kk+3 < kEnd) ? f32_to_bf16bits(p[3]) : 0;
+        }
       }
     }
     for (int off = 0; off < BN; off += strideW) {
@@ -467,79 +456,68 @@ __global__ void __launch_bounds__(256) mlp2_partial_bf16_bucketed_splitk_kernel(
       const int kk = bk + 8 * loadW_x;
       const int col = blockIdx.x * BN + loadW_y + off;
 
-      uint4 wb = make_uint4(0, 0, 0, 0);
+      uint4 wb = make_uint4(0,0,0,0);
       if (col < H && kk < kEnd) {
         if (kk + 7 < kEnd) {
-          wb = *reinterpret_cast<const uint4 *>(W2 + w2_e +
-                                                (size_t)col * (size_t)I + kk);
+          wb = *reinterpret_cast<const uint4*>(W2 + w2_e + (size_t)col * (size_t)I + kk);
         } else {
-          const __hip_bfloat16 *src = W2 + w2_e + (size_t)col * (size_t)I + kk;
-          unsigned u0 = 0, u1 = 0, u2 = 0, u3 = 0;
-          if (kk + 0 < kEnd)
-            u0 |= (unsigned)(reinterpret_cast<const unsigned short *>(src)[0]);
-          if (kk + 1 < kEnd)
-            u0 |= (unsigned)(reinterpret_cast<const unsigned short *>(src)[1])
-                  << 16;
-          if (kk + 2 < kEnd)
-            u1 |= (unsigned)(reinterpret_cast<const unsigned short *>(src)[2]);
-          if (kk + 3 < kEnd)
-            u1 |= (unsigned)(reinterpret_cast<const unsigned short *>(src)[3])
-                  << 16;
-          if (kk + 4 < kEnd)
-            u2 |= (unsigned)(reinterpret_cast<const unsigned short *>(src)[4]);
-          if (kk + 5 < kEnd)
-            u2 |= (unsigned)(reinterpret_cast<const unsigned short *>(src)[5])
-                  << 16;
-          if (kk + 6 < kEnd)
-            u3 |= (unsigned)(reinterpret_cast<const unsigned short *>(src)[6]);
-          wb = make_uint4(u0, u1, u2, u3);
+          const __hip_bfloat16* src = W2 + w2_e + (size_t)col * (size_t)I + kk;
+          unsigned u0=0,u1=0,u2=0,u3=0;
+          if (kk+0 < kEnd) u0 |= (unsigned)(reinterpret_cast<const unsigned short*>(src)[0]);
+          if (kk+1 < kEnd) u0 |= (unsigned)(reinterpret_cast<const unsigned short*>(src)[1])<<16;
+          if (kk+2 < kEnd) u1 |= (unsigned)(reinterpret_cast<const unsigned short*>(src)[2]);
+          if (kk+3 < kEnd) u1 |= (unsigned)(reinterpret_cast<const unsigned short*>(src)[3])<<16;
+          if (kk+4 < kEnd) u2 |= (unsigned)(reinterpret_cast<const unsigned short*>(src)[4]);
+          if (kk+5 < kEnd) u2 |= (unsigned)(reinterpret_cast<const unsigned short*>(src)[5])<<16;
+          if (kk+6 < kEnd) u3 |= (unsigned)(reinterpret_cast<const unsigned short*>(src)[6]);
+          wb = make_uint4(u0,u1,u2,u3);
         }
       }
-      float *dst = sw + (size_t)(8 * loadW_x) * BN + (loadW_y + off);
+      unsigned short* dst = sw + (size_t)(8 * loadW_x) * BN + (loadW_y + off);
       if (col < H) {
-        dst[0 * BN] = bf16bits_to_f32((unsigned short)(wb.x & 0xFFFF));
-        dst[1 * BN] = bf16bits_to_f32((unsigned short)(wb.x >> 16));
-        dst[2 * BN] = bf16bits_to_f32((unsigned short)(wb.y & 0xFFFF));
-        dst[3 * BN] = bf16bits_to_f32((unsigned short)(wb.y >> 16));
-        dst[4 * BN] = bf16bits_to_f32((unsigned short)(wb.z & 0xFFFF));
-        dst[5 * BN] = bf16bits_to_f32((unsigned short)(wb.z >> 16));
-        dst[6 * BN] = bf16bits_to_f32((unsigned short)(wb.w & 0xFFFF));
-        dst[7 * BN] = bf16bits_to_f32((unsigned short)(wb.w >> 16));
+        dst[0*BN] = (unsigned short)(wb.x & 0xFFFF);
+        dst[1*BN] = (unsigned short)(wb.x >> 16);
+        dst[2*BN] = (unsigned short)(wb.y & 0xFFFF);
+        dst[3*BN] = (unsigned short)(wb.y >> 16);
+        dst[4*BN] = (unsigned short)(wb.z & 0xFFFF);
+        dst[5*BN] = (unsigned short)(wb.z >> 16);
+        dst[6*BN] = (unsigned short)(wb.w & 0xFFFF);
+        dst[7*BN] = (unsigned short)(wb.w >> 16);
       } else {
-        dst[0 * BN] = dst[1 * BN] = dst[2 * BN] = dst[3 * BN] = dst[4 * BN] =
-            dst[5 * BN] = dst[6 * BN] = dst[7 * BN] = 0.f;
+        dst[0*BN]=dst[1*BN]=dst[2*BN]=dst[3*BN]=dst[4*BN]=dst[5*BN]=dst[6*BN]=dst[7*BN]=0;
       }
     }
     __syncthreads();
 
-    for (int k = 0; k < BK; k += MFMA_K) {
-      float amk = sx[(k + yMF) * BM + (yTile * WM + xMF)];
-      float bkn = sw[(k + yMF) * BN + (xTile * WN + xMF)];
-      dmn = __builtin_amdgcn_mfma_f32_16x16x4f32(amk, bkn, dmn, 0, 0, 0);
+    for (int k = 0; k < BK; k += 16) {
+      const int basek = k + yMF * 4;
+      const int row = yTile * WM + xMF;
+      const int col = xTile * WN + xMF;
+      bf16x4 av = {sx[(basek+0)*BM + row], sx[(basek+1)*BM + row],
+                   sx[(basek+2)*BM + row], sx[(basek+3)*BM + row]};
+      bf16x4 bv = {sw[(basek+0)*BN + col], sw[(basek+1)*BN + col],
+                   sw[(basek+2)*BN + col], sw[(basek+3)*BN + col]};
+      dmn = __builtin_amdgcn_mfma_f32_16x16x16bf16_1k(av, bv, dmn, 0, 0, 0);
     }
     __syncthreads();
   }
 
   for (int i = 0; i < 4; ++i) {
-    const int xD = lane % MFMA_N;
-    const int yD = MFMA_K * (lane / MFMA_N) + i;
+    const int xD = lane & 15;
+    const int yD = 4 * (lane >> 4) + i;
     const int col = blockIdx.x * BN + xTile * WN + xD;
     const int row = yTile * WM + yD;
     if (row < tcnt && col < H) {
       const int pos = base + row;
       const float w = w_by_bucket[pos];
       const float bia = B2 ? __bfloat162float(B2[b2_e + col]) : 0.f;
-      float *dst = z_partial + (size_t)pos * (size_t)H + col;
-
-      if (splits == 1) {
-        *dst = (dmn[i] + bia) * w;
-      } else {
-        atomicAdd(dst, dmn[i] * w);
-        if (split == 0) atomicAdd(dst, bia * w);
-      }
+      float* dst = z_partial + (size_t)pos * (size_t)H + col;
+      if (splits == 1) { *dst = (dmn[i] + bia) * w; }
+      else { atomicAdd(dst, dmn[i] * w); if (blockIdx.z == 0) atomicAdd(dst, bia * w); }
     }
   }
 }
+
 
 static inline void launch_mlp2_partial_bf16_bucketed_mfma(
     float *z_partial, const float *gate_up_all, const __hip_bfloat16 *w2_layer,
@@ -578,7 +556,8 @@ static inline void launch_mlp2_partial_bf16_bucketed_mfma(
 
   dim3 block(256);
   dim3 grid(gx, gy, splits);
-  const size_t shmem = (size_t)BK * (BM + BN) * sizeof(float);
+  // const size_t shmem = (size_t)BK * (BM + BN) * sizeof(float);
+  const size_t shmem = (size_t)BK * (BM + BN) * sizeof(unsigned short);
   mlp2_partial_bf16_bucketed_splitk_kernel<<<grid, block, shmem, stream>>>(
       z_partial, gate_up_all, w2_layer, b2_layer, w_by_bucket, offsets, tok_idx,
       I, H, E, cap_pairs, splits);
@@ -609,98 +588,116 @@ static inline void moe_gather_pairs(float *e_agg, const float *z_partial,
 }
 
 __global__ void matmul_qkv_fused_kernel(
-    float *__restrict__ q_out, float *__restrict__ k_out,
-    float *__restrict__ v_out, const float *__restrict__ x,
-    const __hip_bfloat16 *__restrict__ W, const __hip_bfloat16 *__restrict__ B,
-    int n, int q_len, int k_len, int v_len, int batch_size) {
+    float *__restrict__ q_out, float *__restrict__ k_out, float *__restrict__ v_out,
+    const float *__restrict__ x, const __hip_bfloat16 *__restrict__ W,
+    const __hip_bfloat16 *__restrict__ B, int n, int q_len, int k_len, int v_len,
+    int batch_size) {
   constexpr int BLOCK_SIZE = 256;
-  // Matrix
   const int M = batch_size;
   const int N = q_len + k_len + v_len;
   const int K = n;
-  // Block tile
-  constexpr int BM = 32;
-  constexpr int BN = 32;
-  constexpr int BK = 8;
-  // Wave tile
-  constexpr int WM = 16;
-  constexpr int WN = 16;
-
-  constexpr int MFMA_M = 16;
-  constexpr int MFMA_N = 16;
-  constexpr int MFMA_K = 4;
-  using mfloat4 =
-      __attribute__((__vector_size__(MFMA_K * sizeof(float)))) float;
+  constexpr int BM = 32, BN = 32, BK = 32;
+  constexpr int WM = 16, WN = 16;
 
   const int waveIdx = threadIdx.x / warpSize;
-  const int xInBlockTile = waveIdx % (BM / WM);
-  const int yInBlockTile = waveIdx / (BM / WM);
-  const int laneIdx = threadIdx.x % warpSize;
-  const int xInMFMA = laneIdx % (MFMA_M);
-  const int yInMFMA = laneIdx / (MFMA_M);
+  const int xTile = waveIdx % (BM / WM);
+  const int yTile = waveIdx / (BM / WM);
+  const int lane = threadIdx.x % warpSize;
+  const int xMF = lane % 16;
+  const int yMF = lane / 16;
 
-  const int loadXIdx_x = threadIdx.x % (BK);
-  const int loadXIdx_y = threadIdx.x / (BK);
-  const int loadWIdx_x = threadIdx.x % (BK);
-  const int loadWIdx_y = threadIdx.x / (BK);
-  constexpr int strideX = BLOCK_SIZE / (BK);
-  constexpr int strideW = BLOCK_SIZE / (BK);
+  const int loadX_x = threadIdx.x % (BK / 4);
+  const int loadX_y = threadIdx.x / (BK / 4);
+  const int loadW_x = threadIdx.x % (BK / 8);
+  const int loadW_y = threadIdx.x / (BK / 8);
+  constexpr int strideX = BLOCK_SIZE / (BK / 4);
+  constexpr int strideW = BLOCK_SIZE / (BK / 8);
 
-  assert(blockDim.x == BLOCK_SIZE);
+  __shared__ unsigned short sx[BK * BM];
+  __shared__ unsigned short sw[BK * BN];
 
-  __shared__ float sx[BK][BM];
-  __shared__ float sw[BK][BN];
+  f32x4 dmn = {0, 0, 0, 0};
 
-  mfloat4 dmn = {0};
-
-  for (int bkIdx = 0; bkIdx < K; bkIdx += BK) {
-    for (int offset = 0; offset < BM; offset += strideX) {
-      int index_x = bkIdx + loadXIdx_x;
-      int index_y = BM * blockIdx.y + loadXIdx_y + offset;
-      sx[index_x % BK][index_y % BM] =
-          index_x < K && index_y < M ? x[index_y * K + index_x] : 0;
+  for (int bk = 0; bk < K; bk += BK) {
+    for (int off = 0; off < BM; off += strideX) {
+      if (loadX_y + off >= BM) break;
+      const int kk = bk + 4 * loadX_x;
+      const int row = BM * blockIdx.y + loadX_y + off;
+      if (row < M) {
+        if (kk + 3 < K) {
+          float4 v = *reinterpret_cast<const float4 *>(x + (size_t)row * K + kk);
+          sx[(4 * loadX_x + 0) * BM + (loadX_y + off)] = f32_to_bf16bits(v.x);
+          sx[(4 * loadX_x + 1) * BM + (loadX_y + off)] = f32_to_bf16bits(v.y);
+          sx[(4 * loadX_x + 2) * BM + (loadX_y + off)] = f32_to_bf16bits(v.z);
+          sx[(4 * loadX_x + 3) * BM + (loadX_y + off)] = f32_to_bf16bits(v.w);
+        } else {
+          for (int t = 0; t < 4; ++t) {
+            int kx = kk + t; unsigned short val = 0;
+            if (kx < K) val = f32_to_bf16bits(x[(size_t)row * K + kx]);
+            sx[(4 * loadX_x + t) * BM + (loadX_y + off)] = val;
+          }
+        }
+      }
     }
-    for (int offset = 0; offset < BN; offset += strideW) {
-      int index_x = bkIdx + loadWIdx_x;
-      int index_y = BN * blockIdx.x + loadWIdx_y + offset;
-      sw[index_x % BK][index_y % BN] =
-          index_x < K && index_y < N
-              ? __bfloat162float(W[index_y * K + index_x])
-              : 0;
+    for (int off = 0; off < BN; off += strideW) {
+      if (loadW_y + off >= BN) break;
+      const int kk = bk + 8 * loadW_x;
+      const int col = BN * blockIdx.x + loadW_y + off;
+      unsigned short *dst = sw + (size_t)(8 * loadW_x) * BN + (loadW_y + off);
+      if (col < N) {
+        if (kk + 7 < K) {
+          uint4 t = *reinterpret_cast<const uint4 *>(W + (size_t)col * K + kk);
+          dst[0 * BN] = (unsigned short)(t.x & 0xFFFF);
+          dst[1 * BN] = (unsigned short)(t.x >> 16);
+          dst[2 * BN] = (unsigned short)(t.y & 0xFFFF);
+          dst[3 * BN] = (unsigned short)(t.y >> 16);
+          dst[4 * BN] = (unsigned short)(t.z & 0xFFFF);
+          dst[5 * BN] = (unsigned short)(t.z >> 16);
+          dst[6 * BN] = (unsigned short)(t.w & 0xFFFF);
+          dst[7 * BN] = (unsigned short)(t.w >> 16);
+        } else {
+          for (int t = 0; t < 8; ++t) {
+            int kx = kk + t; unsigned short val = 0;
+            if (kx < K) val = reinterpret_cast<const unsigned short *>(W + (size_t)col * K + kx)[0];
+            dst[t * BN] = val;
+          }
+        }
+      } else {
+        for (int t = 0; t < 8; ++t) dst[t * BN] = 0;
+      }
     }
     __syncthreads();
-    for (int k = 0; k < BK; k += MFMA_K) {
-      float amk = sx[k + yInMFMA][yInBlockTile * WM + xInMFMA];
-      float bkn = sw[k + yInMFMA][xInBlockTile * WN + xInMFMA];
-      dmn = __builtin_amdgcn_mfma_f32_16x16x4f32(amk, bkn, dmn, 0, 0, 0);
+
+    for (int k = 0; k < BK; k += 16) {
+      const int basek = k + yMF * 4;
+      const int row = yTile * WM + xMF;
+      const int col = xTile * WN + xMF;
+      bf16x4 av = {sx[(basek + 0) * BM + row], sx[(basek + 1) * BM + row],
+                   sx[(basek + 2) * BM + row], sx[(basek + 3) * BM + row]};
+      bf16x4 bv = {sw[(basek + 0) * BN + col], sw[(basek + 1) * BN + col],
+                   sw[(basek + 2) * BN + col], sw[(basek + 3) * BN + col]};
+      dmn = __builtin_amdgcn_mfma_f32_16x16x16bf16_1k(av, bv, dmn, 0, 0, 0);
     }
     __syncthreads();
   }
 
+  const int xD = lane % 16;
+  const int yD = 4 * (lane / 16);
   for (int i = 0; i < 4; ++i) {
-    const int xInD = laneIdx % MFMA_N;
-    const int yInD = MFMA_K * (laneIdx / MFMA_N) + i;
-    const int xInOutput = blockIdx.x * BN + xInBlockTile * WN + xInD;
-    const int yInOutput = blockIdx.y * BM + yInBlockTile * WM + yInD;
-    float result = dmn[i];
-    if (yInOutput < M && xInOutput < N) {
-      if (B) result += __bfloat162float(B[xInOutput]);
-      float *dst;
-      int outIdx;
-      if (xInOutput < q_len) {
-        dst = q_out + yInOutput * q_len;
-        outIdx = xInOutput;
-      } else if (xInOutput < q_len + k_len) {
-        dst = k_out + yInOutput * k_len;
-        outIdx = xInOutput - q_len;
-      } else {
-        dst = v_out + yInOutput * v_len;
-        outIdx = xInOutput - q_len - k_len;
-      }
+    const int xOut = blockIdx.x * BN + xTile * WN + xD;
+    const int yOut = blockIdx.y * BM + yTile * WM + (yD + i);
+    if (yOut < M && xOut < N) {
+      float result = dmn[i];
+      if (B) result += __bfloat162float(B[xOut]);
+      float *dst; int outIdx;
+      if (xOut < q_len) { dst = q_out + yOut * q_len; outIdx = xOut; }
+      else if (xOut < q_len + k_len) { dst = k_out + yOut * k_len; outIdx = xOut - q_len; }
+      else { dst = v_out + yOut * v_len; outIdx = xOut - q_len - k_len; }
       dst[outIdx] = result;
     }
   }
 }
+
 
 static inline void getp_matmul_qkv_fused_bf16(
     float *q, float *k, float *v, float *x, const __hip_bfloat16 *w_qkv_bf16,
@@ -728,23 +725,19 @@ static inline void getp_matmul_qkv_fused_bf16(
 }
 
 __global__ void __launch_bounds__(256)
-    matmul_kernel_nosplit(float *__restrict__ xout, const float *__restrict__ x,
-                          const __hip_bfloat16 *__restrict__ w,
-                          const __hip_bfloat16 *__restrict__ b, int M, int N,
-                          int K) {
+matmul_kernel_nosplit(float *__restrict__ xout, const float *__restrict__ x,
+                      const __hip_bfloat16 *__restrict__ w,
+                      const __hip_bfloat16 *__restrict__ b, int M, int N, int K) {
   constexpr int BLOCK_SIZE = 256;
   constexpr int BM = 32, BN = 32, BK = 32;
   constexpr int WM = 16, WN = 16;
-  constexpr int MFMA_M = 16, MFMA_N = 16, MFMA_K = 4;
-  using mfloat4 =
-      __attribute__((__vector_size__(MFMA_K * sizeof(float)))) float;
 
   const int waveIdx = threadIdx.x / warpSize;
   const int xTile = waveIdx % (BM / WM);
   const int yTile = waveIdx / (BM / WM);
   const int lane = threadIdx.x % warpSize;
-  const int xMF = lane % MFMA_M;
-  const int yMF = lane / MFMA_M;
+  const int xMF = lane % 16;
+  const int yMF = lane / 16;
 
   const int loadX_x = threadIdx.x % (BK / 4);
   const int loadX_y = threadIdx.x / (BK / 4);
@@ -753,58 +746,80 @@ __global__ void __launch_bounds__(256)
   constexpr int strideX = BLOCK_SIZE / (BK / 4);
   constexpr int strideW = BLOCK_SIZE / (BK / 8);
 
-  extern __shared__ float sm[];
-  float *sx = sm;                    // [BK][BM]
-  float *sw = sm + (size_t)BK * BM;  // [BK][BN]
+  extern __shared__ unsigned short sm[];
+  unsigned short *sx = sm;
+  unsigned short *sw = sm + (size_t)BK * BM;
 
-  mfloat4 dmn = {0, 0, 0, 0};
+  f32x4 dmn = {0, 0, 0, 0};
 
   for (int bk = 0; bk < K; bk += BK) {
     for (int off = 0; off < BM; off += strideX) {
       if (loadX_y + off >= BM) break;
       const int kk = bk + 4 * loadX_x;
       const int row = blockIdx.y * BM + loadX_y + off;
-      float4 v =
-          (row < M && kk + 3 < K)
-              ? *reinterpret_cast<const float4 *>(x + (size_t)row * K + kk)
-              : make_float4(0, 0, 0, 0);
-      sx[(4 * loadX_x + 0) * BM + (loadX_y + off)] = v.x;
-      sx[(4 * loadX_x + 1) * BM + (loadX_y + off)] = v.y;
-      sx[(4 * loadX_x + 2) * BM + (loadX_y + off)] = v.z;
-      sx[(4 * loadX_x + 3) * BM + (loadX_y + off)] = v.w;
+      if (row < M) {
+        if (kk + 3 < K) {
+          float4 v = *reinterpret_cast<const float4 *>(x + (size_t)row * K + kk);
+          sx[(4 * loadX_x + 0) * BM + (loadX_y + off)] = f32_to_bf16bits(v.x);
+          sx[(4 * loadX_x + 1) * BM + (loadX_y + off)] = f32_to_bf16bits(v.y);
+          sx[(4 * loadX_x + 2) * BM + (loadX_y + off)] = f32_to_bf16bits(v.z);
+          sx[(4 * loadX_x + 3) * BM + (loadX_y + off)] = f32_to_bf16bits(v.w);
+        } else {
+          for (int t = 0; t < 4; ++t) {
+            int kx = kk + t; unsigned short val = 0;
+            if (kx < K) val = f32_to_bf16bits(x[(size_t)row * K + kx]);
+            sx[(4 * loadX_x + t) * BM + (loadX_y + off)] = val;
+          }
+        }
+      }
     }
     for (int off = 0; off < BN; off += strideW) {
       if (loadW_y + off >= BN) break;
       const int kk = bk + 8 * loadW_x;
       const int col = blockIdx.x * BN + loadW_y + off;
-      uint4 t = (col < N && kk + 7 < K)
-                    ? *reinterpret_cast<const uint4 *>(w + (size_t)col * K + kk)
-                    : make_uint4(0, 0, 0, 0);
-      float *dst = sw + (size_t)(8 * loadW_x) * BN + (loadW_y + off);
-      dst[0 * BN] = bf16bits_to_f32((unsigned short)(t.x & 0xFFFF));
-      dst[1 * BN] = bf16bits_to_f32((unsigned short)(t.x >> 16));
-      dst[2 * BN] = bf16bits_to_f32((unsigned short)(t.y & 0xFFFF));
-      dst[3 * BN] = bf16bits_to_f32((unsigned short)(t.y >> 16));
-      dst[4 * BN] = bf16bits_to_f32((unsigned short)(t.z & 0xFFFF));
-      dst[5 * BN] = bf16bits_to_f32((unsigned short)(t.z >> 16));
-      dst[6 * BN] = bf16bits_to_f32((unsigned short)(t.w & 0xFFFF));
-      dst[7 * BN] = bf16bits_to_f32((unsigned short)(t.w >> 16));
+      unsigned short *dst = sw + (size_t)(8 * loadW_x) * BN + (loadW_y + off);
+      if (col < N) {
+        if (kk + 7 < K) {
+          uint4 t = *reinterpret_cast<const uint4 *>(w + (size_t)col * K + kk);
+          dst[0 * BN] = (unsigned short)(t.x & 0xFFFF);
+          dst[1 * BN] = (unsigned short)(t.x >> 16);
+          dst[2 * BN] = (unsigned short)(t.y & 0xFFFF);
+          dst[3 * BN] = (unsigned short)(t.y >> 16);
+          dst[4 * BN] = (unsigned short)(t.z & 0xFFFF);
+          dst[5 * BN] = (unsigned short)(t.z >> 16);
+          dst[6 * BN] = (unsigned short)(t.w & 0xFFFF);
+          dst[7 * BN] = (unsigned short)(t.w >> 16);
+        } else {
+          for (int t = 0; t < 8; ++t) {
+            int kx = kk + t; unsigned short val = 0;
+            if (kx < K) val = reinterpret_cast<const unsigned short *>(w + (size_t)col * K + kx)[0];
+            dst[t * BN] = val;
+          }
+        }
+      } else {
+        for (int t = 0; t < 8; ++t) dst[t * BN] = 0;
+      }
     }
     __syncthreads();
 
-    for (int k = 0; k < BK; k += MFMA_K) {
-      float amk = sx[(k + yMF) * BM + (yTile * WM + xMF)];
-      float bkn = sw[(k + yMF) * BN + (xTile * WN + xMF)];
-      dmn = __builtin_amdgcn_mfma_f32_16x16x4f32(amk, bkn, dmn, 0, 0, 0);
+    for (int k = 0; k < BK; k += 16) {
+      const int basek = k + yMF * 4;
+      const int row = yTile * WM + xMF;
+      const int col = xTile * WN + xMF;
+      bf16x4 av = {sx[(basek + 0) * BM + row], sx[(basek + 1) * BM + row],
+                   sx[(basek + 2) * BM + row], sx[(basek + 3) * BM + row]};
+      bf16x4 bv = {sw[(basek + 0) * BN + col], sw[(basek + 1) * BN + col],
+                   sw[(basek + 2) * BN + col], sw[(basek + 3) * BN + col]};
+      dmn = __builtin_amdgcn_mfma_f32_16x16x16bf16_1k(av, bv, dmn, 0, 0, 0);
     }
     __syncthreads();
   }
 
+  const int xD = lane % 16;
+  const int yD = 4 * (lane / 16);
   for (int i = 0; i < 4; ++i) {
-    const int xD = lane % MFMA_N;
-    const int yD = MFMA_K * (lane / MFMA_N) + i;
     const int col = blockIdx.x * BN + xTile * WN + xD;
-    const int row = blockIdx.y * BM + yTile * WM + yD;
+    const int row = blockIdx.y * BM + yTile * WM + (yD + i);
     if (row < M && col < N) {
       float v = dmn[i];
       if (b) v += __bfloat162float(b[col]);
@@ -813,23 +828,20 @@ __global__ void __launch_bounds__(256)
   }
 }
 __global__ void __launch_bounds__(256)
-    matmul_kernel_splitk_store(float *__restrict__ partial,
-                               const float *__restrict__ x,
-                               const __hip_bfloat16 *__restrict__ w, int M,
-                               int N, int K, int splits) {
+matmul_kernel_splitk_store(float *__restrict__ partial,
+                           const float *__restrict__ x,
+                           const __hip_bfloat16 *__restrict__ w, int M, int N,
+                           int K, int splits) {
   constexpr int BLOCK_SIZE = 256;
   constexpr int BM = 32, BN = 32, BK = 32;
   constexpr int WM = 16, WN = 16;
-  constexpr int MFMA_M = 16, MFMA_N = 16, MFMA_K = 4;
-  using mfloat4 =
-      __attribute__((__vector_size__(MFMA_K * sizeof(float)))) float;
 
   const int waveIdx = threadIdx.x / warpSize;
   const int xTile = waveIdx % (BM / WM);
   const int yTile = waveIdx / (BM / WM);
-  const int lane = threadIdx.x % warpSize;
-  const int xMF = lane % MFMA_M;
-  const int yMF = lane / MFMA_M;
+  const int lane0 = threadIdx.x % warpSize;
+  const int xMF = lane0 % 16;
+  const int yMF = lane0 / 16;
 
   const int loadX_x = threadIdx.x % (BK / 4);
   const int loadX_y = threadIdx.x / (BK / 4);
@@ -838,11 +850,11 @@ __global__ void __launch_bounds__(256)
   constexpr int strideX = BLOCK_SIZE / (BK / 4);
   constexpr int strideW = BLOCK_SIZE / (BK / 8);
 
-  extern __shared__ float sm[];
-  float *sx = sm;                    // [BK][BM]
-  float *sw = sm + (size_t)BK * BM;  // [BK][BN]
+  extern __shared__ unsigned short sm[];
+  unsigned short *sx = sm;
+  unsigned short *sw = sm + (size_t)BK * BM;
 
-  mfloat4 dmn = {0, 0, 0, 0};
+  f32x4 dmn = {0, 0, 0, 0};
 
   const int split = blockIdx.z;
   const int kChunk = (K + splits - 1) / splits;
@@ -854,55 +866,76 @@ __global__ void __launch_bounds__(256)
       if (loadX_y + off >= BM) break;
       const int kk = bk + 4 * loadX_x;
       const int row = blockIdx.y * BM + loadX_y + off;
-      float4 v =
-          (row < M && kk + 3 < kEnd)
-              ? *reinterpret_cast<const float4 *>(x + (size_t)row * K + kk)
-              : make_float4(0, 0, 0, 0);
-      sx[(4 * loadX_x + 0) * BM + (loadX_y + off)] = v.x;
-      sx[(4 * loadX_x + 1) * BM + (loadX_y + off)] = v.y;
-      sx[(4 * loadX_x + 2) * BM + (loadX_y + off)] = v.z;
-      sx[(4 * loadX_x + 3) * BM + (loadX_y + off)] = v.w;
+      if (row < M) {
+        if (kk + 3 < kEnd) {
+          float4 v = *reinterpret_cast<const float4 *>(x + (size_t)row * K + kk);
+          sx[(4 * loadX_x + 0) * BM + (loadX_y + off)] = f32_to_bf16bits(v.x);
+          sx[(4 * loadX_x + 1) * BM + (loadX_y + off)] = f32_to_bf16bits(v.y);
+          sx[(4 * loadX_x + 2) * BM + (loadX_y + off)] = f32_to_bf16bits(v.z);
+          sx[(4 * loadX_x + 3) * BM + (loadX_y + off)] = f32_to_bf16bits(v.w);
+        } else {
+          for (int t = 0; t < 4; ++t) {
+            int kx = kk + t; unsigned short val = 0;
+            if (kx < kEnd) val = f32_to_bf16bits(x[(size_t)row * K + kx]);
+            sx[(4 * loadX_x + t) * BM + (loadX_y + off)] = val;
+          }
+        }
+      }
     }
     for (int off = 0; off < BN; off += strideW) {
       if (loadW_y + off >= BN) break;
       const int kk = bk + 8 * loadW_x;
       const int col = blockIdx.x * BN + loadW_y + off;
-      uint4 t = (col < N && kk < kEnd)
-                    ? *reinterpret_cast<const uint4 *>(w + (size_t)col * K + kk)
-                    : make_uint4(0, 0, 0, 0);
-      float *dst = sw + (size_t)(8 * loadW_x) * BN + (loadW_y + off);
-      dst[0 * BN] = bf16bits_to_f32((unsigned short)(t.x & 0xFFFF));
-      dst[1 * BN] = bf16bits_to_f32((unsigned short)(t.x >> 16));
-      dst[2 * BN] = bf16bits_to_f32((unsigned short)(t.y & 0xFFFF));
-      dst[3 * BN] = bf16bits_to_f32((unsigned short)(t.y >> 16));
-      dst[4 * BN] = bf16bits_to_f32((unsigned short)(t.z & 0xFFFF));
-      dst[5 * BN] = bf16bits_to_f32((unsigned short)(t.z >> 16));
-      dst[6 * BN] = bf16bits_to_f32((unsigned short)(t.w & 0xFFFF));
-      dst[7 * BN] = bf16bits_to_f32((unsigned short)(t.w >> 16));
+      unsigned short *dst = sw + (size_t)(8 * loadW_x) * BN + (loadW_y + off);
+      if (col < N) {
+        if (kk + 7 < kEnd) {
+          uint4 t = *reinterpret_cast<const uint4 *>(w + (size_t)col * K + kk);
+          dst[0 * BN] = (unsigned short)(t.x & 0xFFFF);
+          dst[1 * BN] = (unsigned short)(t.x >> 16);
+          dst[2 * BN] = (unsigned short)(t.y & 0xFFFF);
+          dst[3 * BN] = (unsigned short)(t.y >> 16);
+          dst[4 * BN] = (unsigned short)(t.z & 0xFFFF);
+          dst[5 * BN] = (unsigned short)(t.z >> 16);
+          dst[6 * BN] = (unsigned short)(t.w & 0xFFFF);
+          dst[7 * BN] = (unsigned short)(t.w >> 16);
+        } else {
+          for (int t = 0; t < 8; ++t) {
+            int kx = kk + t; unsigned short val = 0;
+            if (kx < kEnd) val = reinterpret_cast<const unsigned short *>(w + (size_t)col * K + kx)[0];
+            dst[t * BN] = val;
+          }
+        }
+      } else {
+        for (int t = 0; t < 8; ++t) dst[t * BN] = 0;
+      }
     }
     __syncthreads();
 
-    for (int k = 0; k < BK; k += MFMA_K) {
-      float amk = sx[(k + yMF) * BM + (yTile * WM + xMF)];
-      float bkn = sw[(k + yMF) * BN + (xTile * WN + xMF)];
-      dmn = __builtin_amdgcn_mfma_f32_16x16x4f32(amk, bkn, dmn, 0, 0, 0);
+    for (int k = 0; k < BK; k += 16) {
+      const int basek = k + yMF * 4;
+      const int row = yTile * WM + xMF;
+      const int col = xTile * WN + xMF;
+      bf16x4 av = {sx[(basek + 0) * BM + row], sx[(basek + 1) * BM + row],
+                   sx[(basek + 2) * BM + row], sx[(basek + 3) * BM + row]};
+      bf16x4 bv = {sw[(basek + 0) * BN + col], sw[(basek + 1) * BN + col],
+                   sw[(basek + 2) * BN + col], sw[(basek + 3) * BN + col]};
+      dmn = __builtin_amdgcn_mfma_f32_16x16x16bf16_1k(av, bv, dmn, 0, 0, 0);
     }
     __syncthreads();
   }
 
   const size_t slice_stride = (size_t)M * N;
   const size_t base_out = (size_t)split * slice_stride;
-
+  const int xD = lane0 % 16;
+  const int yD = 4 * (lane0 / 16);
   for (int i = 0; i < 4; ++i) {
-    const int xD = lane % MFMA_N;
-    const int yD = MFMA_K * (lane / MFMA_N) + i;
     const int col = blockIdx.x * BN + xTile * WN + xD;
-    const int row = blockIdx.y * BM + yTile * WM + yD;
-    if (row < M && col < N) {
+    const int row = blockIdx.y * BM + yTile * WM + (yD + i);
+    if (row < M && col < N)
       partial[base_out + (size_t)row * N + col] = dmn[i];
-    }
   }
 }
+
 __global__ void reduce_splitk_with_bias(float *__restrict__ out,
                                         const float *__restrict__ partial,
                                         const __hip_bfloat16 *__restrict__ b,
@@ -916,11 +949,11 @@ __global__ void reduce_splitk_with_bias(float *__restrict__ out,
   if (b) s += __bfloat162float(b[idx % N]);
   out[idx] = s;
 }
+
 template <typename T>
 void getp_matmul(float* xout, float* x, T* w, T* b, int n, int d, int batch_size, hipStream_t stream) {
   PROFILE_FUNCTION();
   const int M = batch_size, N = d, K = n;
-
   constexpr int BM = 32, BN = 32, BK = 32;
   dim3 block(256);
   const int gx = (N + BN - 1) / BN;
@@ -933,20 +966,18 @@ void getp_matmul(float* xout, float* x, T* w, T* b, int n, int d, int batch_size
   if (cu <= 0) cu = 104;
 
   const int target_cta = cu * 4;
-  int splits =
-      (grid_xy >= target_cta) ? 1 : (target_cta + grid_xy - 1) / grid_xy;
+  int splits = (grid_xy >= target_cta) ? 1 : (target_cta + grid_xy - 1) / grid_xy;
   splits = min(8, max(1, splits));
   const int max_splits_by_K = max(1, (K + BK - 1) / BK);
   splits = min(splits, max_splits_by_K);
 
-  const size_t shmem = (size_t)BK * (BM + BN) * sizeof(float);
+  const size_t shmem = (size_t)BK * (BM + BN) * sizeof(unsigned short);
 
   if (splits == 1) {
     dim3 grid(gx, gy);
     matmul_kernel_nosplit<<<grid, block, shmem, stream>>>(
         xout, x, reinterpret_cast<const __hip_bfloat16 *>(w),
         reinterpret_cast<const __hip_bfloat16 *>(b), M, N, K);
-    // HIP_CHECK(hipDeviceSynchronize());
     return;
   }
 
@@ -967,6 +998,7 @@ void getp_matmul(float* xout, float* x, T* w, T* b, int n, int d, int batch_size
   HIP_CHECK(hipFreeAsync(partial, stream));
   // HIP_CHECK(hipDeviceSynchronize());
 }
+
 
 __global__ void compute_inv_freq_kernel(float base, int head_dim,
                                         float scaling_factor,
@@ -1208,6 +1240,133 @@ void getp_vecadd(float *x, float *y, int size, int batch_size, hipStream_t strea
   vecadd_kernel<<<gridDim, blockDim, 0, stream>>>(x, y, size);
   // HIP_CHECK(hipDeviceSynchronize());
 }
+
+
+
+
+__global__ void __launch_bounds__(512) flash_attn_decode_bf16_kernel(
+    float *__restrict__ tb, const __hip_bfloat16 *__restrict__ key_cache,
+    const __hip_bfloat16 *__restrict__ value_cache, const float *__restrict__ q,
+    const float *__restrict__ attn_sinks, int head_dim, int n_attn_heads,
+    int n_kv_heads, int pos, int seq_len, int sliding_window, int apply_mask,
+    int batch_size, int kv_dim, int kv_mul, float inv_sqrt_d, int tile_t,
+    int cache_tcap) {
+  const int kv_h = blockIdx.x;
+  const int b = blockIdx.y;
+  const int warp = threadIdx.y;
+  const int lane = threadIdx.x;
+  const int h = kv_h * kv_mul + warp;
+  if (warp >= kv_mul || h >= n_attn_heads) return;
+
+  extern __shared__ float smem[];
+  float *sK = smem;
+  float *sV = smem + (size_t)tile_t * head_dim;
+
+  const float *qptr = q + (size_t)b * n_attn_heads * head_dim + (size_t)h * head_dim;
+  float qi = (lane < head_dim) ? qptr[lane] : 0.0f;
+
+  float out_i = 0.0f;
+  float m = -INFINITY, l = 0.0f;
+
+  int t_start = 0;
+  if (apply_mask && sliding_window > 0) t_start = MAX(0, pos - sliding_window + 1);
+  const int n_steps = pos - t_start + 1;
+
+  const int vec4 = head_dim >> 2;
+  const int threads = blockDim.x * blockDim.y;
+  const int tid = threadIdx.y * blockDim.x + lane;
+  const int use_ring = (apply_mask && sliding_window > 0);
+
+  for (int base = 0; base < n_steps; base += tile_t) {
+    const int cur = MIN(tile_t, n_steps - base);
+    const int elems_vec = cur * vec4;
+    for (int e4 = tid; e4 < elems_vec; e4 += threads) {
+      int tloc = e4 / vec4;
+      int i4 = (e4 - tloc * vec4) << 2;
+      size_t tindex = use_ring ? (size_t)((t_start + base + tloc) % cache_tcap)
+                               : (size_t)(t_start + base + tloc);
+      const __hip_bfloat16 *kptr = key_cache + tindex * (size_t)batch_size * (size_t)kv_dim +
+                                   (size_t)b * (size_t)kv_dim + (size_t)kv_h * (size_t)head_dim + i4;
+      const __hip_bfloat16 *vptr = value_cache + tindex * (size_t)batch_size * (size_t)kv_dim +
+                                   (size_t)b * (size_t)kv_dim + (size_t)kv_h * (size_t)head_dim + i4;
+
+      uint2 pk = *reinterpret_cast<const uint2 *>(kptr);
+      uint2 pv = *reinterpret_cast<const uint2 *>(vptr);
+      float4 kf = {bf16bits_to_f32((unsigned short)(pk.x & 0xFFFF)),
+                   bf16bits_to_f32((unsigned short)(pk.x >> 16)),
+                   bf16bits_to_f32((unsigned short)(pk.y & 0xFFFF)),
+                   bf16bits_to_f32((unsigned short)(pk.y >> 16))};
+      float4 vf = {bf16bits_to_f32((unsigned short)(pv.x & 0xFFFF)),
+                   bf16bits_to_f32((unsigned short)(pv.x >> 16)),
+                   bf16bits_to_f32((unsigned short)(pv.y & 0xFFFF)),
+                   bf16bits_to_f32((unsigned short)(pv.y >> 16))};
+      reinterpret_cast<float4 *>(sK + (size_t)tloc * head_dim)[i4 >> 2] = kf;
+      reinterpret_cast<float4 *>(sV + (size_t)tloc * head_dim)[i4 >> 2] = vf;
+    }
+    __syncthreads();
+
+    for (int t = 0; t < cur; ++t) {
+      float part = (lane < head_dim) ? (qi * sK[(size_t)t * head_dim + lane]) : 0.0f;
+#pragma unroll
+      for (int off = warpSize >> 1; off > 0; off >>= 1) part += __shfl_down(part, off);
+      float e = 0.0f, alpha = 0.0f;
+      if (lane == 0) {
+        float s = part * inv_sqrt_d;
+        float m_new = fmaxf(m, s);
+        alpha = __expf(m - m_new);
+        e = __expf(s - m_new);
+        l = l * alpha + e;
+        m = m_new;
+      }
+      e = __shfl(e, 0);
+      alpha = __shfl(alpha, 0);
+      if (lane < head_dim) out_i = alpha * out_i + e * sV[(size_t)t * head_dim + lane];
+    }
+    __syncthreads();
+  }
+
+  float alpha_sink = 0.0f, l_final = 0.0f;
+  if (lane == 0) {
+    float s_sink = attn_sinks[h];
+    float m_new = fmaxf(m, s_sink);
+    float alpha = __expf(m - m_new);
+    float e = __expf(s_sink - m_new);
+    l = l * alpha + e;
+    m = m_new;
+    alpha_sink = alpha;
+    l_final = l;
+  }
+  alpha_sink = __shfl(alpha_sink, 0);
+  l_final = __shfl(l_final, 0);
+
+  if (lane < head_dim) {
+    float v = (alpha_sink * out_i) / l_final;
+    float *obh = tb + (size_t)b * n_attn_heads * head_dim + (size_t)h * head_dim;
+    obh[lane] = v;
+  }
+}
+
+static inline void getp_flash_attn_decode_bf16(
+    float *tb, const __hip_bfloat16 *key_cache_layer, const __hip_bfloat16 *value_cache_layer,
+    const float *q, const float *attn_sinks_layer, int head_dim, int n_attn_heads,
+    int n_kv_heads, int pos, int seq_len, int sliding_window, int layer_id,
+    int batch_size, int cache_tcap) {
+  const int kv_dim = head_dim * n_kv_heads;
+  const int kv_mul = n_attn_heads / n_kv_heads;
+  const float invsd = 1.0f / sqrtf((float)head_dim);
+  const int apply_mask = (sliding_window > 0 && ((layer_id & 1) == 0)) ? 1 : 0;
+  const int tsteps = (apply_mask && sliding_window > 0) ? MIN(sliding_window, pos + 1) : (pos + 1);
+  int T = (batch_size >= 80 ? 32 : 64);
+  if (T > tsteps) T = tsteps;
+  dim3 block(64, kv_mul);
+  dim3 grid(n_kv_heads, batch_size);
+  size_t shmem = (size_t)2 * T * head_dim * sizeof(float);
+  flash_attn_decode_bf16_kernel<<<grid, block, shmem>>>(
+      tb, key_cache_layer, value_cache_layer, q, attn_sinks_layer, head_dim,
+      n_attn_heads, n_kv_heads, pos, seq_len, sliding_window, apply_mask,
+      batch_size, kv_dim, kv_mul, invsd, T, cache_tcap);
+}
+
 
 __global__ void __launch_bounds__(512) flash_attn_decode_kernel(
     float *__restrict__ tb, const float *__restrict__ key_cache,

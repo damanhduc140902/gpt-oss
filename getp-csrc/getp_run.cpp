@@ -132,53 +132,25 @@ void coop_getp_generate(Transformer *transformer, Tokenizer *tokenizer,
   sched_setaffinity(0, sizeof(cpu_set_t), &cpuset);
 
   const char *empty_prompt = "";
-  for (int b = 0; b < BATCH_SIZE; ++b) {
-    if (inputs_seq[b] == NULL) {
-      inputs_seq[b] = empty_prompt;
-    }
-  }
+  for (int b = 0; b < B; ++b) if (inputs_seq[b] == NULL) inputs_seq[b] = empty_prompt;
 
-  // encode the (string) prompt into tokens sequence
-  int nums_prompt_tokens[BATCH_SIZE];
-  memset(nums_prompt_tokens, 0, sizeof(int) * BATCH_SIZE);
-  int *prompts_tokens[BATCH_SIZE];
-  for (int b = 0; b < BATCH_SIZE; ++b) {
-    prompts_tokens[b] = (int *)malloc((strlen(inputs_seq[b]) + 3) *
-                                      sizeof(int)); // +3 for '\0', ?BOS, ?EOS 
+  std::vector<int> nums_prompt_tokens(B, 0);
+  std::vector<int*> prompts_tokens(B);
+  for (int b = 0; b < B; ++b) {
+    prompts_tokens[b] = (int *)malloc((strlen(inputs_seq[b]) + 3) * sizeof(int));
   }
-
-  for (int b = 0; b < BATCH_SIZE; ++b) {
+  for (int b = 0; b < B; ++b) {
     encode(tokenizer, inputs_seq[b], -1, -1, prompts_tokens[b], &nums_prompt_tokens[b],
-           transformer->config.initial_context_length);  
-    if (nums_prompt_tokens[b] < 1) {
-      fprintf(stderr, "something is wrong, expected at least 1 prompt token\n");
-      exit(EXIT_FAILURE);
-    }
+           transformer->config.initial_context_length);
+    if (nums_prompt_tokens[b] < 1) { fprintf(stderr, "bad prompt\n"); exit(EXIT_FAILURE); }
   }
 
-  // start the main loop
-  int next[BATCH_SIZE];  // will store the next token in the sequence
-  int token[BATCH_SIZE]; // kick off with the first token in the prompt
-  int pos = 0;           // position in the sequence
-  int epos[BATCH_SIZE];  // position where the sequence of each batch ends
-  int mask[BATCH_SIZE];  // store running state of each batch (0 - done, 1 - otherwise)
-  for (int b = 0; b < BATCH_SIZE; ++b) {
-    token[b] = prompts_tokens[b][0];
-    epos[b] = -1;
-    mask[b] = 1;
-  }
-
-  // print the very first token
-  // should be removed
-  // const char *first_piece = decode_piece(tokenizer, 200006, token);
-  // safe_printf(first_piece);
-  // fflush(stdout);
+  std::vector<int> next(B), token(B), epos(B, -1), mask(B, 1);
+  int pos = 0;
+  for (int b = 0; b < B; ++b) token[b] = prompts_tokens[b][0];
 
   Config *p = &transformer->config;
-  if (!p) {
-    fprintf(stderr, "something is wrong, Config does not exist\n");
-    exit(EXIT_FAILURE);
-  }
+  if (!p) { fprintf(stderr, "Config missing\n"); exit(EXIT_FAILURE); }
 
   while (pos + 1 < steps) {
 
@@ -188,27 +160,17 @@ void coop_getp_generate(Transformer *transformer, Tokenizer *tokenizer,
       sync_point, thread_idx, 
       token, pos);
 
-    // advance the state machine
     pos++;
-    for (int b = 0; b < BATCH_SIZE; ++b) {
+    for (int b = 0; b < B; ++b) {
       if (!mask[b]) continue;
       epos[b] = pos;
-      if (pos < nums_prompt_tokens[b]) {
-        next[b] = prompts_tokens[b][pos];
-      } else {
-        next[b] = next_gpu[b];
-        outputs_tokens[b][pos - nums_prompt_tokens[b]] = next[b];
-      }
+      if (pos < nums_prompt_tokens[b]) next[b] = prompts_tokens[b][pos];
+      else { next[b] = next_gpu[b]; outputs_tokens[b][pos - nums_prompt_tokens[b]] = next[b]; }
     }
-    
 
-    // data-dependent terminating condition: the EOS (=199999 or =200002) token
-    // delimits sequences
-    for (int b = 0; b < BATCH_SIZE; ++b) {
+    for (int b = 0; b < B; ++b) {
       if (!mask[b]) continue;
-      if (next[b] == 199999 || next[b] == 200002) {
-        mask[b] = 0;
-      }
+      if (next[b] == 199999 || next[b] == 200002) mask[b] = 0;
     }
     if (thread_states[thread_idx] && is_all_zero(mask, BATCH_SIZE)) {
       thread_states[thread_idx] = 0;
@@ -224,28 +186,15 @@ void coop_getp_generate(Transformer *transformer, Tokenizer *tokenizer,
     // safe_printf(piece); // same as printf("%s", piece), but skips "unsafe" bytes
     // fflush(stdout);
 
-    for (int b = 0; b < BATCH_SIZE; ++b) {
-      token[b] = next[b];
-    }
-
+    for (int b = 0; b < B; ++b) token[b] = next[b];
     free(next_gpu);
   }
 
-  // should be removed
-  // printf("\n");
-
-  // Marker for end of sequence
-  for (int b = 0; b < BATCH_SIZE; ++b) {
-    if (epos[b] == -1) {
-      fprintf(stderr, "something is wrong, epos can not recieve value -1\n");
-      exit(EXIT_FAILURE);
-    }
+  for (int b = 0; b < B; ++b) {
+    if (epos[b] == -1) { fprintf(stderr, "bad epos\n"); exit(EXIT_FAILURE); }
     outputs_tokens[b][epos[b] - nums_prompt_tokens[b] + 1] = -1;
   }
-
-  for (int b = 0; b < BATCH_SIZE; ++b) {
-    free(prompts_tokens[b]);
-  }
+  for (int b = 0; b < B; ++b) free(prompts_tokens[b]);
   HIP_CHECK(hipDeviceSynchronize());
 
   long long acc = 0;
@@ -313,6 +262,7 @@ void distribute_requests(Transformer *transformer,
 
   *num_token_out_ptr = acc_token_out;
 }
+
 
 long long inference(Transformer *transformer, Tokenizer *tokenizer,
                     Sampler *sampler, Requests *requests) {
