@@ -24,7 +24,7 @@
 #endif
 
 #ifndef GETP_BN_AGG
-#define GETP_BN_AGG 4
+#define GETP_BN_AGG 2
 #endif
 
 extern CollectiveGroup g_world;
@@ -212,12 +212,53 @@ static inline int build_moe_buckets_local_pos(const int *local_ids,
   return cap_pairs;
 }
 
-__global__ void __launch_bounds__(256) mlp1_swiglu_bf16_bucketed_kernel(
-    float *__restrict__ gate_up_all, const float *__restrict__ x,
+__device__ inline uint4 pack8_f32_to_bf16(float4 a, float4 b) {
+  uint4 u;
+  u.x = (unsigned)f32_to_bf16bits(a.x) | ((unsigned)f32_to_bf16bits(a.y) << 16);
+  u.y = (unsigned)f32_to_bf16bits(a.z) | ((unsigned)f32_to_bf16bits(a.w) << 16);
+  u.z = (unsigned)f32_to_bf16bits(b.x) | ((unsigned)f32_to_bf16bits(b.y) << 16);
+  u.w = (unsigned)f32_to_bf16bits(b.z) | ((unsigned)f32_to_bf16bits(b.w) << 16);
+  return u;
+}
+
+__global__ void moe_scatter_acts_to_expert_bf16_kernel(__hip_bfloat16 *a_in,
+                                                       const float *x,
+                                                       const int *tok_idx,
+                                                       int total_pairs, int H) {
+  int pos = blockIdx.x;
+  if (pos >= total_pairs) return;
+  int b = tok_idx[pos];
+  const float *__restrict__ src = x + (size_t)b * H;
+  __hip_bfloat16 *__restrict__ dst = a_in + (size_t)pos * H;
+
+  int t = threadIdx.x;
+  int step8 = blockDim.x * 8;
+  int H8 = H & ~7;
+  for (int kk8 = t * 8; kk8 < H8; kk8 += step8) {
+    const float4 *p4 = reinterpret_cast<const float4 *>(src + kk8);
+    float4 a = p4[0], b4 = p4[1];
+    uint4 u = pack8_f32_to_bf16(a, b4);
+    reinterpret_cast<uint4 *>(dst)[kk8 >> 3] = u;
+  }
+  for (int kk = H8 + t; kk < H; kk += blockDim.x)
+    reinterpret_cast<unsigned short *>(dst)[kk] = f32_to_bf16bits(src[kk]);
+}
+
+static inline void moe_scatter_acts_to_expert_bf16(__hip_bfloat16 *a_in,
+                                                   const float *x,
+                                                   const int *tok_idx,
+                                                   int total_pairs, int H) {
+  dim3 block(256), grid(total_pairs);
+  moe_scatter_acts_to_expert_bf16_kernel<<<grid, block>>>(a_in, x, tok_idx,
+                                                          total_pairs, H);
+}
+
+__global__ void __launch_bounds__(256) mlp1_swiglu_bf16_bucketed_kernel_outbf16(
+    __hip_bfloat16 *__restrict__ gate_up_bf16,
+    const __hip_bfloat16 *__restrict__ A_in,
     const __hip_bfloat16 *__restrict__ W1,
     const __hip_bfloat16 *__restrict__ B1, const int *__restrict__ offsets,
-    const int *__restrict__ tok_idx, int H, int I, int E, int cap_pairs,
-    float swiglu_limit) {
+    int H, int I, int E, int cap_pairs, float swiglu_limit) {
   constexpr int BM = 32, BN = 32, BK = 32, WM = 16, WN = 16;
   const int BNt = BN * GETP_BN_AGG;
 
@@ -230,8 +271,7 @@ __global__ void __launch_bounds__(256) mlp1_swiglu_bf16_bucketed_kernel(
 
   const int e = blockIdx.y % E;
   const int blk = blockIdx.y / E;
-  const int s = offsets[e];
-  const int t = offsets[e + 1];
+  const int s = offsets[e], t = offsets[e + 1];
   const int n = t - s;
   const int base_all = blk * BM;
   const int base = s + base_all;
@@ -261,42 +301,34 @@ __global__ void __launch_bounds__(256) mlp1_swiglu_bf16_bucketed_kernel(
   const int colBase = blockIdx.x * BNt;
 
   for (int bk = 0; bk < H; bk += BK) {
-    // Load X (bucketed by tok_idx)
     for (int off = 0; off < BM; off += strideX) {
       if (loadX_y + off >= BM) break;
       const int kk = bk + 4 * loadX_x;
       const int r = loadX_y + off;
       const int pos = base + r;
       if (r < tcnt) {
+        const __hip_bfloat16 *p = A_in + (size_t)pos * H + kk;
         if (kk + 3 < H) {
-          const int b = tok_idx[pos];
-          float4 v = *reinterpret_cast<const float4 *>(x + (size_t)b * H + kk);
-          sx[(4 * loadX_x + 0) * BM + r] = f32_to_bf16bits(v.x);
-          sx[(4 * loadX_x + 1) * BM + r] = f32_to_bf16bits(v.y);
-          sx[(4 * loadX_x + 2) * BM + r] = f32_to_bf16bits(v.z);
-          sx[(4 * loadX_x + 3) * BM + r] = f32_to_bf16bits(v.w);
+          uint2 v = *reinterpret_cast<const uint2 *>(p);
+          sx[(4 * loadX_x + 0) * BM + r] = (unsigned short)(v.x & 0xFFFF);
+          sx[(4 * loadX_x + 1) * BM + r] = (unsigned short)(v.x >> 16);
+          sx[(4 * loadX_x + 2) * BM + r] = (unsigned short)(v.y & 0xFFFF);
+          sx[(4 * loadX_x + 3) * BM + r] = (unsigned short)(v.y >> 16);
         } else {
-          const int b = tok_idx[pos];
-          const float *p = x + (size_t)b * H + kk;
-          sx[(4 * loadX_x + 0) * BM + r] =
-              (kk + 0 < H) ? f32_to_bf16bits(p[0]) : 0;
-          sx[(4 * loadX_x + 1) * BM + r] =
-              (kk + 1 < H) ? f32_to_bf16bits(p[1]) : 0;
-          sx[(4 * loadX_x + 2) * BM + r] =
-              (kk + 2 < H) ? f32_to_bf16bits(p[2]) : 0;
-          sx[(4 * loadX_x + 3) * BM + r] =
-              (kk + 3 < H) ? f32_to_bf16bits(p[3]) : 0;
+          const unsigned short *q = reinterpret_cast<const unsigned short *>(p);
+          sx[(4 * loadX_x + 0) * BM + r] = (kk + 0 < H) ? q[0] : 0;
+          sx[(4 * loadX_x + 1) * BM + r] = (kk + 1 < H) ? q[1] : 0;
+          sx[(4 * loadX_x + 2) * BM + r] = (kk + 2 < H) ? q[2] : 0;
+          sx[(4 * loadX_x + 3) * BM + r] = (kk + 3 < H) ? q[3] : 0;
         }
       }
     }
-    // Load W (gate & up) with BN aggregation
     for (int off = 0; off < BNt; off += strideW) {
       if (loadW_y + off >= BNt) break;
       const int kk = bk + 8 * loadW_x;
       const int col = colBase + loadW_y + off;
 
-      uint4 wg = make_uint4(0, 0, 0, 0);
-      uint4 wu = make_uint4(0, 0, 0, 0);
+      uint4 wg = make_uint4(0, 0, 0, 0), wu = make_uint4(0, 0, 0, 0);
       if (col < I) {
         if (kk + 7 < H) {
           wg = *reinterpret_cast<const uint4 *>(W1 + w1_e +
@@ -374,7 +406,6 @@ __global__ void __launch_bounds__(256) mlp1_swiglu_bf16_bucketed_kernel(
     }
     __syncthreads();
 
-    // MFMA: 4-way BN aggregation for gate & up
     for (int k = 0; k < BK; k += 16) {
       const int basek = k + yMF * 4;
       const int row = yTile * WM + xMF;
@@ -382,7 +413,6 @@ __global__ void __launch_bounds__(256) mlp1_swiglu_bf16_bucketed_kernel(
 
       bf16x4 av = {sx[(basek + 0) * BM + row], sx[(basek + 1) * BM + row],
                    sx[(basek + 2) * BM + row], sx[(basek + 3) * BM + row]};
-
       bf16x4 g0 = {swg[(basek + 0) * BNt + c + 0 * BN],
                    swg[(basek + 1) * BNt + c + 0 * BN],
                    swg[(basek + 2) * BNt + c + 0 * BN],
@@ -399,7 +429,6 @@ __global__ void __launch_bounds__(256) mlp1_swiglu_bf16_bucketed_kernel(
                    swg[(basek + 1) * BNt + c + 3 * BN],
                    swg[(basek + 2) * BNt + c + 3 * BN],
                    swg[(basek + 3) * BNt + c + 3 * BN]};
-
       bf16x4 u0 = {swu[(basek + 0) * BNt + c + 0 * BN],
                    swu[(basek + 1) * BNt + c + 0 * BN],
                    swu[(basek + 2) * BNt + c + 0 * BN],
@@ -421,7 +450,6 @@ __global__ void __launch_bounds__(256) mlp1_swiglu_bf16_bucketed_kernel(
       dg1 = __builtin_amdgcn_mfma_f32_16x16x16bf16_1k(av, g1, dg1, 0, 0, 0);
       dg2 = __builtin_amdgcn_mfma_f32_16x16x16bf16_1k(av, g2, dg2, 0, 0, 0);
       dg3 = __builtin_amdgcn_mfma_f32_16x16x16bf16_1k(av, g3, dg3, 0, 0, 0);
-
       du0 = __builtin_amdgcn_mfma_f32_16x16x16bf16_1k(av, u0, du0, 0, 0, 0);
       du1 = __builtin_amdgcn_mfma_f32_16x16x16bf16_1k(av, u1, du1, 0, 0, 0);
       du2 = __builtin_amdgcn_mfma_f32_16x16x16bf16_1k(av, u2, du2, 0, 0, 0);
@@ -439,16 +467,19 @@ __global__ void __launch_bounds__(256) mlp1_swiglu_bf16_bucketed_kernel(
 
     auto store_group = [&](int col, float gval, float uval) {
       if (col >= I) return;
-      float bg = B1 ? __bfloat162float(B1[b1_e + (size_t)(2 * col + 0)]) : 0.f;
-      float bu = B1 ? __bfloat162float(B1[b1_e + (size_t)(2 * col + 1)]) : 0.f;
-      float g = gval + bg;
-      float u = uval + bu;
+      const float bg =
+          B1 ? __bfloat162float(B1[b1_e + (size_t)(2 * col + 0)]) : 0.f;
+      const float bu =
+          B1 ? __bfloat162float(B1[b1_e + (size_t)(2 * col + 1)]) : 0.f;
+      float g = gval + bg, u = uval + bu;
       if (g > swiglu_limit) g = swiglu_limit;
       if (u > swiglu_limit) u = swiglu_limit;
       if (u < -swiglu_limit) u = -swiglu_limit;
       const float a = 1.702f;
       float s = 1.f / (1.f + __expf(-a * g));
-      gate_up_all[(size_t)pos * (size_t)I + col] = (g * s) * (u + 1.f);
+      float out = (g * s) * (u + 1.f);
+      reinterpret_cast<unsigned short *>(gate_up_bf16)[(size_t)pos * I + col] =
+          f32_to_bf16bits(out);
     };
 
     const int c0 = colBase + xTile * WN + xD + 0 * BN;
@@ -462,30 +493,33 @@ __global__ void __launch_bounds__(256) mlp1_swiglu_bf16_bucketed_kernel(
   }
 }
 
-static inline void launch_mlp1_swiglu_bf16_bucketed(
-    float *gate_up_all, const float *x, const __hip_bfloat16 *w1_layer,
-    const __hip_bfloat16 *b1_layer, const int *offsets, const int *tok_idx,
-    int H, int I, int E, int cap_pairs, float swiglu_limit) {
+static inline void launch_mlp1_swiglu_bf16_bucketed_outbf16(
+    __hip_bfloat16 *gate_up_bf16, const __hip_bfloat16 *a_in,
+    const __hip_bfloat16 *w1_layer, const __hip_bfloat16 *b1_layer,
+    const int *offsets, int H, int I, int E, int cap_pairs,
+    float swiglu_limit) {
   PROFILE_FUNCTION();
   constexpr int BM = 32, BN = 32, BK = 32;
   const int BNt = BN * GETP_BN_AGG;
   dim3 block(256);
   int by = (cap_pairs + BM - 1) / BM;
   dim3 grid((I + BNt - 1) / BNt, E * by);
-  const size_t shmem = (size_t)BK * ((size_t)BM + (size_t)BNt + (size_t)BNt) *
-                       sizeof(unsigned short);
-  mlp1_swiglu_bf16_bucketed_kernel<<<grid, block, shmem>>>(
-      gate_up_all, x, w1_layer, b1_layer, offsets, tok_idx, H, I, E, cap_pairs,
+  size_t shmem = (size_t)BK * ((size_t)BM + (size_t)BNt + (size_t)BNt) *
+                 sizeof(unsigned short);
+  mlp1_swiglu_bf16_bucketed_kernel_outbf16<<<grid, block, shmem>>>(
+      gate_up_bf16, a_in, w1_layer, b1_layer, offsets, H, I, E, cap_pairs,
       swiglu_limit);
 }
 
-__global__ void __launch_bounds__(256) mlp2_partial_bf16_bucketed_splitk_kernel(
-    float *__restrict__ z_partial, const float *__restrict__ gate_up_all,
-    const __hip_bfloat16 *__restrict__ W2,
-    const __hip_bfloat16 *__restrict__ B2,
-    const float *__restrict__ w_by_bucket, const int *__restrict__ offsets,
-    const int *__restrict__ tok_idx, int I, int H, int E, int cap_pairs,
-    int splits) {
+__global__ void __launch_bounds__(256)
+    mlp2_partial_bf16_bucketed_splitk_kernel_inbf16(
+        float *__restrict__ z_partial,
+        const __hip_bfloat16 *__restrict__ gate_up_bf16,
+        const __hip_bfloat16 *__restrict__ W2,
+        const __hip_bfloat16 *__restrict__ B2,
+        const float *__restrict__ w_by_bucket, const int *__restrict__ offsets,
+        const int *__restrict__ tok_idx, int I, int H, int E, int cap_pairs,
+        int splits) {
   constexpr int BM = 32, BN = 32, BK = 32, WM = 16, WN = 16;
   const int BNt = BN * GETP_BN_AGG;
 
@@ -496,14 +530,13 @@ __global__ void __launch_bounds__(256) mlp2_partial_bf16_bucketed_splitk_kernel(
   const int xMF = lane & 15;
   const int yMF = lane >> 4;
 
-  extern __shared__ unsigned char smem_raw[];
-  unsigned short *sx = reinterpret_cast<unsigned short *>(smem_raw);
+  extern __shared__ unsigned short smem_raw_mlp2[];
+  unsigned short *sx = smem_raw_mlp2;
   unsigned short *sw = sx + (size_t)BK * BM;
 
   const int e = blockIdx.y % E;
   const int blk = blockIdx.y / E;
-  const int s = offsets[e];
-  const int t = offsets[e + 1];
+  const int s = offsets[e], t = offsets[e + 1];
   const int n = t - s;
   const int base_all = blk * BM;
   const int base = s + base_all;
@@ -531,34 +564,29 @@ __global__ void __launch_bounds__(256) mlp2_partial_bf16_bucketed_splitk_kernel(
   const int colBase = blockIdx.x * BNt;
 
   for (int bk = kBeg; bk < kEnd; bk += BK) {
-    // Load X (gate_up_all)
     for (int off = 0; off < BM; off += strideX) {
       if (loadX_y + off >= BM) break;
       const int kk = bk + 4 * loadX_x;
       const int r = loadX_y + off;
       const int pos = base + r;
       if (r < tcnt) {
+        const __hip_bfloat16 *src = gate_up_bf16 + (size_t)pos * (size_t)I + kk;
         if (kk + 3 < kEnd) {
-          float4 v = *reinterpret_cast<const float4 *>(
-              gate_up_all + (size_t)pos * (size_t)I + kk);
-          sx[(4 * loadX_x + 0) * BM + r] = f32_to_bf16bits(v.x);
-          sx[(4 * loadX_x + 1) * BM + r] = f32_to_bf16bits(v.y);
-          sx[(4 * loadX_x + 2) * BM + r] = f32_to_bf16bits(v.z);
-          sx[(4 * loadX_x + 3) * BM + r] = f32_to_bf16bits(v.w);
+          uint2 v = *reinterpret_cast<const uint2 *>(src);
+          sx[(4 * loadX_x + 0) * BM + r] = (unsigned short)(v.x & 0xFFFF);
+          sx[(4 * loadX_x + 1) * BM + r] = (unsigned short)(v.x >> 16);
+          sx[(4 * loadX_x + 2) * BM + r] = (unsigned short)(v.y & 0xFFFF);
+          sx[(4 * loadX_x + 3) * BM + r] = (unsigned short)(v.y >> 16);
         } else {
-          const float *p = gate_up_all + (size_t)pos * (size_t)I + kk;
-          sx[(4 * loadX_x + 0) * BM + r] =
-              (kk + 0 < kEnd) ? f32_to_bf16bits(p[0]) : 0;
-          sx[(4 * loadX_x + 1) * BM + r] =
-              (kk + 1 < kEnd) ? f32_to_bf16bits(p[1]) : 0;
-          sx[(4 * loadX_x + 2) * BM + r] =
-              (kk + 2 < kEnd) ? f32_to_bf16bits(p[2]) : 0;
-          sx[(4 * loadX_x + 3) * BM + r] =
-              (kk + 3 < kEnd) ? f32_to_bf16bits(p[3]) : 0;
+          const unsigned short *q =
+              reinterpret_cast<const unsigned short *>(src);
+          sx[(4 * loadX_x + 0) * BM + r] = (kk + 0 < kEnd) ? q[0] : 0;
+          sx[(4 * loadX_x + 1) * BM + r] = (kk + 1 < kEnd) ? q[1] : 0;
+          sx[(4 * loadX_x + 2) * BM + r] = (kk + 2 < kEnd) ? q[2] : 0;
+          sx[(4 * loadX_x + 3) * BM + r] = (kk + 3 < kEnd) ? q[3] : 0;
         }
       }
     }
-    // Load W2 aggregated by BNt
     for (int off = 0; off < BNt; off += strideW) {
       if (loadW_y + off >= BNt) break;
       const int kk = bk + 8 * loadW_x;
@@ -608,7 +636,6 @@ __global__ void __launch_bounds__(256) mlp2_partial_bf16_bucketed_splitk_kernel(
     }
     __syncthreads();
 
-    // MFMA with 4 BN groups
     for (int k = 0; k < BK; k += 16) {
       const int basek = k + yMF * 4;
       const int row = yTile * WM + xMF;
@@ -616,7 +643,6 @@ __global__ void __launch_bounds__(256) mlp2_partial_bf16_bucketed_splitk_kernel(
 
       bf16x4 av = {sx[(basek + 0) * BM + row], sx[(basek + 1) * BM + row],
                    sx[(basek + 2) * BM + row], sx[(basek + 3) * BM + row]};
-
       bf16x4 b0 = {sw[(basek + 0) * BNt + c + 0 * BN],
                    sw[(basek + 1) * BNt + c + 0 * BN],
                    sw[(basek + 2) * BNt + c + 0 * BN],
@@ -654,9 +680,9 @@ __global__ void __launch_bounds__(256) mlp2_partial_bf16_bucketed_splitk_kernel(
       if (col >= H) return;
       const float bia = B2 ? __bfloat162float(B2[b2_e + col]) : 0.f;
       float *dst = z_partial + (size_t)pos * (size_t)H + col;
-      if (splits == 1) {
+      if (splits == 1)
         *dst = (val + bia) * w;
-      } else {
+      else {
         atomicAdd(dst, val * w);
         if (blockIdx.z == 0) atomicAdd(dst, bia * w);
       }
@@ -673,13 +699,12 @@ __global__ void __launch_bounds__(256) mlp2_partial_bf16_bucketed_splitk_kernel(
   }
 }
 
-static inline void launch_mlp2_partial_bf16_bucketed_mfma(
-    float *z_partial, const float *gate_up_all, const __hip_bfloat16 *w2_layer,
-    const __hip_bfloat16 *b2_layer, const float *w_by_bucket,
-    const int *offsets, const int *tok_idx, int I, int H, int E,
-    int cap_pairs) {
+static inline void launch_mlp2_partial_bf16_bucketed_frombf16(
+    float *z_partial, const __hip_bfloat16 *gate_up_bf16,
+    const __hip_bfloat16 *w2_layer, const __hip_bfloat16 *b2_layer,
+    const float *w_by_bucket, const int *offsets, const int *tok_idx, int I,
+    int H, int E, int cap_pairs) {
   PROFILE_FUNCTION();
-
   constexpr int BN = 32, BM = 32, BK = 32;
   const int BNt = BN * GETP_BN_AGG;
 
@@ -710,11 +735,12 @@ static inline void launch_mlp2_partial_bf16_bucketed_mfma(
 
   dim3 block(256);
   dim3 grid(gx, gy, splits);
-  const size_t shmem =
+  size_t shmem =
       (size_t)BK * ((size_t)BM + (size_t)BNt) * sizeof(unsigned short);
-  mlp2_partial_bf16_bucketed_splitk_kernel<<<grid, block, shmem>>>(
-      z_partial, gate_up_all, w2_layer, b2_layer, w_by_bucket, offsets, tok_idx,
-      I, H, E, cap_pairs, splits);
+
+  mlp2_partial_bf16_bucketed_splitk_kernel_inbf16<<<grid, block, shmem>>>(
+      z_partial, gate_up_bf16, w2_layer, b2_layer, w_by_bucket, offsets,
+      tok_idx, I, H, E, cap_pairs, splits);
 }
 
 __global__ void moe_gather_pairs_kernel(float *__restrict__ e_agg,
@@ -912,6 +938,7 @@ static inline void getp_matmul_qkv_fused_bf16(
     float *q, float *k, float *v, float *x, const __hip_bfloat16 *w_qkv_bf16,
     const __hip_bfloat16 *b_qkv_bf16, int n, int head_dim, int n_attn_heads,
     int n_kv_heads, int batch_size) {
+  PROFILE_FUNCTION();
   const int q_len = head_dim * n_attn_heads;
   const int k_len = head_dim * n_kv_heads;
   const int v_len = head_dim * n_kv_heads;
@@ -927,6 +954,7 @@ static inline void getp_matmul_qkv_fused_bf16(
 
   matmul_qkv_fused_kernel<<<grid, block, shmem>>>(
       q, k, v, x, w_qkv_bf16, b_qkv_bf16, n, q_len, k_len, v_len, batch_size);
+  // HIP_CHECK(hipDeviceSynchronize());
 }
 
 __global__ void __launch_bounds__(256)
@@ -1298,6 +1326,7 @@ void getp_matmul(float *xout, float *x, T *w, T *b, int n, int d,
     matmul_kernel_nosplit<<<grid, block, shmem>>>(
         xout, x, reinterpret_cast<const __hip_bfloat16 *>(w),
         reinterpret_cast<const __hip_bfloat16 *>(b), M, N, K);
+    // HIP_CHECK(hipDeviceSynchronize());
     return;
   }
 
@@ -1316,6 +1345,7 @@ void getp_matmul(float *xout, float *x, T *w, T *b, int n, int d,
       xout, partial, reinterpret_cast<const __hip_bfloat16 *>(b), M, N, splits);
 
   HIP_CHECK(hipFree(partial));
+  // HIP_CHECK(hipDeviceSynchronize());
 }
 
 __global__ void compute_inv_freq_kernel(float base, int head_dim,
@@ -1571,60 +1601,72 @@ __global__ void __launch_bounds__(512) flash_attn_decode_bf16_kernel(
   const int h = kv_h * kv_mul + warp;
   if (warp >= kv_mul || h >= n_attn_heads) return;
 
-  extern __shared__ float smem[];
-  float *sK = smem;
-  float *sV = smem + (size_t)tile_t * head_dim;
+  extern __shared__ unsigned short smem_flash[];
+  unsigned short *sK0 = smem_flash;
+  unsigned short *sV0 = sK0 + (size_t)tile_t * head_dim;
+  unsigned short *sK1 = sV0 + (size_t)tile_t * head_dim;
+  unsigned short *sV1 = sK1 + (size_t)tile_t * head_dim;
 
   const float *qptr =
       q + (size_t)b * n_attn_heads * head_dim + (size_t)h * head_dim;
   float qi = (lane < head_dim) ? qptr[lane] : 0.0f;
 
-  float out_i = 0.0f;
-  float m = -INFINITY, l = 0.0f;
+  float out_i = 0.0f, m = -INFINITY, l = 0.0f;
 
   int t_start = 0;
   if (apply_mask && sliding_window > 0)
     t_start = MAX(0, pos - sliding_window + 1);
   const int n_steps = pos - t_start + 1;
 
-  const int vec4 = head_dim >> 2;
+  const int vec8 = head_dim >> 3;
   const int threads = blockDim.x * blockDim.y;
   const int tid = threadIdx.y * blockDim.x + lane;
   const int use_ring = (apply_mask && sliding_window > 0);
 
-  for (int base = 0; base < n_steps; base += tile_t) {
-    const int cur = MIN(tile_t, n_steps - base);
-    const int elems_vec = cur * vec4;
-    for (int e4 = tid; e4 < elems_vec; e4 += threads) {
-      int tloc = e4 / vec4;
-      int i4 = (e4 - tloc * vec4) << 2;
-      size_t tindex = use_ring ? (size_t)((t_start + base + tloc) % cache_tcap)
-                               : (size_t)(t_start + base + tloc);
+  auto prefetch = [&](int base_t, int cur_t, unsigned short *dK,
+                      unsigned short *dV) {
+    const int elems = cur_t * vec8;
+    for (int e8 = tid; e8 < elems; e8 += threads) {
+      int tloc = e8 / vec8;
+      int i8 = (e8 - tloc * vec8) << 3;
+      size_t tindex = use_ring
+                          ? (size_t)((t_start + base_t + tloc) % cache_tcap)
+                          : (size_t)(t_start + base_t + tloc);
       const __hip_bfloat16 *kptr =
           key_cache + tindex * (size_t)batch_size * (size_t)kv_dim +
-          (size_t)b * (size_t)kv_dim + (size_t)kv_h * (size_t)head_dim + i4;
+          (size_t)b * (size_t)kv_dim + (size_t)kv_h * (size_t)head_dim + i8;
       const __hip_bfloat16 *vptr =
           value_cache + tindex * (size_t)batch_size * (size_t)kv_dim +
-          (size_t)b * (size_t)kv_dim + (size_t)kv_h * (size_t)head_dim + i4;
-
-      uint2 pk = *reinterpret_cast<const uint2 *>(kptr);
-      uint2 pv = *reinterpret_cast<const uint2 *>(vptr);
-      float4 kf = {bf16bits_to_f32((unsigned short)(pk.x & 0xFFFF)),
-                   bf16bits_to_f32((unsigned short)(pk.x >> 16)),
-                   bf16bits_to_f32((unsigned short)(pk.y & 0xFFFF)),
-                   bf16bits_to_f32((unsigned short)(pk.y >> 16))};
-      float4 vf = {bf16bits_to_f32((unsigned short)(pv.x & 0xFFFF)),
-                   bf16bits_to_f32((unsigned short)(pv.x >> 16)),
-                   bf16bits_to_f32((unsigned short)(pv.y & 0xFFFF)),
-                   bf16bits_to_f32((unsigned short)(pv.y >> 16))};
-      reinterpret_cast<float4 *>(sK + (size_t)tloc * head_dim)[i4 >> 2] = kf;
-      reinterpret_cast<float4 *>(sV + (size_t)tloc * head_dim)[i4 >> 2] = vf;
+          (size_t)b * (size_t)kv_dim + (size_t)kv_h * (size_t)head_dim + i8;
+      uint4 k8 = *reinterpret_cast<const uint4 *>(kptr);
+      uint4 v8 = *reinterpret_cast<const uint4 *>(vptr);
+      reinterpret_cast<uint4 *>(dK + (size_t)tloc * head_dim)[i8 >> 3] = k8;
+      reinterpret_cast<uint4 *>(dV + (size_t)tloc * head_dim)[i8 >> 3] = v8;
     }
-    __syncthreads();
+  };
+
+  int base = 0;
+  int cur = MIN(tile_t, n_steps);
+  if (cur > 0) prefetch(0, cur, sK0, sV0);
+  __syncthreads();
+
+  bool ping = true;
+  while (true) {
+    unsigned short *sK = ping ? sK0 : sK1;
+    unsigned short *sV = ping ? sV0 : sV1;
+
+    int nxt = base + cur;
+    int nxt_cur = (nxt < n_steps) ? MIN(tile_t, n_steps - nxt) : 0;
+    if (nxt_cur > 0) {
+      unsigned short *nK = ping ? sK1 : sK0;
+      unsigned short *nV = ping ? sV1 : sV0;
+      prefetch(nxt, nxt_cur, nK, nV);
+    }
 
     for (int t = 0; t < cur; ++t) {
-      float part =
-          (lane < head_dim) ? (qi * sK[(size_t)t * head_dim + lane]) : 0.0f;
+      float part = (lane < head_dim)
+                       ? (qi * bf16bits_to_f32(sK[(size_t)t * head_dim + lane]))
+                       : 0.0f;
 #pragma unroll
       for (int off = warpSize >> 1; off > 0; off >>= 1)
         part += __shfl_down(part, off);
@@ -1640,9 +1682,15 @@ __global__ void __launch_bounds__(512) flash_attn_decode_bf16_kernel(
       e = __shfl(e, 0);
       alpha = __shfl(alpha, 0);
       if (lane < head_dim)
-        out_i = alpha * out_i + e * sV[(size_t)t * head_dim + lane];
+        out_i = alpha * out_i +
+                e * bf16bits_to_f32(sV[(size_t)t * head_dim + lane]);
     }
+
     __syncthreads();
+    if (nxt_cur == 0) break;
+    ping = !ping;
+    base = nxt;
+    cur = nxt_cur;
   }
 
   float alpha_sink = 0.0f, l_final = 0.0f;
@@ -1666,7 +1714,6 @@ __global__ void __launch_bounds__(512) flash_attn_decode_bf16_kernel(
     obh[lane] = v;
   }
 }
-
 static inline void getp_flash_attn_decode_bf16(
     float *tb, const __hip_bfloat16 *key_cache_layer,
     const __hip_bfloat16 *value_cache_layer, const float *q,
@@ -1680,157 +1727,28 @@ static inline void getp_flash_attn_decode_bf16(
   const int tsteps = (apply_mask && sliding_window > 0)
                          ? MIN(sliding_window, pos + 1)
                          : (pos + 1);
+
   int T = (batch_size >= 80 ? 32 : 64);
   if (T > tsteps) T = tsteps;
+
+  // size_t shmem = (size_t)4 * (size_t)T * (size_t)head_dim * sizeof(float);
+  size_t shmem =
+      (size_t)4 * (size_t)T * (size_t)head_dim * sizeof(unsigned short);
+
+  const size_t LDS_MAX = 64 * 1024;
+  if (shmem > LDS_MAX) {
+    T = (int)(LDS_MAX / (4u * (size_t)head_dim * sizeof(float)));
+    if (T < 1) T = 1;
+    if (T > tsteps) T = tsteps;
+    shmem = (size_t)4 * (size_t)T * (size_t)head_dim * sizeof(float);
+  }
+
   dim3 block(64, kv_mul);
   dim3 grid(n_kv_heads, batch_size);
-  size_t shmem = (size_t)2 * T * head_dim * sizeof(float);
   flash_attn_decode_bf16_kernel<<<grid, block, shmem>>>(
       tb, key_cache_layer, value_cache_layer, q, attn_sinks_layer, head_dim,
       n_attn_heads, n_kv_heads, pos, seq_len, sliding_window, apply_mask,
       batch_size, kv_dim, kv_mul, invsd, T, cache_tcap);
-}
-
-__global__ void __launch_bounds__(512) flash_attn_decode_kernel(
-    float *__restrict__ tb, const float *__restrict__ key_cache,
-    const float *__restrict__ value_cache, const float *__restrict__ q,
-    const float *__restrict__ attn_sinks, int head_dim, int n_attn_heads,
-    int n_kv_heads, int pos, int seq_len, int sliding_window, int apply_mask,
-    int batch_size, int kv_dim, int kv_mul, float inv_sqrt_d, int tile_t,
-    int cache_tcap) {
-  const int kv_h = blockIdx.x;
-  const int b = blockIdx.y;
-  const int warp = threadIdx.y;
-  const int lane = threadIdx.x;
-  const int h = kv_h * kv_mul + warp;
-  if (warp >= kv_mul || h >= n_attn_heads) return;
-
-  extern __shared__ float smem[];
-  float *sK = smem;
-  float *sV = smem + (size_t)tile_t * head_dim;
-
-  const float *qptr =
-      q + (size_t)b * n_attn_heads * head_dim + (size_t)h * head_dim;
-  float qi = (lane < head_dim) ? qptr[lane] : 0.0f;
-
-  float out_i = 0.0f;
-  float m = -INFINITY, l = 0.0f;
-
-  int t_start = 0;
-  if (apply_mask && sliding_window > 0)
-    t_start = MAX(0, pos - sliding_window + 1);
-  const int n_steps = pos - t_start + 1;
-
-  const int vec = head_dim >> 2;
-  const int threads = blockDim.x * blockDim.y;
-  const int tid = threadIdx.y * blockDim.x + lane;
-  const int use_ring = (apply_mask && sliding_window > 0);
-
-  for (int base = 0; base < n_steps; base += tile_t) {
-    const int cur = MIN(tile_t, n_steps - base);
-    const int elems_vec = cur * vec;
-    for (int e4 = tid; e4 < elems_vec; e4 += threads) {
-      int tloc = e4 / vec;
-      int i4 = (e4 - tloc * vec) << 2;
-      size_t tindex = use_ring ? (size_t)((t_start + base + tloc) % cache_tcap)
-                               : (size_t)(t_start + base + tloc);
-      const float4 *k4 = reinterpret_cast<const float4 *>(
-          key_cache + tindex * (size_t)batch_size * (size_t)kv_dim +
-          (size_t)b * (size_t)kv_dim + (size_t)kv_h * (size_t)head_dim + i4);
-      const float4 *v4 = reinterpret_cast<const float4 *>(
-          value_cache + tindex * (size_t)batch_size * (size_t)kv_dim +
-          (size_t)b * (size_t)kv_dim + (size_t)kv_h * (size_t)head_dim + i4);
-      reinterpret_cast<float4 *>(sK + (size_t)tloc * head_dim)[i4 >> 2] = *k4;
-      reinterpret_cast<float4 *>(sV + (size_t)tloc * head_dim)[i4 >> 2] = *v4;
-    }
-    __syncthreads();
-
-    for (int t = 0; t < cur; ++t) {
-      float part =
-          (lane < head_dim) ? (qi * sK[(size_t)t * head_dim + lane]) : 0.0f;
-#pragma unroll
-      for (int off = warpSize >> 1; off > 0; off >>= 1)
-        part += __shfl_down(part, off);
-
-      float e = 0.0f, alpha = 0.0f;
-      if (lane == 0) {
-        float s = part * inv_sqrt_d;
-        float m_new = fmaxf(m, s);
-        alpha = __expf(m - m_new);
-        e = __expf(s - m_new);
-        l = l * alpha + e;
-        m = m_new;
-      }
-      e = __shfl(e, 0);
-      alpha = __shfl(alpha, 0);
-      if (lane < head_dim)
-        out_i = alpha * out_i + e * sV[(size_t)t * head_dim + lane];
-    }
-    __syncthreads();
-  }
-
-  float alpha_sink = 0.0f, l_final = 0.0f;
-  if (lane == 0) {
-    float s_sink = attn_sinks[h];
-    float m_new = fmaxf(m, s_sink);
-    float alpha = __expf(m - m_new);
-    float e = __expf(s_sink - m_new);
-    l = l * alpha + e;
-    m = m_new;
-    alpha_sink = alpha;
-    l_final = l;
-  }
-  alpha_sink = __shfl(alpha_sink, 0);
-  l_final = __shfl(l_final, 0);
-
-  if (lane < head_dim) {
-    float v = (alpha_sink * out_i) / l_final;
-    float *obh =
-        tb + (size_t)b * n_attn_heads * head_dim + (size_t)h * head_dim;
-    obh[lane] = v;
-  }
-}
-
-static inline void getp_flash_attn_decode(
-    float *tb, const float *key_cache_layer, const float *value_cache_layer,
-    const float *q, const float *attn_sinks_layer, int head_dim,
-    int n_attn_heads, int n_kv_heads, int pos, int seq_len, int sliding_window,
-    int layer_id, int batch_size, int cache_tcap) {
-  PROFILE_FUNCTION();
-  const int kv_dim = head_dim * n_kv_heads;
-  const int kv_mul = n_attn_heads / n_kv_heads;
-  const float invsd = 1.0f / sqrtf((float)head_dim);
-  const int apply_mask = (sliding_window > 0 && ((layer_id & 1) == 0)) ? 1 : 0;
-  const int tsteps = (apply_mask && sliding_window > 0)
-                         ? MIN(sliding_window, pos + 1)
-                         : (pos + 1);
-  int T = (batch_size >= 80 ? 32 : 64);
-  if (T > tsteps) T = tsteps;
-  dim3 block(64, kv_mul);
-  dim3 grid(n_kv_heads, batch_size);
-  size_t shmem = (size_t)2 * T * head_dim * sizeof(float);
-  flash_attn_decode_kernel<<<grid, block, shmem>>>(
-      tb, key_cache_layer, value_cache_layer, q, attn_sinks_layer, head_dim,
-      n_attn_heads, n_kv_heads, pos, seq_len, sliding_window, apply_mask,
-      batch_size, kv_dim, kv_mul, invsd, T, cache_tcap);
-}
-
-__global__ void gather_embedding_kernel(float *__restrict__ x,
-                                        const float *__restrict__ table,
-                                        const int *__restrict__ tok, int H) {
-  int b = blockIdx.x;
-  int tid = threadIdx.x;
-  int id = tok[b];
-  const float *src = table + (size_t)id * H;
-  float *dst = x + (size_t)b * H;
-  for (int j = tid; j < H; j += blockDim.x) dst[j] = src[j];
-}
-static inline void getp_gather_embedding(float *x, const float *table,
-                                         const int *tok, int H, int B) {
-  PROFILE_FUNCTION();
-  dim3 block(256), grid(B);
-  gather_embedding_kernel<<<grid, block>>>(x, table, tok, H);
-  // HIP_CHECK(hipDeviceSynchronize());
 }
 
 __global__ void argmax_rows_kernel(const float *__restrict__ logits, int V,
@@ -1895,8 +1813,10 @@ __global__ void gather_embedding_bf16_kernel(float *x,
 static inline void getp_gather_embedding_bf16(float *x,
                                               const __hip_bfloat16 *table,
                                               const int *tok, int H, int B) {
+  PROFILE_FUNCTION();
   dim3 block(256), grid(B);
   gather_embedding_bf16_kernel<<<grid, block>>>(x, table, tok, H);
+  // HIP_CHECK(hipDeviceSynchronize());
 }
 
 int *getp_forward(Transformer * /*transformer*/,
@@ -2030,6 +1950,16 @@ int *getp_forward(Transformer * /*transformer*/,
         p->experts_per_token, experts_per_device, ext->e_counts, ext->e_offsets,
         ext->e_dev, ext->w_dev, ext->pair_pos);
 
+    // tổng số pair = e_offsets[E]
+    int total_pairs = 0;
+    HIP_CHECK(hipMemcpy(&total_pairs, ext->e_offsets + experts_per_device,
+                        sizeof(int), hipMemcpyDeviceToHost));
+
+    // scatter x -> a_in theo expert
+    moe_scatter_acts_to_expert_bf16(ext->a_in, dev_s->t, ext->e_dev,
+                                    total_pairs, hidden_dim);
+
+    // agg buffer
     HIP_CHECK(hipMemset(dev_s->e_agg, 0,
                         (size_t)batch_size * hidden_dim * sizeof(float)));
 
@@ -2039,10 +1969,10 @@ int *getp_forward(Transformer * /*transformer*/,
     __hip_bfloat16 *b1_base =
         dev_w->b_mlp1 + 1ll * l * experts_per_device * 2 * p->intermediate_dim;
 
-    launch_mlp1_swiglu_bf16_bucketed(dev_s->gate_up, dev_s->t, w1_base, b1_base,
-                                     ext->e_offsets, ext->e_dev, hidden_dim,
-                                     p->intermediate_dim, experts_per_device,
-                                     cap_pairs, p->swiglu_limit);
+    launch_mlp1_swiglu_bf16_bucketed_outbf16(
+        ext->gate_up_bf16, ext->a_in, w1_base, b1_base, ext->e_offsets,
+        hidden_dim, p->intermediate_dim, experts_per_device, cap_pairs,
+        p->swiglu_limit);
 
     __hip_bfloat16 *w2_base = dev_w->w_mlp2 + 1ll * l * experts_per_device *
                                                   hidden_dim *
@@ -2050,8 +1980,8 @@ int *getp_forward(Transformer * /*transformer*/,
     __hip_bfloat16 *b2_base =
         dev_w->b_mlp2 + 1ll * l * experts_per_device * hidden_dim;
 
-    launch_mlp2_partial_bf16_bucketed_mfma(
-        ext->z_partial, dev_s->gate_up, w2_base, b2_base, ext->w_dev,
+    launch_mlp2_partial_bf16_bucketed_frombf16(
+        ext->z_partial, ext->gate_up_bf16, w2_base, b2_base, ext->w_dev,
         ext->e_offsets, ext->e_dev, p->intermediate_dim, hidden_dim,
         experts_per_device, cap_pairs);
 
@@ -2071,5 +2001,6 @@ int *getp_forward(Transformer * /*transformer*/,
   int *next_host = (int *)malloc(sizeof(int) * batch_size);
   HIP_CHECK(hipMemcpy(next_host, dev_s->topk_i, sizeof(int) * batch_size,
                       hipMemcpyDeviceToHost));
+  // HIP_CHECK(hipDeviceSynchronize());
   return next_host;
 }

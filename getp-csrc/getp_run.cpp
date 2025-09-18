@@ -1,16 +1,16 @@
 // TODO: Modify this file to optimize end-to-end throughput
+#include <hip/hip_runtime.h>
+#include <hip/driver_types.h>
+#include <cstddef>
+#include <cstring>
+#include <vector>
+
+#include "collectives.cpp"
 #include "getp_eval.cpp"
+#include "getp_state_ext.cpp"
 #include "getp_transformer.cpp"
 #include "getp_transformer.hpp"
 #include "profiler.hpp"
-#include <cstddef>
-#include <cstring>
-#include <hip/driver_types.h>
-#include <hip/hip_runtime.h>
-
-#include "collectives.cpp"
-#include "getp_state_ext.cpp"
-#include <vector>
 
 #ifndef GETP_RUN
 #define GETP_RUN
@@ -32,8 +32,10 @@ void warm_up(Transformer *transformer, Tokenizer *tokenizer) {
   int n_devices;
   HIP_CHECK(hipGetDeviceCount(&n_devices));
 
-  dev_transformers = reinterpret_cast<DeviceTransformer **>(malloc(sizeof(DeviceTransformer *) * n_devices));
-  workers = reinterpret_cast<GPUWorker *>(malloc(sizeof(GPUWorker) * n_devices));
+  dev_transformers = reinterpret_cast<DeviceTransformer **>(
+      malloc(sizeof(DeviceTransformer *) * n_devices));
+  workers =
+      reinterpret_cast<GPUWorker *>(malloc(sizeof(GPUWorker) * n_devices));
 
   Config *p = &transformer->config;
 
@@ -42,7 +44,6 @@ void warm_up(Transformer *transformer, Tokenizer *tokenizer) {
 
     workers[i].expert_start = 0;
     workers[i].expert_end = p->n_experts;
-
   }
 
   for (int i = 0; i < n_devices; ++i) {
@@ -55,14 +56,13 @@ void warm_up(Transformer *transformer, Tokenizer *tokenizer) {
   for (int i = 0; i < n_devices; ++i) devices[i] = i;
   // Allocate on-device MoE extension state per device
 
-ext_create(n_devices);
-for (int i = 0; i < n_devices; ++i) {
-  ext_alloc_device(i, BATCH_SIZE, p->experts_per_token, p->n_experts, p->hidden_dim);
-}
-
+  ext_create(n_devices);
+  for (int i = 0; i < n_devices; ++i) {
+    ext_alloc_device(i, BATCH_SIZE, p->experts_per_token, p->n_experts,
+                     p->hidden_dim, p->intermediate_dim);
+  }
 
   cgCreate(g_world, devices);
-
 }
 
 void finish(Transformer *transformer, Tokenizer *tokenizer) {
@@ -97,17 +97,22 @@ long long simple_getp_generate(Transformer *transformer, Tokenizer *tokenizer,
   PROFILE_FUNCTION();
 
   const char *empty_prompt = "";
-  for (int b = 0; b < B; ++b) if (inputs_seq[b] == NULL) inputs_seq[b] = empty_prompt;
+  for (int b = 0; b < B; ++b)
+    if (inputs_seq[b] == NULL) inputs_seq[b] = empty_prompt;
 
   std::vector<int> nums_prompt_tokens(B, 0);
-  std::vector<int*> prompts_tokens(B);
+  std::vector<int *> prompts_tokens(B);
   for (int b = 0; b < B; ++b) {
-    prompts_tokens[b] = (int *)malloc((strlen(inputs_seq[b]) + 3) * sizeof(int));
+    prompts_tokens[b] =
+        (int *)malloc((strlen(inputs_seq[b]) + 3) * sizeof(int));
   }
   for (int b = 0; b < B; ++b) {
-    encode(tokenizer, inputs_seq[b], -1, -1, prompts_tokens[b], &nums_prompt_tokens[b],
-           transformer->config.initial_context_length);
-    if (nums_prompt_tokens[b] < 1) { fprintf(stderr, "bad prompt\n"); exit(EXIT_FAILURE); }
+    encode(tokenizer, inputs_seq[b], -1, -1, prompts_tokens[b],
+           &nums_prompt_tokens[b], transformer->config.initial_context_length);
+    if (nums_prompt_tokens[b] < 1) {
+      fprintf(stderr, "bad prompt\n");
+      exit(EXIT_FAILURE);
+    }
   }
 
   std::vector<int> next(B), token(B), epos(B, -1), mask(B, 1);
@@ -115,31 +120,45 @@ long long simple_getp_generate(Transformer *transformer, Tokenizer *tokenizer,
   for (int b = 0; b < B; ++b) token[b] = prompts_tokens[b][0];
 
   Config *p = &transformer->config;
-  if (!p) { fprintf(stderr, "Config missing\n"); exit(EXIT_FAILURE); }
+  if (!p) {
+    fprintf(stderr, "Config missing\n");
+    exit(EXIT_FAILURE);
+  }
 
   while (pos + 1 < steps) {
-    int *next_gpu = getp_forward(transformer, dev_transformers, worker, token.data(), pos, B);
+    int *next_gpu = getp_forward(transformer, dev_transformers, worker,
+                                 token.data(), pos, B);
 
     pos++;
     for (int b = 0; b < B; ++b) {
       if (!mask[b]) continue;
       epos[b] = pos;
-      if (pos < nums_prompt_tokens[b]) next[b] = prompts_tokens[b][pos];
-      else { next[b] = next_gpu[b]; outputs_tokens[b][pos - nums_prompt_tokens[b]] = next[b]; }
+      if (pos < nums_prompt_tokens[b])
+        next[b] = prompts_tokens[b][pos];
+      else {
+        next[b] = next_gpu[b];
+        outputs_tokens[b][pos - nums_prompt_tokens[b]] = next[b];
+      }
     }
 
     for (int b = 0; b < B; ++b) {
       if (!mask[b]) continue;
       if (next[b] == 199999 || next[b] == 200002) mask[b] = 0;
     }
-    if (is_all_zero(mask.data(), B)) { free(next_gpu); break; }
+    if (is_all_zero(mask.data(), B)) {
+      free(next_gpu);
+      break;
+    }
 
     for (int b = 0; b < B; ++b) token[b] = next[b];
     free(next_gpu);
   }
 
   for (int b = 0; b < B; ++b) {
-    if (epos[b] == -1) { fprintf(stderr, "bad epos\n"); exit(EXIT_FAILURE); }
+    if (epos[b] == -1) {
+      fprintf(stderr, "bad epos\n");
+      exit(EXIT_FAILURE);
+    }
     outputs_tokens[b][epos[b] - nums_prompt_tokens[b] + 1] = -1;
   }
   for (int b = 0; b < B; ++b) free(prompts_tokens[b]);
@@ -150,16 +169,13 @@ long long simple_getp_generate(Transformer *transformer, Tokenizer *tokenizer,
   return acc;
 }
 
-void single_thread_generate(Transformer *transformer, 
-                            Tokenizer *tokenizer, 
-                            Sampler *sampler, 
-                            Requests *requests,
-                            GPUWorker *worker,
-                            long long *num_token_out_ptr,
+void single_thread_generate(Transformer *transformer, Tokenizer *tokenizer,
+                            Sampler *sampler, Requests *requests,
+                            GPUWorker *worker, long long *num_token_out_ptr,
                             int thread_idx) {
   Sampler *local_sampler = reinterpret_cast<Sampler *>(malloc(sizeof(Sampler)));
-  build_sampler(local_sampler, sampler->vocab_size, sampler->temperature, sampler->topp,
-                sampler->rng_state + thread_idx);
+  build_sampler(local_sampler, sampler->vocab_size, sampler->temperature,
+                sampler->topp, sampler->rng_state + thread_idx);
 
   long long num_token_out = 0;
   const char *inputs_seq[BATCH_SIZE];
@@ -181,43 +197,44 @@ void single_thread_generate(Transformer *transformer,
   *num_token_out_ptr = num_token_out;
 }
 
-
 long long inference(Transformer *transformer, Tokenizer *tokenizer,
                     Sampler *sampler, Requests *requests) {
   PROFILE_FUNCTION();
-  
+
   // Reset timing at the start of inference
   reset_timing_summary();
 
   int n_devices;
   HIP_CHECK(hipGetDeviceCount(&n_devices));
 
-  int seq_len_eff = std::min(transformer->config.seq_len, requests->max_seq_len);
+  int seq_len_eff =
+      std::min(transformer->config.seq_len, requests->max_seq_len);
   for (int i = 0; i < n_devices; ++i) {
     resize_kv_cache(dev_transformers[i], seq_len_eff);
   }
-  
 
   int num_reqs_per_device = requests->num_reqs / n_devices;
   for (int i = 0; i < n_devices; ++i) {
     workers[i].request_start = i * num_reqs_per_device;
     workers[i].request_end = (i + 1) * num_reqs_per_device;
     if (i == n_devices - 1) workers[i].request_end = requests->num_reqs;
-    // assert((workers[i].request_end - workers[i].request_start) % BATCH_SIZE == 0);
+    // assert((workers[i].request_end - workers[i].request_start) % BATCH_SIZE
+    // == 0);
   }
-  
+
   std::vector<long long> nums_token_out(n_devices);
   std::vector<std::thread> threads(n_devices);
 
   for (int i = 0; i < n_devices; ++i) {
-    threads[i] = std::thread(single_thread_generate, 
-      transformer, tokenizer, sampler, requests, &workers[i], &nums_token_out[i], i);
+    threads[i] =
+        std::thread(single_thread_generate, transformer, tokenizer, sampler,
+                    requests, &workers[i], &nums_token_out[i], i);
   }
 
   for (int i = 0; i < n_devices; ++i) {
     threads[i].join();
   }
-  
+
   // Ensure all GPU work is completed before printing timing
   HIP_CHECK(hipDeviceSynchronize());
 
@@ -225,11 +242,11 @@ long long inference(Transformer *transformer, Tokenizer *tokenizer,
   for (int i = 0; i < n_devices; ++i) {
     num_token_out += nums_token_out[i];
   }
-  
+
   // Print timing summary at the end of inference
   print_timing_summary();
-  
+
   return num_token_out;
 }
 
-#endif // GETP_RUN
+#endif  // GETP_RUN
