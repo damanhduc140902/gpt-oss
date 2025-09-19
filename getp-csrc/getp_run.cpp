@@ -26,6 +26,7 @@ CollectiveGroup g_world;
 
 DeviceTransformer **dev_transformers;
 GPUWorker *workers;
+int BATCH_SIZE = 0;
 
 #include "getp_forward.cpp"
 
@@ -47,10 +48,12 @@ void warm_up(Transformer *transformer, Tokenizer *tokenizer) {
   if (p->n_experts == 128) {
     // 120b model
     EXPERT_PARALLELISM = n_devices;
+    BATCH_SIZE = 512;
   }
   else {
     // 20b model
     EXPERT_PARALLELISM = 1;
+    BATCH_SIZE = 896;
   }
 
   if (n_devices % EXPERT_PARALLELISM) {
@@ -209,8 +212,10 @@ namespace Model_20b {
                   sampler->topp, sampler->rng_state + thread_idx);
 
     long long num_token_out = 0;
-    const char *inputs_seq[BATCH_SIZE];
-    int *outputs_tokens[BATCH_SIZE];
+    // const char *inputs_seq[BATCH_SIZE];
+    // int *outputs_tokens[BATCH_SIZE];
+    std::vector<const char*> inputs_seq(BATCH_SIZE);
+    std::vector<int*> outputs_tokens(BATCH_SIZE);
 
     int idx0 = worker->request_start;
     int requests_per_thread = worker->request_end - worker->request_start;
@@ -222,7 +227,7 @@ namespace Model_20b {
         outputs_tokens[b] = get_tok_gen_ptr(requests, idx0 + idx + b);
       }
       num_token_out += simple_getp_generate(transformer, tokenizer, local_sampler,
-                                            worker, inputs_seq, outputs_tokens,
+                                            worker, inputs_seq.data(), outputs_tokens.data(),
                                             requests->max_seq_len, B);
     }
     *num_token_out_ptr = num_token_out;
