@@ -71,4 +71,5 @@ void ext_free_all(int n_devices) {
   g_ext = nullptr;
 }
 
+
 RunStateExt* ext_get(int device_index) { return &g_ext[device_index]; }

@@ -166,6 +166,30 @@ __global__ void exclusive_scan_small_kernel(const int *in, int *out, int E) {
   if (tid == 0) out[E] = smi[E - 1];
 }
 
+
+
+
+__global__ void moe_blocks_per_expert_kernel(const int *offsets, int E, int BM,
+                                             int *blk_counts) {
+  int e = blockIdx.x * blockDim.x + threadIdx.x;
+  if (e >= E) return;
+  int n = offsets[e + 1] - offsets[e];
+  blk_counts[e] = (n + BM - 1) / BM;
+}
+
+static inline int build_moe_block_schedule(const int *offsets, int E, int BM,
+                                           int *blk_counts, int *blk_offsets) {
+  dim3 b(256), g((E + b.x - 1) / b.x);
+  moe_blocks_per_expert_kernel<<<g, b>>>(offsets, E, BM, blk_counts);
+  exclusive_scan_small_kernel<<<dim3(1), dim3(256), sizeof(int) * 256>>>(
+      blk_counts, blk_offsets, E);
+  int total_blocks = 0;
+  HIP_CHECK(hipMemcpy(&total_blocks, blk_offsets + E, sizeof(int),
+                      hipMemcpyDeviceToHost));
+  return total_blocks;
+}
+
+
 __global__ void moe_fill_local_pos_kernel(const int *local_ids,
                                           const float *local_wts,
                                           const int *n_local, int B, int K,
@@ -261,10 +285,10 @@ __global__ void __launch_bounds__(256) mlp1_swiglu_bf16_bucketed_kernel_outbf16(
     const __hip_bfloat16 *__restrict__ A_in,
     const __hip_bfloat16 *__restrict__ W1,
     const __hip_bfloat16 *__restrict__ B1, const int *__restrict__ offsets,
-    int H, int I, int E, int cap_pairs, float swiglu_limit) {
+    const int *__restrict__ blk_offs, int H, int I, int E,
+    float swiglu_limit) {
   constexpr int BM = 32, BN = 32, BK = 32, WM = 16, WN = 16;
   const int BNt = BN * GETP_BN_AGG;
-
   const int lane = threadIdx.x & 63;
   const int wave = threadIdx.x >> 6;
   const int xTile = wave % (BM / WM);
@@ -272,13 +296,21 @@ __global__ void __launch_bounds__(256) mlp1_swiglu_bf16_bucketed_kernel_outbf16(
   const int xMF = lane & 15;
   const int yMF = lane >> 4;
 
-  const int e = blockIdx.y % E;
-  const int blk = blockIdx.y / E;
+  int by = blockIdx.y;
+  int lo = 0, hi = E;
+  while (lo + 1 < hi) {
+    int mid = (lo + hi) >> 1;
+    int off = blk_offs[mid];
+    if (by < off) hi = mid; else lo = mid;
+  }
+  int e = lo;
+  int blk = by - blk_offs[e];
+
   const int s = offsets[e], t = offsets[e + 1];
   const int n = t - s;
   const int base_all = blk * BM;
+  if (base_all >= n) return;
   const int base = s + base_all;
-  if (base >= t) return;
   const int tcnt = min(BM, n - base_all);
 
   const size_t w1_e = (size_t)e * (size_t)(2 * I) * (size_t)H;
@@ -300,7 +332,6 @@ __global__ void __launch_bounds__(256) mlp1_swiglu_bf16_bucketed_kernel_outbf16(
   const int loadW_y = threadIdx.x / (BK / 8);
   constexpr int strideX = 256 / (BK / 4);
   constexpr int strideW = 256 / (BK / 8);
-
   const int colBase = blockIdx.x * BNt;
 
   for (int bk = 0; bk < H; bk += BK) {
@@ -330,7 +361,6 @@ __global__ void __launch_bounds__(256) mlp1_swiglu_bf16_bucketed_kernel_outbf16(
       if (loadW_y + off >= BNt) break;
       const int kk = bk + 8 * loadW_x;
       const int col = colBase + loadW_y + off;
-
       uint4 wg = make_uint4(0, 0, 0, 0), wu = make_uint4(0, 0, 0, 0);
       if (col < I) {
         if (kk + 7 < H) {
@@ -341,42 +371,14 @@ __global__ void __launch_bounds__(256) mlp1_swiglu_bf16_bucketed_kernel_outbf16(
         } else if (kk < H) {
           const __hip_bfloat16 *pg = W1 + w1_e + (size_t)(2 * col + 0) * H + kk;
           const __hip_bfloat16 *pu = W1 + w1_e + (size_t)(2 * col + 1) * H + kk;
-          unsigned u0 = 0, u1 = 0, u2 = 0, u3 = 0, v0 = 0, v1 = 0, v2 = 0,
-                   v3 = 0;
-          if (kk + 0 < H) {
-            u0 |= (unsigned)(reinterpret_cast<const unsigned short *>(pg)[0]);
-            v0 |= (unsigned)(reinterpret_cast<const unsigned short *>(pu)[0]);
-          }
-          if (kk + 1 < H) {
-            u0 |= (unsigned)(reinterpret_cast<const unsigned short *>(pg)[1])
-                  << 16;
-            v0 |= (unsigned)(reinterpret_cast<const unsigned short *>(pu)[1])
-                  << 16;
-          }
-          if (kk + 2 < H) {
-            u1 |= (unsigned)(reinterpret_cast<const unsigned short *>(pg)[2]);
-            v1 |= (unsigned)(reinterpret_cast<const unsigned short *>(pu)[2]);
-          }
-          if (kk + 3 < H) {
-            u1 |= (unsigned)(reinterpret_cast<const unsigned short *>(pg)[3])
-                  << 16;
-            v1 |= (unsigned)(reinterpret_cast<const unsigned short *>(pu)[3])
-                  << 16;
-          }
-          if (kk + 4 < H) {
-            u2 |= (unsigned)(reinterpret_cast<const unsigned short *>(pg)[4]);
-            v2 |= (unsigned)(reinterpret_cast<const unsigned short *>(pu)[4]);
-          }
-          if (kk + 5 < H) {
-            u2 |= (unsigned)(reinterpret_cast<const unsigned short *>(pg)[5])
-                  << 16;
-            v2 |= (unsigned)(reinterpret_cast<const unsigned short *>(pu)[5])
-                  << 16;
-          }
-          if (kk + 6 < H) {
-            u3 |= (unsigned)(reinterpret_cast<const unsigned short *>(pg)[6]);
-            v3 |= (unsigned)(reinterpret_cast<const unsigned short *>(pu)[6]);
-          }
+          unsigned u0 = 0, u1 = 0, u2 = 0, u3 = 0, v0 = 0, v1 = 0, v2 = 0, v3 = 0;
+          if (kk + 0 < H) { u0 |= (unsigned)(reinterpret_cast<const unsigned short *>(pg)[0]); v0 |= (unsigned)(reinterpret_cast<const unsigned short *>(pu)[0]); }
+          if (kk + 1 < H) { u0 |= (unsigned)(reinterpret_cast<const unsigned short *>(pg)[1]) << 16; v0 |= (unsigned)(reinterpret_cast<const unsigned short *>(pu)[1]) << 16; }
+          if (kk + 2 < H) { u1 |= (unsigned)(reinterpret_cast<const unsigned short *>(pg)[2]); v1 |= (unsigned)(reinterpret_cast<const unsigned short *>(pu)[2]); }
+          if (kk + 3 < H) { u1 |= (unsigned)(reinterpret_cast<const unsigned short *>(pg)[3]) << 16; v1 |= (unsigned)(reinterpret_cast<const unsigned short *>(pu)[3]) << 16; }
+          if (kk + 4 < H) { u2 |= (unsigned)(reinterpret_cast<const unsigned short *>(pg)[4]); v2 |= (unsigned)(reinterpret_cast<const unsigned short *>(pu)[4]); }
+          if (kk + 5 < H) { u2 |= (unsigned)(reinterpret_cast<const unsigned short *>(pg)[5]) << 16; v2 |= (unsigned)(reinterpret_cast<const unsigned short *>(pu)[5]) << 16; }
+          if (kk + 6 < H) { u3 |= (unsigned)(reinterpret_cast<const unsigned short *>(pg)[6]); }
           wg = make_uint4(u0, u1, u2, u3);
           wu = make_uint4(v0, v1, v2, v3);
         }
@@ -401,10 +403,7 @@ __global__ void __launch_bounds__(256) mlp1_swiglu_bf16_bucketed_kernel_outbf16(
         du[6 * BNt] = (unsigned short)(wu.w & 0xFFFF);
         du[7 * BNt] = (unsigned short)(wu.w >> 16);
       } else {
-        for (int t = 0; t < 8; ++t) {
-          dg[t * BNt] = 0;
-          du[t * BNt] = 0;
-        }
+        for (int t = 0; t < 8; ++t) { dg[t * BNt] = 0; du[t * BNt] = 0; }
       }
     }
     __syncthreads();
@@ -413,42 +412,15 @@ __global__ void __launch_bounds__(256) mlp1_swiglu_bf16_bucketed_kernel_outbf16(
       const int basek = k + yMF * 4;
       const int row = yTile * WM + xMF;
       const int c = xTile * WN + xMF;
-
-      bf16x4 av = {sx[(basek + 0) * BM + row], sx[(basek + 1) * BM + row],
-                   sx[(basek + 2) * BM + row], sx[(basek + 3) * BM + row]};
-      bf16x4 g0 = {swg[(basek + 0) * BNt + c + 0 * BN],
-                   swg[(basek + 1) * BNt + c + 0 * BN],
-                   swg[(basek + 2) * BNt + c + 0 * BN],
-                   swg[(basek + 3) * BNt + c + 0 * BN]};
-      bf16x4 g1 = {swg[(basek + 0) * BNt + c + 1 * BN],
-                   swg[(basek + 1) * BNt + c + 1 * BN],
-                   swg[(basek + 2) * BNt + c + 1 * BN],
-                   swg[(basek + 3) * BNt + c + 1 * BN]};
-      bf16x4 g2 = {swg[(basek + 0) * BNt + c + 2 * BN],
-                   swg[(basek + 1) * BNt + c + 2 * BN],
-                   swg[(basek + 2) * BNt + c + 2 * BN],
-                   swg[(basek + 3) * BNt + c + 2 * BN]};
-      bf16x4 g3 = {swg[(basek + 0) * BNt + c + 3 * BN],
-                   swg[(basek + 1) * BNt + c + 3 * BN],
-                   swg[(basek + 2) * BNt + c + 3 * BN],
-                   swg[(basek + 3) * BNt + c + 3 * BN]};
-      bf16x4 u0 = {swu[(basek + 0) * BNt + c + 0 * BN],
-                   swu[(basek + 1) * BNt + c + 0 * BN],
-                   swu[(basek + 2) * BNt + c + 0 * BN],
-                   swu[(basek + 3) * BNt + c + 0 * BN]};
-      bf16x4 u1 = {swu[(basek + 0) * BNt + c + 1 * BN],
-                   swu[(basek + 1) * BNt + c + 1 * BN],
-                   swu[(basek + 2) * BNt + c + 1 * BN],
-                   swu[(basek + 3) * BNt + c + 1 * BN]};
-      bf16x4 u2 = {swu[(basek + 0) * BNt + c + 2 * BN],
-                   swu[(basek + 1) * BNt + c + 2 * BN],
-                   swu[(basek + 2) * BNt + c + 2 * BN],
-                   swu[(basek + 3) * BNt + c + 2 * BN]};
-      bf16x4 u3 = {swu[(basek + 0) * BNt + c + 3 * BN],
-                   swu[(basek + 1) * BNt + c + 3 * BN],
-                   swu[(basek + 2) * BNt + c + 3 * BN],
-                   swu[(basek + 3) * BNt + c + 3 * BN]};
-
+      bf16x4 av = {sx[(basek + 0) * BM + row], sx[(basek + 1) * BM + row], sx[(basek + 2) * BM + row], sx[(basek + 3) * BM + row]};
+      bf16x4 g0 = {swg[(basek + 0) * BNt + c + 0 * BN], swg[(basek + 1) * BNt + c + 0 * BN], swg[(basek + 2) * BNt + c + 0 * BN], swg[(basek + 3) * BNt + c + 0 * BN]};
+      bf16x4 g1 = {swg[(basek + 0) * BNt + c + 1 * BN], swg[(basek + 1) * BNt + c + 1 * BN], swg[(basek + 2) * BNt + c + 1 * BN], swg[(basek + 3) * BNt + c + 1 * BN]};
+      bf16x4 g2 = {swg[(basek + 0) * BNt + c + 2 * BN], swg[(basek + 1) * BNt + c + 2 * BN], swg[(basek + 2) * BNt + c + 2 * BN], swg[(basek + 3) * BNt + c + 2 * BN]};
+      bf16x4 g3 = {swg[(basek + 0) * BNt + c + 3 * BN], swg[(basek + 1) * BNt + c + 3 * BN], swg[(basek + 2) * BNt + c + 3 * BN], swg[(basek + 3) * BNt + c + 3 * BN]};
+      bf16x4 u0 = {swu[(basek + 0) * BNt + c + 0 * BN], swu[(basek + 1) * BNt + c + 0 * BN], swu[(basek + 2) * BNt + c + 0 * BN], swu[(basek + 3) * BNt + c + 0 * BN]};
+      bf16x4 u1 = {swu[(basek + 0) * BNt + c + 1 * BN], swu[(basek + 1) * BNt + c + 1 * BN], swu[(basek + 2) * BNt + c + 1 * BN], swu[(basek + 3) * BNt + c + 1 * BN]};
+      bf16x4 u2 = {swu[(basek + 0) * BNt + c + 2 * BN], swu[(basek + 1) * BNt + c + 2 * BN], swu[(basek + 2) * BNt + c + 2 * BN], swu[(basek + 3) * BNt + c + 2 * BN]};
+      bf16x4 u3 = {swu[(basek + 0) * BNt + c + 3 * BN], swu[(basek + 1) * BNt + c + 3 * BN], swu[(basek + 2) * BNt + c + 3 * BN], swu[(basek + 3) * BNt + c + 3 * BN]};
       dg0 = __builtin_amdgcn_mfma_f32_16x16x16bf16_1k(av, g0, dg0, 0, 0, 0);
       dg1 = __builtin_amdgcn_mfma_f32_16x16x16bf16_1k(av, g1, dg1, 0, 0, 0);
       dg2 = __builtin_amdgcn_mfma_f32_16x16x16bf16_1k(av, g2, dg2, 0, 0, 0);
@@ -467,13 +439,10 @@ __global__ void __launch_bounds__(256) mlp1_swiglu_bf16_bucketed_kernel_outbf16(
     const int row = yTile * WM + (yD + i);
     if (row >= tcnt) continue;
     const int pos = base + row;
-
     auto store_group = [&](int col, float gval, float uval) {
       if (col >= I) return;
-      const float bg =
-          B1 ? __bfloat162float(B1[b1_e + (size_t)(2 * col + 0)]) : 0.f;
-      const float bu =
-          B1 ? __bfloat162float(B1[b1_e + (size_t)(2 * col + 1)]) : 0.f;
+      const float bg = B1 ? __bfloat162float(B1[b1_e + (size_t)(2 * col + 0)]) : 0.f;
+      const float bu = B1 ? __bfloat162float(B1[b1_e + (size_t)(2 * col + 1)]) : 0.f;
       float g = gval + bg, u = uval + bu;
       if (g > swiglu_limit) g = swiglu_limit;
       if (u > swiglu_limit) u = swiglu_limit;
@@ -481,10 +450,9 @@ __global__ void __launch_bounds__(256) mlp1_swiglu_bf16_bucketed_kernel_outbf16(
       const float a = 1.702f;
       float s = 1.f / (1.f + __expf(-a * g));
       float out = (g * s) * (u + 1.f);
-      reinterpret_cast<unsigned short *>(gate_up_bf16)[(size_t)pos * I + col] =
-          f32_to_bf16bits(out);
+      reinterpret_cast<unsigned short *>(gate_up_bf16)[(size_t)pos * I + col] = f32_to_bf16bits(out);
     };
-
+    const int colBase = blockIdx.x * BNt;
     const int c0 = colBase + xTile * WN + xD + 0 * BN;
     const int c1 = colBase + xTile * WN + xD + 1 * BN;
     const int c2 = colBase + xTile * WN + xD + 2 * BN;
@@ -495,22 +463,19 @@ __global__ void __launch_bounds__(256) mlp1_swiglu_bf16_bucketed_kernel_outbf16(
     store_group(c3, dg3[i], du3[i]);
   }
 }
-
 static inline void launch_mlp1_swiglu_bf16_bucketed_outbf16(
     __hip_bfloat16 *gate_up_bf16, const __hip_bfloat16 *a_in,
     const __hip_bfloat16 *w1_layer, const __hip_bfloat16 *b1_layer,
-    const int *offsets, int H, int I, int E, int cap_pairs, float swiglu_limit,
-    hipStream_t stream) {
-  PROFILE_FUNCTION();
+    const int *offsets, const int *blk_offs, int H, int I, int E,
+    int total_blocks, float swiglu_limit) {
   constexpr int BM = 32, BN = 32, BK = 32;
   const int BNt = BN * GETP_BN_AGG;
   dim3 block(256);
-  int by = (cap_pairs + BM - 1) / BM;
-  dim3 grid((I + BNt - 1) / BNt, E * by);
-  size_t shmem = (size_t)BK * ((size_t)BM + (size_t)BNt + (size_t)BNt) *
-                 sizeof(unsigned short);
-  mlp1_swiglu_bf16_bucketed_kernel_outbf16<<<grid, block, shmem, stream>>>(
-      gate_up_bf16, a_in, w1_layer, b1_layer, offsets, H, I, E, cap_pairs,
+  dim3 grid((I + BNt - 1) / BNt, total_blocks);
+  size_t shmem =
+      (size_t)BK * ((size_t)BM + (size_t)BNt + (size_t)BNt) * sizeof(unsigned short);
+  mlp1_swiglu_bf16_bucketed_kernel_outbf16<<<grid, block, shmem>>>(
+      gate_up_bf16, a_in, w1_layer, b1_layer, offsets, blk_offs, H, I, E,
       swiglu_limit);
   // HIP_CHECK(hipDeviceSynchronize());
 }
@@ -522,11 +487,10 @@ __global__ void __launch_bounds__(256)
         const __hip_bfloat16 *__restrict__ W2,
         const __hip_bfloat16 *__restrict__ B2,
         const float *__restrict__ w_by_bucket, const int *__restrict__ offsets,
-        const int *__restrict__ tok_idx, int I, int H, int E, int cap_pairs,
-        int splits) {
+        const int *__restrict__ blk_offs, const int *__restrict__ tok_idx, int I,
+        int H, int E, int splits) {
   constexpr int BM = 32, BN = 32, BK = 32, WM = 16, WN = 16;
   const int BNt = BN * GETP_BN_AGG;
-
   const int lane = threadIdx.x & 63;
   const int wave = threadIdx.x >> 6;
   const int xTile = wave % (BM / WM);
@@ -538,13 +502,21 @@ __global__ void __launch_bounds__(256)
   unsigned short *sx = smem_raw_mlp2;
   unsigned short *sw = sx + (size_t)BK * BM;
 
-  const int e = blockIdx.y % E;
-  const int blk = blockIdx.y / E;
+  int by = blockIdx.y;
+  int lo = 0, hi = E;
+  while (lo + 1 < hi) {
+    int mid = (lo + hi) >> 1;
+    int off = blk_offs[mid];
+    if (by < off) hi = mid; else lo = mid;
+  }
+  int e = lo;
+  int blk = by - blk_offs[e];
+
   const int s = offsets[e], t = offsets[e + 1];
   const int n = t - s;
   const int base_all = blk * BM;
+  if (base_all >= n) return;
   const int base = s + base_all;
-  if (base >= t) return;
   const int tcnt = min(BM, n - base_all);
 
   const size_t w2_e = (size_t)e * (size_t)H * (size_t)I;
@@ -568,6 +540,7 @@ __global__ void __launch_bounds__(256)
   const int colBase = blockIdx.x * BNt;
 
   for (int bk = kBeg; bk < kEnd; bk += BK) {
+    for (int off = 0; off; off += 0) { break; }
     for (int off = 0; off < BM; off += strideX) {
       if (loadX_y + off >= BM) break;
       const int kk = bk + 4 * loadX_x;
@@ -582,8 +555,7 @@ __global__ void __launch_bounds__(256)
           sx[(4 * loadX_x + 2) * BM + r] = (unsigned short)(v.y & 0xFFFF);
           sx[(4 * loadX_x + 3) * BM + r] = (unsigned short)(v.y >> 16);
         } else {
-          const unsigned short *q =
-              reinterpret_cast<const unsigned short *>(src);
+          const unsigned short *q = reinterpret_cast<const unsigned short *>(src);
           sx[(4 * loadX_x + 0) * BM + r] = (kk + 0 < kEnd) ? q[0] : 0;
           sx[(4 * loadX_x + 1) * BM + r] = (kk + 1 < kEnd) ? q[1] : 0;
           sx[(4 * loadX_x + 2) * BM + r] = (kk + 2 < kEnd) ? q[2] : 0;
@@ -595,7 +567,6 @@ __global__ void __launch_bounds__(256)
       if (loadW_y + off >= BNt) break;
       const int kk = bk + 8 * loadW_x;
       const int col = colBase + loadW_y + off;
-
       uint4 wb = make_uint4(0, 0, 0, 0);
       if (col < H && kk < kEnd) {
         if (kk + 7 < kEnd) {
@@ -604,23 +575,13 @@ __global__ void __launch_bounds__(256)
         } else {
           const __hip_bfloat16 *src = W2 + w2_e + (size_t)col * (size_t)I + kk;
           unsigned u0 = 0, u1 = 0, u2 = 0, u3 = 0;
-          if (kk + 0 < kEnd)
-            u0 |= (unsigned)(reinterpret_cast<const unsigned short *>(src)[0]);
-          if (kk + 1 < kEnd)
-            u0 |= (unsigned)(reinterpret_cast<const unsigned short *>(src)[1])
-                  << 16;
-          if (kk + 2 < kEnd)
-            u1 |= (unsigned)(reinterpret_cast<const unsigned short *>(src)[2]);
-          if (kk + 3 < kEnd)
-            u1 |= (unsigned)(reinterpret_cast<const unsigned short *>(src)[3])
-                  << 16;
-          if (kk + 4 < kEnd)
-            u2 |= (unsigned)(reinterpret_cast<const unsigned short *>(src)[4]);
-          if (kk + 5 < kEnd)
-            u2 |= (unsigned)(reinterpret_cast<const unsigned short *>(src)[5])
-                  << 16;
-          if (kk + 6 < kEnd)
-            u3 |= (unsigned)(reinterpret_cast<const unsigned short *>(src)[6]);
+          if (kk + 0 < kEnd) u0 |= (unsigned)(reinterpret_cast<const unsigned short *>(src)[0]);
+          if (kk + 1 < kEnd) u0 |= (unsigned)(reinterpret_cast<const unsigned short *>(src)[1]) << 16;
+          if (kk + 2 < kEnd) u1 |= (unsigned)(reinterpret_cast<const unsigned short *>(src)[2]);
+          if (kk + 3 < kEnd) u1 |= (unsigned)(reinterpret_cast<const unsigned short *>(src)[3]) << 16;
+          if (kk + 4 < kEnd) u2 |= (unsigned)(reinterpret_cast<const unsigned short *>(src)[4]);
+          if (kk + 5 < kEnd) u2 |= (unsigned)(reinterpret_cast<const unsigned short *>(src)[5]) << 16;
+          if (kk + 6 < kEnd) u3 |= (unsigned)(reinterpret_cast<const unsigned short *>(src)[6]);
           wb = make_uint4(u0, u1, u2, u3);
         }
       }
@@ -644,7 +605,6 @@ __global__ void __launch_bounds__(256)
       const int basek = k + yMF * 4;
       const int row = yTile * WM + xMF;
       const int c = xTile * WN + xMF;
-
       bf16x4 av = {sx[(basek + 0) * BM + row], sx[(basek + 1) * BM + row],
                    sx[(basek + 2) * BM + row], sx[(basek + 3) * BM + row]};
       bf16x4 b0 = {sw[(basek + 0) * BNt + c + 0 * BN],
@@ -663,7 +623,6 @@ __global__ void __launch_bounds__(256)
                    sw[(basek + 1) * BNt + c + 3 * BN],
                    sw[(basek + 2) * BNt + c + 3 * BN],
                    sw[(basek + 3) * BNt + c + 3 * BN]};
-
       d0 = __builtin_amdgcn_mfma_f32_16x16x16bf16_1k(av, b0, d0, 0, 0, 0);
       d1 = __builtin_amdgcn_mfma_f32_16x16x16bf16_1k(av, b1, d1, 0, 0, 0);
       d2 = __builtin_amdgcn_mfma_f32_16x16x16bf16_1k(av, b2, d2, 0, 0, 0);
@@ -679,19 +638,17 @@ __global__ void __launch_bounds__(256)
     if (row >= tcnt) continue;
     const int pos = base + row;
     const float w = w_by_bucket[pos];
-
     auto store_group = [&](int col, float val) {
       if (col >= H) return;
       const float bia = B2 ? __bfloat162float(B2[b2_e + col]) : 0.f;
       float *dst = z_partial + (size_t)pos * (size_t)H + col;
-      if (splits == 1)
-        *dst = (val + bia) * w;
+      if (splits == 1) *dst = (val + bia) * w;
       else {
         atomicAdd(dst, val * w);
         if (blockIdx.z == 0) atomicAdd(dst, bia * w);
       }
     };
-
+    const int colBase = blockIdx.x * BNt;
     const int c0 = colBase + xTile * WN + xD + 0 * BN;
     const int c1 = colBase + xTile * WN + xD + 1 * BN;
     const int c2 = colBase + xTile * WN + xD + 2 * BN;
@@ -702,19 +659,16 @@ __global__ void __launch_bounds__(256)
     store_group(c3, d3[i]);
   }
 }
-
 static inline void launch_mlp2_partial_bf16_bucketed_frombf16(
     float *z_partial, const __hip_bfloat16 *gate_up_bf16,
     const __hip_bfloat16 *w2_layer, const __hip_bfloat16 *b2_layer,
-    const float *w_by_bucket, const int *offsets, const int *tok_idx, int I,
-    int H, int E, int cap_pairs, hipStream_t stream) {
+    const float *w_by_bucket, const int *offsets, const int *blk_offs,
+    const int *tok_idx, int I, int H, int E, int total_blocks) {
   PROFILE_FUNCTION();
   constexpr int BN = 32, BM = 32, BK = 32;
   const int BNt = BN * GETP_BN_AGG;
-
-  const int by = (cap_pairs + BM - 1) / BM;
   const int gx = (H + BNt - 1) / BNt;
-  const int gy = E * by;
+  const int gy = total_blocks;
   const int grid_xy = max(1, gx) * max(1, gy);
 
   int dev = 0, cu = 104;
@@ -724,8 +678,7 @@ static inline void launch_mlp2_partial_bf16_bucketed_frombf16(
   if (cu <= 0) cu = 104;
 
   const int target_cta = cu * 4;
-  int splits =
-      (grid_xy >= target_cta) ? 1 : (target_cta + grid_xy - 1) / grid_xy;
+  int splits = (grid_xy >= target_cta) ? 1 : (target_cta + grid_xy - 1) / grid_xy;
   splits = min(8, max(1, splits));
   const int max_splits_by_K = max(1, (I + BK - 1) / BK);
   splits = min(splits, max_splits_by_K);
@@ -740,14 +693,14 @@ static inline void launch_mlp2_partial_bf16_bucketed_frombf16(
 
   dim3 block(256);
   dim3 grid(gx, gy, splits);
-  size_t shmem =
-      (size_t)BK * ((size_t)BM + (size_t)BNt) * sizeof(unsigned short);
+  size_t shmem = (size_t)BK * ((size_t)BM + (size_t)BNt) * sizeof(unsigned short);
 
   mlp2_partial_bf16_bucketed_splitk_kernel_inbf16<<<grid, block, shmem,
                                                     stream>>>(
       z_partial, gate_up_bf16, w2_layer, b2_layer, w_by_bucket, offsets,
-      tok_idx, I, H, E, cap_pairs, splits);
+      blk_offs, tok_idx, I, H, E, splits);
 }
+
 
 __global__ void moe_gather_pairs_kernel(float *__restrict__ e_agg,
                                         const float *__restrict__ z_partial,
@@ -1752,7 +1705,7 @@ static inline void getp_flash_attn_decode_bf16(
     T = (int)(LDS_MAX / (4u * (size_t)head_dim * sizeof(float)));
     if (T < 1) T = 1;
     if (T > tsteps) T = tsteps;
-    shmem = (size_t)4 * (size_t)T * (size_t)head_dim * sizeof(float);
+    shmem = (size_t)4 * (size_t)T * (size_t)head_dim * sizeof(unsigned short);
   }
 
   dim3 block(64, kv_mul);
@@ -2054,50 +2007,43 @@ int *getp_forward(Transformer * /*transformer*/,
 
     int experts_per_device = worker->expert_end - worker->expert_start;
     int cap_pairs = build_moe_buckets_local_pos(
-        ext->local_ids, ext->local_wts, ext->n_local,
-        EXPERT_PARALLELISM * BATCH_SIZE, p->experts_per_token,
-        experts_per_device, ext->e_counts, ext->e_offsets, ext->e_dev,
-        ext->w_dev, ext->pair_pos, compute_stream);
-
-    // tổng số pair = e_offsets[E]
-    int total_pairs = 0;
-    HIP_CHECK(hipMemcpyAsync(&total_pairs, ext->e_offsets + experts_per_device,
-                             sizeof(int), hipMemcpyDeviceToHost,
-                             compute_stream));
-
-    HIP_CHECK(hipStreamSynchronize(compute_stream));
-
-    // scatter x -> a_in theo expert
-    moe_scatter_acts_to_expert_bf16(ext->a_in, ext->ext_t, ext->e_dev,
-                                    total_pairs, hidden_dim, compute_stream);
-
-    // agg buffer
-    HIP_CHECK(hipMemsetAsync(
-        ext->ext_e_agg, 0,
-        (size_t)EXPERT_PARALLELISM * BATCH_SIZE * hidden_dim * sizeof(float),
-        compute_stream));
-
-    __hip_bfloat16 *w1_base = dev_w->w_mlp1 + 1ll * l * experts_per_device * 2 *
-                                                  p->intermediate_dim *
-                                                  hidden_dim;
-    __hip_bfloat16 *b1_base =
-        dev_w->b_mlp1 + 1ll * l * experts_per_device * 2 * p->intermediate_dim;
-
-    launch_mlp1_swiglu_bf16_bucketed_outbf16(
-        ext->gate_up_bf16, ext->a_in, w1_base, b1_base, ext->e_offsets,
-        hidden_dim, p->intermediate_dim, experts_per_device, cap_pairs,
-        p->swiglu_limit, compute_stream);
-
-    __hip_bfloat16 *w2_base = dev_w->w_mlp2 + 1ll * l * experts_per_device *
-                                                  hidden_dim *
-                                                  p->intermediate_dim;
-    __hip_bfloat16 *b2_base =
-        dev_w->b_mlp2 + 1ll * l * experts_per_device * hidden_dim;
-
-    launch_mlp2_partial_bf16_bucketed_frombf16(
-        ext->z_partial, ext->gate_up_bf16, w2_base, b2_base, ext->w_dev,
-        ext->e_offsets, ext->e_dev, p->intermediate_dim, hidden_dim,
-        experts_per_device, cap_pairs, compute_stream);
+      ext->local_ids, ext->local_wts, ext->n_local, batch_size,
+      p->experts_per_token, experts_per_device, ext->e_counts, ext->e_offsets,
+      ext->e_dev, ext->w_dev, ext->pair_pos);
+  
+  int total_pairs = 0;
+  HIP_CHECK(hipMemcpy(&total_pairs, ext->e_offsets + experts_per_device,
+                      sizeof(int), hipMemcpyDeviceToHost));
+  
+  int total_blocks = build_moe_block_schedule(ext->e_offsets, experts_per_device,
+                                              32, ext->blk_counts, ext->blk_offsets);
+  
+  moe_scatter_acts_to_expert_bf16(ext->a_in, dev_s->t, ext->e_dev,
+                                  total_pairs, hidden_dim);
+  
+  HIP_CHECK(hipMemset(dev_s->e_agg, 0,
+                      (size_t)batch_size * hidden_dim * sizeof(float)));
+  
+  __hip_bfloat16 *w1_base = dev_w->w_mlp1 + 1ll * l * experts_per_device * 2 *
+                                                p->intermediate_dim * hidden_dim;
+  __hip_bfloat16 *b1_base =
+      dev_w->b_mlp1 + 1ll * l * experts_per_device * 2 * p->intermediate_dim;
+  
+  launch_mlp1_swiglu_bf16_bucketed_outbf16(
+      ext->gate_up_bf16, ext->a_in, w1_base, b1_base, ext->e_offsets,
+      ext->blk_offsets, hidden_dim, p->intermediate_dim, experts_per_device,
+      total_blocks, p->swiglu_limit);
+  
+  __hip_bfloat16 *w2_base = dev_w->w_mlp2 + 1ll * l * experts_per_device *
+                                                hidden_dim * p->intermediate_dim;
+  __hip_bfloat16 *b2_base =
+      dev_w->b_mlp2 + 1ll * l * experts_per_device * hidden_dim;
+  
+  launch_mlp2_partial_bf16_bucketed_frombf16(
+      ext->z_partial, ext->gate_up_bf16, w2_base, b2_base, ext->w_dev,
+      ext->e_offsets, ext->blk_offsets, ext->e_dev, p->intermediate_dim,
+      hidden_dim, experts_per_device, total_blocks);
+  
 
     moe_gather_pairs(ext->ext_e_agg, ext->z_partial, ext->pair_pos, hidden_dim,
                      p->experts_per_token, EXPERT_PARALLELISM * BATCH_SIZE,

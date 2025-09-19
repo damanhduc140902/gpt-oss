@@ -4,14 +4,14 @@
 #include <cstdlib>
 
 struct RunStateExt {
-  int   *local_ids;
+  int *local_ids;
   float *local_wts;
-  int   *n_local;
-  int   *e_counts;
-  int   *e_offsets;
-  int   *e_dev;
+  int *n_local;
+  int *e_counts;
+  int *e_offsets;
+  int *e_dev;
   float *w_dev;
-  int   *pair_pos;
+  int *pair_pos;
   float *z_partial;
 
   int *ext_topk_i;
@@ -20,8 +20,9 @@ struct RunStateExt {
   // float *ext_gate_up;
   float *ext_t;
   float *ext_e_agg;
-
-  __hip_bfloat16 *a_in;          
+  int *blk_counts;
+  int *blk_offsets;
+  __hip_bfloat16 *a_in;
   __hip_bfloat16 *gate_up_bf16;
 };
 
