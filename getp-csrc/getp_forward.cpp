@@ -178,14 +178,15 @@ __global__ void moe_blocks_per_expert_kernel(const int *offsets, int E, int BM,
 }
 
 static inline int build_moe_block_schedule(const int *offsets, int E, int BM,
-                                           int *blk_counts, int *blk_offsets) {
+                                           int *blk_counts, int *blk_offsets, hipStream_t stream) {
   dim3 b(256), g((E + b.x - 1) / b.x);
-  moe_blocks_per_expert_kernel<<<g, b>>>(offsets, E, BM, blk_counts);
-  exclusive_scan_small_kernel<<<dim3(1), dim3(256), sizeof(int) * 256>>>(
+  moe_blocks_per_expert_kernel<<<g, b, 0, stream>>>(offsets, E, BM, blk_counts);
+  exclusive_scan_small_kernel<<<dim3(1), dim3(256), sizeof(int) * 256, stream>>>(
       blk_counts, blk_offsets, E);
   int total_blocks = 0;
-  HIP_CHECK(hipMemcpy(&total_blocks, blk_offsets + E, sizeof(int),
-                      hipMemcpyDeviceToHost));
+  HIP_CHECK(hipMemcpyAsync(&total_blocks, blk_offsets + E, sizeof(int),
+                           hipMemcpyDeviceToHost, stream));
+  HIP_CHECK(hipStreamSynchronize(stream));
   return total_blocks;
 }
 
@@ -467,14 +468,14 @@ static inline void launch_mlp1_swiglu_bf16_bucketed_outbf16(
     __hip_bfloat16 *gate_up_bf16, const __hip_bfloat16 *a_in,
     const __hip_bfloat16 *w1_layer, const __hip_bfloat16 *b1_layer,
     const int *offsets, const int *blk_offs, int H, int I, int E,
-    int total_blocks, float swiglu_limit) {
+    int total_blocks, float swiglu_limit, hipStream_t stream) {
   constexpr int BM = 32, BN = 32, BK = 32;
   const int BNt = BN * GETP_BN_AGG;
   dim3 block(256);
   dim3 grid((I + BNt - 1) / BNt, total_blocks);
   size_t shmem =
       (size_t)BK * ((size_t)BM + (size_t)BNt + (size_t)BNt) * sizeof(unsigned short);
-  mlp1_swiglu_bf16_bucketed_kernel_outbf16<<<grid, block, shmem>>>(
+  mlp1_swiglu_bf16_bucketed_kernel_outbf16<<<grid, block, shmem, stream>>>(
       gate_up_bf16, a_in, w1_layer, b1_layer, offsets, blk_offs, H, I, E,
       swiglu_limit);
   // HIP_CHECK(hipDeviceSynchronize());
@@ -663,7 +664,7 @@ static inline void launch_mlp2_partial_bf16_bucketed_frombf16(
     float *z_partial, const __hip_bfloat16 *gate_up_bf16,
     const __hip_bfloat16 *w2_layer, const __hip_bfloat16 *b2_layer,
     const float *w_by_bucket, const int *offsets, const int *blk_offs,
-    const int *tok_idx, int I, int H, int E, int total_blocks) {
+    const int *tok_idx, int I, int H, int E, int total_blocks, hipStream_t stream) {
   PROFILE_FUNCTION();
   constexpr int BN = 32, BM = 32, BK = 32;
   const int BNt = BN * GETP_BN_AGG;
@@ -695,8 +696,7 @@ static inline void launch_mlp2_partial_bf16_bucketed_frombf16(
   dim3 grid(gx, gy, splits);
   size_t shmem = (size_t)BK * ((size_t)BM + (size_t)BNt) * sizeof(unsigned short);
 
-  mlp2_partial_bf16_bucketed_splitk_kernel_inbf16<<<grid, block, shmem,
-                                                    stream>>>(
+  mlp2_partial_bf16_bucketed_splitk_kernel_inbf16<<<grid, block, shmem, stream>>>(
       z_partial, gate_up_bf16, w2_layer, b2_layer, w_by_bucket, offsets,
       blk_offs, tok_idx, I, H, E, splits);
 }
@@ -2007,42 +2007,45 @@ int *getp_forward(Transformer * /*transformer*/,
 
     int experts_per_device = worker->expert_end - worker->expert_start;
     int cap_pairs = build_moe_buckets_local_pos(
-      ext->local_ids, ext->local_wts, ext->n_local, batch_size,
-      p->experts_per_token, experts_per_device, ext->e_counts, ext->e_offsets,
-      ext->e_dev, ext->w_dev, ext->pair_pos);
+        ext->local_ids, ext->local_wts, ext->n_local,
+        EXPERT_PARALLELISM * BATCH_SIZE, p->experts_per_token,
+        experts_per_device, ext->e_counts, ext->e_offsets, ext->e_dev,
+        ext->w_dev, ext->pair_pos, compute_stream);
   
-  int total_pairs = 0;
-  HIP_CHECK(hipMemcpy(&total_pairs, ext->e_offsets + experts_per_device,
-                      sizeof(int), hipMemcpyDeviceToHost));
-  
-  int total_blocks = build_moe_block_schedule(ext->e_offsets, experts_per_device,
-                                              32, ext->blk_counts, ext->blk_offsets);
-  
-  moe_scatter_acts_to_expert_bf16(ext->a_in, dev_s->t, ext->e_dev,
-                                  total_pairs, hidden_dim);
-  
-  HIP_CHECK(hipMemset(dev_s->e_agg, 0,
-                      (size_t)batch_size * hidden_dim * sizeof(float)));
-  
-  __hip_bfloat16 *w1_base = dev_w->w_mlp1 + 1ll * l * experts_per_device * 2 *
-                                                p->intermediate_dim * hidden_dim;
-  __hip_bfloat16 *b1_base =
-      dev_w->b_mlp1 + 1ll * l * experts_per_device * 2 * p->intermediate_dim;
-  
-  launch_mlp1_swiglu_bf16_bucketed_outbf16(
-      ext->gate_up_bf16, ext->a_in, w1_base, b1_base, ext->e_offsets,
-      ext->blk_offsets, hidden_dim, p->intermediate_dim, experts_per_device,
-      total_blocks, p->swiglu_limit);
-  
-  __hip_bfloat16 *w2_base = dev_w->w_mlp2 + 1ll * l * experts_per_device *
-                                                hidden_dim * p->intermediate_dim;
-  __hip_bfloat16 *b2_base =
-      dev_w->b_mlp2 + 1ll * l * experts_per_device * hidden_dim;
-  
-  launch_mlp2_partial_bf16_bucketed_frombf16(
-      ext->z_partial, ext->gate_up_bf16, w2_base, b2_base, ext->w_dev,
-      ext->e_offsets, ext->blk_offsets, ext->e_dev, p->intermediate_dim,
-      hidden_dim, experts_per_device, total_blocks);
+    int total_pairs = 0;
+    HIP_CHECK(hipMemcpyAsync(&total_pairs, ext->e_offsets + experts_per_device,
+                            sizeof(int), hipMemcpyDeviceToHost, compute_stream));
+    
+    int total_blocks = build_moe_block_schedule(ext->e_offsets, experts_per_device,
+                                                32, ext->blk_counts, ext->blk_offsets, compute_stream);
+    
+    moe_scatter_acts_to_expert_bf16(ext->a_in, ext->ext_t, ext->e_dev,
+                                    total_pairs, hidden_dim, compute_stream);
+    
+    HIP_CHECK(hipMemsetAsync(
+          ext->ext_e_agg, 0,
+          (size_t)EXPERT_PARALLELISM * BATCH_SIZE * hidden_dim * sizeof(float),
+          compute_stream));
+    
+    __hip_bfloat16 *w1_base = dev_w->w_mlp1 + 1ll * l * experts_per_device * 2 *
+                                                  p->intermediate_dim * hidden_dim;
+    __hip_bfloat16 *b1_base =
+        dev_w->b_mlp1 + 1ll * l * experts_per_device * 2 * p->intermediate_dim;
+    
+    launch_mlp1_swiglu_bf16_bucketed_outbf16(
+        ext->gate_up_bf16, ext->a_in, w1_base, b1_base, ext->e_offsets,
+        ext->blk_offsets, hidden_dim, p->intermediate_dim, experts_per_device,
+        total_blocks, p->swiglu_limit, compute_stream);
+    
+    __hip_bfloat16 *w2_base = dev_w->w_mlp2 + 1ll * l * experts_per_device *
+                                                  hidden_dim * p->intermediate_dim;
+    __hip_bfloat16 *b2_base =
+        dev_w->b_mlp2 + 1ll * l * experts_per_device * hidden_dim;
+    
+    launch_mlp2_partial_bf16_bucketed_frombf16(
+        ext->z_partial, ext->gate_up_bf16, w2_base, b2_base, ext->w_dev,
+        ext->e_offsets, ext->blk_offsets, ext->e_dev, p->intermediate_dim,
+        hidden_dim, experts_per_device, total_blocks, compute_stream);
   
 
     moe_gather_pairs(ext->ext_e_agg, ext->z_partial, ext->pair_pos, hidden_dim,
