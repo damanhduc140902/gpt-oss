@@ -1740,7 +1740,7 @@ static inline void getp_flash_attn_decode_bf16(
     T = (int)(LDS_MAX / (4u * (size_t)head_dim * sizeof(float)));
     if (T < 1) T = 1;
     if (T > tsteps) T = tsteps;
-    shmem = (size_t)4 * (size_t)T * (size_t)head_dim * sizeof(float);
+    shmem = (size_t)4 * (size_t)T * (size_t)head_dim * sizeof(unsigned short);
   }
 
   dim3 block(64, kv_mul);
