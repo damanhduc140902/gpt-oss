@@ -2088,11 +2088,23 @@ int *getp_forward_120b(Transformer * /*transformer*/,
   RunState *dev_s = &dev_transformers[device_index]->state;
   RunStateExt *ext = ext_get(device_index);
   hipStream_t compute_stream = dev_transformers[device_index]->compute_stream;
+  hipStream_t memory_stream = dev_transformers[device_index]->memory_stream;
 
   float *dev_x = dev_s->x;
 
   // Note: 1 thread - 1 gpu => only need to set device once
   HIP_CHECK(hipSetDevice(device_index));
+
+  hipEvent_t event_rmsnorm;
+  hipEvent_t event_router_topk;
+  hipEvent_t event_memset;
+  hipEvent_t events_e_agg[MAXIMUM_GPU];
+  HIP_CHECK(hipEventCreate(&event_rmsnorm));
+  HIP_CHECK(hipEventCreate(&event_router_topk));
+  HIP_CHECK(hipEventCreate(&event_memset));
+  for (int i = 0; i < EXPERT_PARALLELISM; ++i) {
+    HIP_CHECK(hipEventCreate(&events_e_agg[i]));
+  }
 
   HIP_CHECK(hipMemcpyAsync(dev_s->topk_i, token, sizeof(int) * BATCH_SIZE,
                            hipMemcpyHostToDevice, compute_stream));
@@ -2187,19 +2199,23 @@ int *getp_forward_120b(Transformer * /*transformer*/,
 
       getp_vecadd(dev_x, dev_s->tb2, hidden_dim, BATCH_SIZE, compute_stream);
 
-      getp_rmsnorm(dev_s->t, dev_x, dev_w->rms_ffn_w + 1ll * l * hidden_dim,
+      getp_rmsnorm(ext->ext_t + (size_t)device_index * BATCH_SIZE * hidden_dim, 
+                   dev_x, dev_w->rms_ffn_w + 1ll * l * hidden_dim,
                    BATCH_SIZE, hidden_dim, compute_stream);
+
+      HIP_CHECK(hipEventRecord(event_rmsnorm, compute_stream));
 
       __hip_bfloat16 *dev_w_router =
           dev_w->w_router_bf16 + 1ll * l * hidden_dim * n_experts;
       __hip_bfloat16 *dev_b_router = dev_w->b_router_bf16 + 1ll * l * n_experts;
-      getp_matmul<__hip_bfloat16>(dev_s->router_score, dev_s->t, dev_w_router,
-                                  dev_b_router, hidden_dim, n_experts,
+      getp_matmul<__hip_bfloat16>(dev_s->router_score, ext->ext_t + (size_t)device_index * BATCH_SIZE * hidden_dim, 
+                                  dev_w_router, dev_b_router, hidden_dim, n_experts,
                                   BATCH_SIZE, compute_stream);
 
       getp_router_topk_softmax_batch(dev_s->router_score, n_experts,
-                                     p->experts_per_token, dev_s->topk_v,
-                                     dev_s->topk_i, BATCH_SIZE, compute_stream);
+                                     p->experts_per_token, ext->ext_topk_v + (size_t)device_index * BATCH_SIZE * p->experts_per_token,
+                                     ext->ext_topk_i + (size_t)device_index * BATCH_SIZE * p->experts_per_token, BATCH_SIZE, compute_stream);
+      HIP_CHECK(hipEventRecord(event_router_topk, compute_stream));
     }
 
     // Brief explain: Main device 0 gathers all dev_s->t from other devices then
@@ -2207,63 +2223,43 @@ int *getp_forward_120b(Transformer * /*transformer*/,
     // EXPERT_PARALLELISM tokens input Evaluate router score and distribute the
     // tokens to the experts as the same as in the previous commit
 
-    // TODO: Remove below synchronization
-    // TODO: Add comm-comp overlapping
-
-    hipEvent_t ev_ready;
-    HIP_CHECK(hipEventCreateWithFlags(&ev_ready, hipEventDisableTiming));
-    HIP_CHECK(hipEventRecord(ev_ready, compute_stream));
-    HIP_CHECK(hipStreamWaitEvent(g_world.comm[device_index], ev_ready, 0));
-
+    HIP_CHECK(hipStreamWaitEvent(memory_stream, event_rmsnorm));
     for (int i = 0; i < EXPERT_PARALLELISM; ++i) {
-      const int peer_device_index = workers[i].device_index;
+      GPUWorker *peer_worker = &workers[i];
+      int peer_device_index = peer_worker->device_index;
+      RunState *peer_dev_s = &dev_transformers[peer_device_index]->state;
       RunStateExt *peer_ext = ext_get(peer_device_index);
 
-      if (peer_device_index == device_index) {
-        HIP_CHECK(hipMemcpyAsync(
-            ext->ext_t + (size_t)device_index * BATCH_SIZE * hidden_dim,
-            dev_s->t, (size_t)BATCH_SIZE * hidden_dim * sizeof(float),
-            hipMemcpyDeviceToDevice, g_world.comm[device_index]));
-        HIP_CHECK(hipMemcpyAsync(
-            ext->ext_topk_i +
-                (size_t)device_index * BATCH_SIZE * p->experts_per_token,
-            dev_s->topk_i,
-            (size_t)BATCH_SIZE * p->experts_per_token * sizeof(int),
-            hipMemcpyDeviceToDevice, g_world.comm[device_index]));
-        HIP_CHECK(hipMemcpyAsync(
-            ext->ext_topk_v +
-                (size_t)device_index * BATCH_SIZE * p->experts_per_token,
-            dev_s->topk_v,
-            (size_t)BATCH_SIZE * p->experts_per_token * sizeof(float),
-            hipMemcpyDeviceToDevice, g_world.comm[device_index]));
-      } else {
+      if (peer_device_index != device_index) {
         HIP_CHECK(hipMemcpyPeerAsync(
-            peer_ext->ext_t + (size_t)device_index * BATCH_SIZE * hidden_dim,
-            peer_device_index, dev_s->t, device_index,
-            (size_t)BATCH_SIZE * hidden_dim * sizeof(float),
-            g_world.comm[device_index]));
-        HIP_CHECK(hipMemcpyPeerAsync(
-            peer_ext->ext_topk_i +
-                (size_t)device_index * BATCH_SIZE * p->experts_per_token,
-            peer_device_index, dev_s->topk_i, device_index,
-            (size_t)BATCH_SIZE * p->experts_per_token * sizeof(int),
-            g_world.comm[device_index]));
-        HIP_CHECK(hipMemcpyPeerAsync(
-            peer_ext->ext_topk_v +
-                (size_t)device_index * BATCH_SIZE * p->experts_per_token,
-            peer_device_index, dev_s->topk_v, device_index,
-            (size_t)BATCH_SIZE * p->experts_per_token * sizeof(float),
-            g_world.comm[device_index]));
+          peer_ext->ext_t + (size_t)device_index * BATCH_SIZE * hidden_dim, peer_device_index,
+          ext->ext_t + (size_t)device_index * BATCH_SIZE * hidden_dim, device_index, 
+          sizeof(float) * BATCH_SIZE * hidden_dim, 
+          memory_stream));
+      }
+    }
+    HIP_CHECK(hipStreamWaitEvent(memory_stream, event_router_topk));
+    for (int i = 0; i < EXPERT_PARALLELISM; ++i) {
+      GPUWorker *peer_worker = &workers[i];
+      int peer_device_index = peer_worker->device_index;
+
+      RunState *peer_dev_s = &dev_transformers[peer_device_index]->state;
+      RunStateExt *peer_ext = ext_get(peer_device_index);
+      
+      if (peer_device_index != device_index) {
+        HIP_CHECK(hipMemcpyPeerAsync(peer_ext->ext_topk_i + (size_t)device_index * BATCH_SIZE * p->experts_per_token, peer_device_index,
+          ext->ext_topk_i + (size_t)device_index * BATCH_SIZE * p->experts_per_token, device_index, 
+          sizeof(int) * BATCH_SIZE * p->experts_per_token, 
+          memory_stream));
+        HIP_CHECK(hipMemcpyPeerAsync(peer_ext->ext_topk_v + (size_t)device_index * BATCH_SIZE * p->experts_per_token, peer_device_index,
+          ext->ext_topk_v + (size_t)device_index * BATCH_SIZE * p->experts_per_token, device_index, 
+          sizeof(float) * BATCH_SIZE * p->experts_per_token, 
+          memory_stream));
       }
     }
 
-    HIP_CHECK(hipEventDestroy(ev_ready));
-    sync_workers(g_world.comm[device_index], sync_point);
-
-    HIP_CHECK(hipMemsetAsync(
-        ext->ext_e_agg, 0,
-        (size_t)EXPERT_PARALLELISM * BATCH_SIZE * hidden_dim * sizeof(float),
-        compute_stream));
+    HIP_CHECK(hipStreamSynchronize(memory_stream));
+    sync_workers(compute_stream, sync_point);
 
     // MOE
     HIP_CHECK(hipSetDevice(device_index));
@@ -2295,7 +2291,8 @@ int *getp_forward_120b(Transformer * /*transformer*/,
     HIP_CHECK(hipMemsetAsync(
         ext->ext_e_agg, 0,
         (size_t)EXPERT_PARALLELISM * BATCH_SIZE * hidden_dim * sizeof(float),
-        compute_stream));
+        memory_stream));
+    HIP_CHECK(hipEventRecord(event_memset, memory_stream));
 
     __hip_bfloat16 *w1_base = dev_w->w_mlp1 + 1ll * l * experts_per_device * 2 *
                                                   p->intermediate_dim *
@@ -2319,36 +2316,42 @@ int *getp_forward_120b(Transformer * /*transformer*/,
         ext->e_offsets, ext->blk_offsets, ext->e_dev, p->intermediate_dim,
         hidden_dim, experts_per_device, total_blocks, compute_stream);
 
+    HIP_CHECK(hipStreamWaitEvent(compute_stream, event_memset));
     moe_gather_pairs(ext->ext_e_agg, ext->z_partial, ext->pair_pos, hidden_dim,
                      p->experts_per_token, EXPERT_PARALLELISM * BATCH_SIZE,
                      compute_stream);
 
     sync_workers(compute_stream, sync_point);
 
-    float *buffers_e_agg[MAXIMUM_GPU];
-    for (int i = 0; i < EXPERT_PARALLELISM; ++i) {
+    getp_vecadd(dev_x, ext->ext_e_agg + (size_t)device_index * BATCH_SIZE * hidden_dim, hidden_dim, BATCH_SIZE, compute_stream);
+    for (int i = 0, j = 0; i < EXPERT_PARALLELISM; ++i) {
       GPUWorker *peer_worker = &workers[i];
       int peer_device_index = peer_worker->device_index;
 
       RunStateExt *peer_ext = ext_get(peer_device_index);
 
-      buffers_e_agg[i] =
-          peer_ext->ext_e_agg + (size_t)device_index * BATCH_SIZE * hidden_dim;
+      if (peer_device_index != device_index) {
+        HIP_CHECK(hipMemcpyPeerAsync(
+          ext->peer_e_agg + (size_t)j * BATCH_SIZE * hidden_dim, device_index, 
+          peer_ext->ext_e_agg + (size_t)device_index * BATCH_SIZE * hidden_dim, peer_device_index, 
+          sizeof(float) * BATCH_SIZE * hidden_dim, memory_stream));
+        HIP_CHECK(hipEventRecord(events_e_agg[j], memory_stream));
+        ++j;
+      }
     }
+    for (int i = 0, j = 0; i < EXPERT_PARALLELISM; ++i) {
+      GPUWorker *peer_worker = &workers[i];
+      int peer_device_index = peer_worker->device_index;
 
-    cgReduceSumF32(g_world, buffers_e_agg, BATCH_SIZE * (size_t)hidden_dim,
-                   device_index);
+      RunStateExt *peer_ext = ext_get(peer_device_index);
 
-    // Make sure that the reduction in device 0 is done
-    sync_workers(compute_stream, sync_point);
-
-    HIP_CHECK(hipMemcpyAsync(dev_s->e_agg, buffers_e_agg[device_index],
-                             sizeof(float) * BATCH_SIZE * hidden_dim,
-                             hipMemcpyDeviceToDevice, compute_stream));
-
-    getp_vecadd(dev_x, dev_s->e_agg, hidden_dim, BATCH_SIZE, compute_stream);
-
-    // TODO: Is it necessary?
+      if (peer_device_index != device_index) {
+        HIP_CHECK(hipStreamWaitEvent(compute_stream, events_e_agg[j]));
+        getp_vecadd(dev_x, ext->peer_e_agg + (size_t)j * BATCH_SIZE * hidden_dim, hidden_dim, BATCH_SIZE, compute_stream);
+        ++j;
+      }
+    }
+    
     sync_workers(compute_stream, sync_point);
   }
 

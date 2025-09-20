@@ -39,6 +39,7 @@ void ext_alloc_device(int device_index, int batch_size, int expert_parallelism, 
   // HIP_CHECK(hipMalloc(&g_ext[device_index].ext_gate_up,      sizeof(float) * (size_t)expert_parallelism * batch_size * experts_per_token * intermediate_dim));
   HIP_CHECK(hipMalloc(&g_ext[device_index].ext_t,            sizeof(float) * (size_t)expert_parallelism * batch_size * hidden_dim));
   HIP_CHECK(hipMalloc(&g_ext[device_index].ext_e_agg,        sizeof(float) * (size_t)expert_parallelism * batch_size * hidden_dim));
+  HIP_CHECK(hipMalloc(&g_ext[device_index].peer_e_agg,       sizeof(float) * (size_t)expert_parallelism * batch_size * hidden_dim));
 
   HIP_CHECK(hipMalloc(&g_ext[device_index].blk_counts,  sizeof(int) * (size_t)n_experts));
   HIP_CHECK(hipMalloc(&g_ext[device_index].blk_offsets, sizeof(int) * (size_t)(n_experts + 1)));
@@ -66,6 +67,7 @@ void ext_free_all(int n_devices) {
     // if (g_ext[i].ext_gate_up)       HIP_CHECK(hipFree(g_ext[i].ext_gate_up));
     if (g_ext[i].ext_t)             HIP_CHECK(hipFree(g_ext[i].ext_t));
     if (g_ext[i].ext_e_agg)         HIP_CHECK(hipFree(g_ext[i].ext_e_agg));
+    if (g_ext[i].peer_e_agg)        HIP_CHECK(hipFree(g_ext[i].peer_e_agg));
 
     if (g_ext[i].blk_counts)  HIP_CHECK(hipFree(g_ext[i].blk_counts));
     if (g_ext[i].blk_offsets) HIP_CHECK(hipFree(g_ext[i].blk_offsets));

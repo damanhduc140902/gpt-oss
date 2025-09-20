@@ -20,6 +20,8 @@ struct RunStateExt {
   // float *ext_gate_up;
   float *ext_t;
   float *ext_e_agg;
+  float *peer_e_agg;
+
   int *blk_counts;
   int *blk_offsets;
   __hip_bfloat16 *a_in;
