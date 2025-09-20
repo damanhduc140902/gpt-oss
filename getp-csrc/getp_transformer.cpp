@@ -219,7 +219,7 @@ void init_device_run_state(RunState *s, Config *p) {
   HIP_CHECK(hipMalloc(&s->value_cache, (size_t)BATCH_SIZE * total_t * (size_t)kv_dim * sizeof(__hip_bfloat16)));
 
   s->att = nullptr;
-  HIP_CHECK(hipMalloc(&s->logits, (size_t)BATCH_SIZE * p->vocab_size * sizeof(float)));
+  s->logits = nullptr;
   s->mask = NULL;
 }
 
@@ -260,7 +260,7 @@ void free_device_run_state(RunState *s) {
   if (s->qkv) HIP_CHECK(hipFree(s->qkv));
   HIP_CHECK(hipFree(s->q));
   if (s->att) HIP_CHECK(hipFree(s->att));
-  HIP_CHECK(hipFree(s->logits));
+  if (s->logits) HIP_CHECK(hipFree(s->logits));
   HIP_CHECK(hipFree(s->key_cache));
   HIP_CHECK(hipFree(s->value_cache));
   if (s->mask) HIP_CHECK(hipFree(s->mask));
