@@ -11,7 +11,6 @@
 #include "getp_state_ext.hpp"
 #include "getp_transformer.cpp"
 #include "getp_transformer.hpp"
-#include "profiler.hpp"
 
 #ifndef GEMV_TILE_N
 #define GEMV_TILE_N 512
@@ -66,19 +65,12 @@ __global__ void rmsnorm_kernel(float *o, float *x, float *weight, int size) {
 }
 void getp_rmsnorm(float *o, float *x, float *weight, int batch_size, int dim,
                   hipStream_t stream) {
-  PROFILE_FUNCTION();
+  
   dim3 blockDim(1024);
   dim3 gridDim(1, batch_size);
   rmsnorm_kernel<<<gridDim, blockDim, sizeof(float) * (blockDim.x + 1),
                    stream>>>(o, x, weight, dim);
-  // HIP_CHECK(hipDeviceSynchronize());
-}
-
-// Warp reduce sum (HIP wavefront = 64)
-__device__ inline float warp_sum_f32(float v) {
-#pragma unroll
-  for (int off = warpSize >> 1; off > 0; off >>= 1) v += __shfl_down(v, off);
-  return v;
+  
 }
 
 union __bf16_bits_u {
@@ -535,7 +527,7 @@ static inline void launch_mlp1_swiglu_bf16_bucketed_outbf16(
   mlp1_swiglu_bf16_bucketed_kernel_outbf16<<<grid, block, shmem, stream>>>(
       gate_up_bf16, a_in, w1_layer, b1_layer, offsets, blk_offs, H, I, E,
       swiglu_limit);
-  // HIP_CHECK(hipDeviceSynchronize());
+  
 }
 
 __global__ void __launch_bounds__(256)
@@ -740,7 +732,7 @@ static inline void launch_mlp2_partial_bf16_bucketed_frombf16(
     const float *w_by_bucket, const int *offsets, const int *blk_offs,
     const int *tok_idx, int I, int H, int E, int total_blocks,
     hipStream_t stream) {
-  PROFILE_FUNCTION();
+  
   constexpr int BN = 32, BM = 32, BK = 32;
   const int BNt = BN * GETP_BN_AGG;
   const int gx = (H + BNt - 1) / BNt;
@@ -801,175 +793,6 @@ static inline void moe_gather_pairs(float *e_agg, const float *z_partial,
   dim3 blk(256), grd((H + blk.x - 1) / blk.x, B);
   moe_gather_pairs_kernel<<<grd, blk, 0, stream>>>(e_agg, z_partial, pair_pos,
                                                    H, K, B);
-}
-
-#ifndef GETP_QKV_AGG
-#define GETP_QKV_AGG 4
-#endif
-__global__ void __launch_bounds__(256) matmul_qkv_fused_kernel(
-    float *__restrict__ q_out, float *__restrict__ k_out,
-    float *__restrict__ v_out, const float *__restrict__ x,
-    const __hip_bfloat16 *__restrict__ W, const __hip_bfloat16 *__restrict__ B,
-    int n, int q_len, int k_len, int v_len, int batch_size) {
-  constexpr int BM = 32, BN = 32, BK = 32, WM = 16, WN = 16;
-  const int BNt = BN * GETP_QKV_AGG;
-
-  const int M = batch_size;
-  const int K = n;
-  const int N = q_len + k_len + v_len;
-
-  const int wave = threadIdx.x >> 6;
-  const int lane = threadIdx.x & 63;
-  const int xTile = wave % (BM / WM);
-  const int yTile = wave / (BM / WM);
-  const int xMF = lane & 15;
-  const int yMF = lane >> 4;
-
-  const int loadX_x = threadIdx.x % (BK / 4);
-  const int loadX_y = threadIdx.x / (BK / 4);
-  const int loadW_x = threadIdx.x % (BK / 8);
-  const int loadW_y = threadIdx.x / (BK / 8);
-  constexpr int strideX = 256 / (BK / 4);
-  constexpr int strideW = 256 / (BK / 8);
-
-  extern __shared__ unsigned short sm[];
-  unsigned short *sx0 = sm;
-  unsigned short *sw0 = sx0 + (size_t)BK * BM;
-  unsigned short *sx1 = sw0 + (size_t)BK * BNt;
-  unsigned short *sw1 = sx1 + (size_t)BK * BM;
-
-  f32x4 d0 = {0, 0, 0, 0}, d1 = {0, 0, 0, 0}, d2 = {0, 0, 0, 0},
-        d3 = {0, 0, 0, 0};
-
-  const int rowBase = blockIdx.y * BM;
-  const int colBase = blockIdx.x * BNt;
-
-  auto prefetch = [&](int bk, unsigned short *sx, unsigned short *sw) {
-    for (int off = 0; off < BM; off += strideX) {
-      if (loadX_y + off >= BM) break;
-      const int kk = bk + 4 * loadX_x;
-      const int row = rowBase + loadX_y + off;
-      if (row < M) {
-        if (kk + 3 < K) {
-          float4 v =
-              *reinterpret_cast<const float4 *>(x + (size_t)row * K + kk);
-          sx[(4 * loadX_x + 0) * BM + (loadX_y + off)] = f32_to_bf16bits(v.x);
-          sx[(4 * loadX_x + 1) * BM + (loadX_y + off)] = f32_to_bf16bits(v.y);
-          sx[(4 * loadX_x + 2) * BM + (loadX_y + off)] = f32_to_bf16bits(v.z);
-          sx[(4 * loadX_x + 3) * BM + (loadX_y + off)] = f32_to_bf16bits(v.w);
-        } else {
-          for (int t = 0; t < 4; ++t) {
-            int kx = kk + t;
-            unsigned short val = 0;
-            if (kx < K) val = f32_to_bf16bits(x[(size_t)row * K + kx]);
-            sx[(4 * loadX_x + t) * BM + (loadX_y + off)] = val;
-          }
-        }
-      }
-    }
-    for (int off = 0; off < BNt; off += strideW) {
-      if (loadW_y + off >= BNt) break;
-      const int kk = bk + 8 * loadW_x;
-      const int col = colBase + loadW_y + off;
-      unsigned short *dst = sw + (size_t)(8 * loadW_x) * BNt + (loadW_y + off);
-      if (col < N) {
-        if (kk + 7 < K) {
-          uint4 t = *reinterpret_cast<const uint4 *>(W + (size_t)col * K + kk);
-          dst[0 * BNt] = (unsigned short)(t.x & 0xFFFF);
-          dst[1 * BNt] = (unsigned short)(t.x >> 16);
-          dst[2 * BNt] = (unsigned short)(t.y & 0xFFFF);
-          dst[3 * BNt] = (unsigned short)(t.y >> 16);
-          dst[4 * BNt] = (unsigned short)(t.z & 0xFFFF);
-          dst[5 * BNt] = (unsigned short)(t.z >> 16);
-          dst[6 * BNt] = (unsigned short)(t.w & 0xFFFF);
-          dst[7 * BNt] = (unsigned short)(t.w >> 16);
-        } else {
-          for (int t = 0; t < 8; ++t) {
-            int kx = kk + t;
-            unsigned short val = 0;
-            if (kx < K)
-              val = reinterpret_cast<const unsigned short *>(
-                  W + (size_t)col * K + kx)[0];
-            dst[t * BNt] = val;
-          }
-        }
-      } else {
-        for (int t = 0; t < 8; ++t) dst[t * BNt] = 0;
-      }
-    }
-  };
-
-  int bk = 0;
-  if (K > 0) prefetch(0, sx0, sw0);
-  __syncthreads();
-  bool ping = true;
-
-  for (; bk < K; bk += BK) {
-    unsigned short *sx = ping ? sx0 : sx1;
-    unsigned short *sw = ping ? sw0 : sw1;
-    int nxt = bk + BK;
-    if (nxt < K) prefetch(nxt, ping ? sx1 : sx0, ping ? sw1 : sw0);
-
-    for (int k = 0; k < BK; k += 16) {
-      const int basek = k + yMF * 4;
-      const int row = yTile * WM + xMF;
-      const int c = xTile * WN + xMF;
-
-      bf16x4 av = {sx[(basek + 0) * BM + row], sx[(basek + 1) * BM + row],
-                   sx[(basek + 2) * BM + row], sx[(basek + 3) * BM + row]};
-      bf16x4 b0 = {sw[(basek + 0) * BNt + c + 0 * BN],
-                   sw[(basek + 1) * BNt + c + 0 * BN],
-                   sw[(basek + 2) * BNt + c + 0 * BN],
-                   sw[(basek + 3) * BNt + c + 0 * BN]};
-      bf16x4 b1 = {sw[(basek + 0) * BNt + c + 1 * BN],
-                   sw[(basek + 1) * BNt + c + 1 * BN],
-                   sw[(basek + 2) * BNt + c + 1 * BN],
-                   sw[(basek + 3) * BNt + c + 1 * BN]};
-      bf16x4 b2 = {sw[(basek + 0) * BNt + c + 2 * BN],
-                   sw[(basek + 1) * BNt + c + 2 * BN],
-                   sw[(basek + 2) * BNt + c + 2 * BN],
-                   sw[(basek + 3) * BNt + c + 2 * BN]};
-      bf16x4 b3 = {sw[(basek + 0) * BNt + c + 3 * BN],
-                   sw[(basek + 1) * BNt + c + 3 * BN],
-                   sw[(basek + 2) * BNt + c + 3 * BN],
-                   sw[(basek + 3) * BNt + c + 3 * BN]};
-
-      d0 = __builtin_amdgcn_mfma_f32_16x16x16bf16_1k(av, b0, d0, 0, 0, 0);
-      d1 = __builtin_amdgcn_mfma_f32_16x16x16bf16_1k(av, b1, d1, 0, 0, 0);
-      d2 = __builtin_amdgcn_mfma_f32_16x16x16bf16_1k(av, b2, d2, 0, 0, 0);
-      d3 = __builtin_amdgcn_mfma_f32_16x16x16bf16_1k(av, b3, d3, 0, 0, 0);
-    }
-    __syncthreads();
-    ping = !ping;
-  }
-
-  const int xD = lane & 15;
-  const int yD = 4 * (lane >> 4);
-  for (int i = 0; i < 4; ++i) {
-    const int row = rowBase + yTile * WM + (yD + i);
-    if (row >= M) continue;
-
-    auto store = [&](int col, float val) {
-      if (col >= N) return;
-      float r = val;
-      if (B) r += __bfloat162float(B[col]);
-      if (col < q_len)
-        q_out[(size_t)row * q_len + col] = r;
-      else if (col < q_len + k_len)
-        k_out[(size_t)row * k_len + (col - q_len)] = r;
-      else
-        v_out[(size_t)row * v_len + (col - q_len - k_len)] = r;
-    };
-
-    const int c0 = colBase + xTile * WN + xD + 0 * BN;
-    const int c1 = colBase + xTile * WN + xD + 1 * BN;
-    const int c2 = colBase + xTile * WN + xD + 2 * BN;
-    const int c3 = colBase + xTile * WN + xD + 3 * BN;
-    store(c0, d0[i]);
-    store(c1, d1[i]);
-    store(c2, d2[i]);
-    store(c3, d3[i]);
-  }
 }
 
 __global__ void __launch_bounds__(256)
@@ -1163,7 +986,7 @@ static inline void getp_matmul_qkv_fused_bf16(
     float *q, float *k, float *v, float *x, __hip_bfloat16 *w_qkv_bf16,
     __hip_bfloat16 *b_qkv_bf16, int n, int head_dim, int n_attn_heads,
     int n_kv_heads, int batch_size, hipStream_t stream) {
-  PROFILE_FUNCTION();
+  
   const int q_len = head_dim * n_attn_heads;
   const int k_len = head_dim * n_kv_heads;
   const int v_len = head_dim * n_kv_heads;
@@ -1181,7 +1004,7 @@ static inline void getp_matmul_qkv_fused_bf16(
 
   new_matmul_qkv_fused_kernel<<<grid, block, 0, stream>>>(
       q, k, v, x, w_qkv_bf16, b_qkv_bf16, n, q_len, k_len, v_len, batch_size);
-  // HIP_CHECK(hipDeviceSynchronize());
+  
 }
 
 __global__ void __launch_bounds__(256)
@@ -1520,251 +1343,10 @@ __global__ void reduce_splitk_with_bias(float *__restrict__ out,
   out[idx] = s;
 }
 
-__device__ inline unsigned long long pack_key_f32_i32(float v, int idx) {
-  unsigned u = __float_as_uint(v);
-  unsigned s = u >> 31;
-  u ^= s ? 0xFFFFFFFFu : 0x80000000u;
-  unsigned idxk = 0xFFFFFFFFu - (unsigned)idx;
-  return ((unsigned long long)u << 32) | idxk;
-}
-__device__ inline int unpack_idx_i32(unsigned long long k) {
-  return (int)(0xFFFFFFFFu - (unsigned)k);
-}
-
-__global__ void lmhead_tile_argmax_bf16_kernel(
-    unsigned long long *partial_keys, const float *__restrict__ x,
-    const __hip_bfloat16 *__restrict__ w, int M, int N, int K) {
-  constexpr int BM = 32, BN = 32, BK = 32, WM = 16, WN = 16;
-  const int BNt = BN * GETP_BN_AGG;
-  const int wave = threadIdx.x >> 6;
-  const int lane = threadIdx.x & 63;
-  const int xTile = wave % (BM / WM);
-  const int yTile = wave / (BM / WM);
-  const int xMF = lane & 15;
-  const int yMF = lane >> 4;
-  const int loadX_x = threadIdx.x % (BK / 4);
-  const int loadX_y = threadIdx.x / (BK / 4);
-  const int loadW_x = threadIdx.x % (BK / 8);
-  const int loadW_y = threadIdx.x / (BK / 8);
-  constexpr int strideX = 256 / (BK / 4);
-  constexpr int strideW = 256 / (BK / 8);
-
-  extern __shared__ unsigned short smem_arg[];
-  unsigned short *sx0 = smem_arg;
-  unsigned short *sw0 = sx0 + (size_t)BK * BM;
-  unsigned short *sx1 = sw0 + (size_t)BK * BNt;
-  unsigned short *sw1 = sx1 + (size_t)BK * BM;
-  unsigned long long *smax_x0 =
-      reinterpret_cast<unsigned long long *>(sw1 + (size_t)BK * BNt);
-  unsigned long long *smax_x1 = smax_x0 + BM;
-
-  const int rowBase = blockIdx.y * BM;
-  const int colBase = blockIdx.x * BNt;
-
-  for (int r = threadIdx.x; r < BM; r += blockDim.x) {
-    smax_x0[r] = pack_key_f32_i32(-INFINITY, N);
-    smax_x1[r] = pack_key_f32_i32(-INFINITY, N);
-  }
-  __syncthreads();
-
-  f32x4 d0 = {0, 0, 0, 0}, d1 = {0, 0, 0, 0}, d2 = {0, 0, 0, 0},
-        d3 = {0, 0, 0, 0};
-
-  auto prefetch = [&](int bk, unsigned short *sx, unsigned short *sw) {
-    for (int off = 0; off < BM; off += strideX) {
-      if (loadX_y + off >= BM) break;
-      const int kk = bk + 4 * loadX_x;
-      const int row = rowBase + loadX_y + off;
-      if (row < M) {
-        if (kk + 3 < K) {
-          float4 v =
-              *reinterpret_cast<const float4 *>(x + (size_t)row * K + kk);
-          sx[(4 * loadX_x + 0) * BM + (loadX_y + off)] = f32_to_bf16bits(v.x);
-          sx[(4 * loadX_x + 1) * BM + (loadX_y + off)] = f32_to_bf16bits(v.y);
-          sx[(4 * loadX_x + 2) * BM + (loadX_y + off)] = f32_to_bf16bits(v.z);
-          sx[(4 * loadX_x + 3) * BM + (loadX_y + off)] = f32_to_bf16bits(v.w);
-        } else {
-          for (int t = 0; t < 4; ++t) {
-            int kx = kk + t;
-            unsigned short val = 0;
-            if (kx < K) val = f32_to_bf16bits(x[(size_t)row * K + kx]);
-            sx[(4 * loadX_x + t) * BM + (loadX_y + off)] = val;
-          }
-        }
-      }
-    }
-    for (int off = 0; off < BNt; off += strideW) {
-      if (loadW_y + off >= BNt) break;
-      const int kk = bk + 8 * loadW_x;
-      const int col = colBase + loadW_y + off;
-      unsigned short *dst = sw + (size_t)(8 * loadW_x) * BNt + (loadW_y + off);
-      if (col < N) {
-        if (kk + 7 < K) {
-          uint4 t = *reinterpret_cast<const uint4 *>(w + (size_t)col * K + kk);
-          dst[0 * BNt] = (unsigned short)(t.x & 0xFFFF);
-          dst[1 * BNt] = (unsigned short)(t.x >> 16);
-          dst[2 * BNt] = (unsigned short)(t.y & 0xFFFF);
-          dst[3 * BNt] = (unsigned short)(t.y >> 16);
-          dst[4 * BNt] = (unsigned short)(t.z & 0xFFFF);
-          dst[5 * BNt] = (unsigned short)(t.z >> 16);
-          dst[6 * BNt] = (unsigned short)(t.w & 0xFFFF);
-          dst[7 * BNt] = (unsigned short)(t.w >> 16);
-        } else {
-          for (int t = 0; t < 8; ++t) {
-            int kx = kk + t;
-            unsigned short val = 0;
-            if (kx < K)
-              val = reinterpret_cast<const unsigned short *>(
-                  w + (size_t)col * K + kx)[0];
-            dst[t * BNt] = val;
-          }
-        }
-      } else {
-        for (int t = 0; t < 8; ++t) dst[t * BNt] = 0;
-      }
-    }
-  };
-
-  int bk = 0;
-  if (K > 0) prefetch(0, sx0, sw0);
-  __syncthreads();
-  bool ping = true;
-
-  for (; bk < K; bk += BK) {
-    unsigned short *sx = ping ? sx0 : sx1;
-    unsigned short *sw = ping ? sw0 : sw1;
-    int nxt = bk + BK;
-    if (nxt < K) prefetch(nxt, ping ? sx1 : sx0, ping ? sw1 : sw0);
-
-    for (int k = 0; k < BK; k += 16) {
-      const int basek = k + yMF * 4;
-      const int row = yTile * WM + xMF;
-      const int c = xTile * WN + xMF;
-      bf16x4 av = {sx[(basek + 0) * BM + row], sx[(basek + 1) * BM + row],
-                   sx[(basek + 2) * BM + row], sx[(basek + 3) * BM + row]};
-      bf16x4 b0 = {sw[(basek + 0) * BNt + c + 0 * BN],
-                   sw[(basek + 1) * BNt + c + 0 * BN],
-                   sw[(basek + 2) * BNt + c + 0 * BN],
-                   sw[(basek + 3) * BNt + c + 0 * BN]};
-      bf16x4 b1 = {sw[(basek + 0) * BNt + c + 1 * BN],
-                   sw[(basek + 1) * BNt + c + 1 * BN],
-                   sw[(basek + 2) * BNt + c + 1 * BN],
-                   sw[(basek + 3) * BNt + c + 1 * BN]};
-      bf16x4 b2 = {sw[(basek + 0) * BNt + c + 2 * BN],
-                   sw[(basek + 1) * BNt + c + 2 * BN],
-                   sw[(basek + 2) * BNt + c + 2 * BN],
-                   sw[(basek + 3) * BNt + c + 2 * BN]};
-      bf16x4 b3 = {sw[(basek + 0) * BNt + c + 3 * BN],
-                   sw[(basek + 1) * BNt + c + 3 * BN],
-                   sw[(basek + 2) * BNt + c + 3 * BN],
-                   sw[(basek + 3) * BNt + c + 3 * BN]};
-      d0 = __builtin_amdgcn_mfma_f32_16x16x16bf16_1k(av, b0, d0, 0, 0, 0);
-      d1 = __builtin_amdgcn_mfma_f32_16x16x16bf16_1k(av, b1, d1, 0, 0, 0);
-      d2 = __builtin_amdgcn_mfma_f32_16x16x16bf16_1k(av, b2, d2, 0, 0, 0);
-      d3 = __builtin_amdgcn_mfma_f32_16x16x16bf16_1k(av, b3, d3, 0, 0, 0);
-    }
-    __syncthreads();
-    ping = !ping;
-  }
-
-  const int xD = lane & 15;
-  const int yD = 4 * (lane >> 4);
-  for (int i = 0; i < 4; ++i) {
-    const int row = yTile * WM + (yD + i);
-    if (row >= BM) continue;
-    const int gRow = rowBase + row;
-    if (gRow >= M) continue;
-
-    const int c0 = colBase + xTile * WN + xD + 0 * BN;
-    const int c1 = colBase + xTile * WN + xD + 1 * BN;
-    const int c2 = colBase + xTile * WN + xD + 2 * BN;
-    const int c3 = colBase + xTile * WN + xD + 3 * BN;
-
-    unsigned long long k0 =
-        (c0 < N) ? pack_key_f32_i32(d0[i], c0) : pack_key_f32_i32(-INFINITY, N);
-    unsigned long long k1 =
-        (c1 < N) ? pack_key_f32_i32(d1[i], c1) : pack_key_f32_i32(-INFINITY, N);
-    unsigned long long k2 =
-        (c2 < N) ? pack_key_f32_i32(d2[i], c2) : pack_key_f32_i32(-INFINITY, N);
-    unsigned long long k3 =
-        (c3 < N) ? pack_key_f32_i32(d3[i], c3) : pack_key_f32_i32(-INFINITY, N);
-
-    unsigned long long m = k0;
-    if (k1 > m) m = k1;
-    if (k2 > m) m = k2;
-    if (k3 > m) m = k3;
-
-#pragma unroll
-    for (int off = 8; off > 0; off >>= 1) {
-      unsigned long long o = __shfl_down(m, off, 16);
-      if ((xD + off) < 16 && o > m) m = o;
-    }
-
-    if (xD == 0) {
-      if (xTile == 0)
-        smax_x0[row] = m;
-      else
-        smax_x1[row] = m;
-    }
-  }
-  __syncthreads();
-
-  if (threadIdx.x < BM) {
-    int r = threadIdx.x;
-    int gRow = rowBase + r;
-    if (gRow < M) {
-      unsigned long long best = smax_x0[r];
-      if (smax_x1[r] > best) best = smax_x1[r];
-      partial_keys[(size_t)blockIdx.x * M + gRow] = best;
-    }
-  }
-}
-
-__global__ void lmhead_reduce_argmax_from_keys_kernel(
-    int *out, const unsigned long long *partial_keys, int M, int tiles) {
-  int b = blockIdx.x * blockDim.x + threadIdx.x;
-  if (b >= M) return;
-  unsigned long long best = 0ull;
-  for (int t = 0; t < tiles; ++t) {
-    unsigned long long k = partial_keys[(size_t)t * M + b];
-    if (k > best) best = k;
-  }
-  out[b] = unpack_idx_i32(best);
-}
-
-static inline void getp_matmul_argmax_bf16(int *out, const float *x,
-                                           const __hip_bfloat16 *w, int M,
-                                           int N, int K, hipStream_t stream) {
-  PROFILE_FUNCTION();
-  constexpr int BM = 32, BN = 32, BK = 32;
-  const int BNt = BN * GETP_BN_AGG;
-  const int tiles = (N + BNt - 1) / BNt;
-
-  unsigned long long *partial_keys = nullptr;
-  HIP_CHECK(hipMallocAsync(
-      &partial_keys, (size_t)tiles * (size_t)M * sizeof(unsigned long long),
-      stream));
-
-  dim3 block(256);
-  dim3 grid(tiles, (M + BM - 1) / BM);
-  size_t shmem = (size_t)2 * (size_t)BK * ((size_t)BM + (size_t)BNt) *
-                     sizeof(unsigned short) +
-                 (size_t)2 * (size_t)BM * sizeof(unsigned long long);
-  lmhead_tile_argmax_bf16_kernel<<<grid, block, shmem, stream>>>(partial_keys,
-                                                                 x, w, M, N, K);
-
-  dim3 rBlock(256);
-  dim3 rGrid((M + rBlock.x - 1) / rBlock.x);
-  lmhead_reduce_argmax_from_keys_kernel<<<rGrid, rBlock, 0, stream>>>(
-      out, partial_keys, M, tiles);
-
-  HIP_CHECK(hipFreeAsync(partial_keys, stream));
-}
-
 template <typename T>
 void getp_matmul(float *xout, float *x, T *w, T *b, int n, int d,
                  int batch_size, hipStream_t stream) {
-  PROFILE_FUNCTION();
+  
   const int M = batch_size, N = d, K = n;
   constexpr int BM = 32, BN = 32, BK = 32;
   const int BNt = BN * GETP_BN_AGG;
@@ -1795,7 +1377,7 @@ void getp_matmul(float *xout, float *x, T *w, T *b, int n, int d,
     matmul_kernel_nosplit<<<grid, block, shmem, stream>>>(
         xout, x, reinterpret_cast<const __hip_bfloat16 *>(w),
         reinterpret_cast<const __hip_bfloat16 *>(b), M, N, K);
-    // HIP_CHECK(hipDeviceSynchronize());
+    
     return;
   }
 
@@ -1815,7 +1397,7 @@ void getp_matmul(float *xout, float *x, T *w, T *b, int n, int d,
       xout, partial, reinterpret_cast<const __hip_bfloat16 *>(b), M, N, splits);
 
   HIP_CHECK(hipFreeAsync(partial, stream));
-  // HIP_CHECK(hipDeviceSynchronize());
+  
 }
 
 __global__ void compute_inv_freq_kernel(float base, int head_dim,
@@ -1861,7 +1443,7 @@ void getp_compute_cos_sin(int pos, float base, int head_dim,
                           float scaling_factor, float initial_context_length,
                           float ntk_beta, float ntk_alpha, float *cos_out,
                           float *sin_out, float *inv_freq, hipStream_t stream) {
-  PROFILE_FUNCTION();
+  
   int d_half = head_dim / 2;
   float concentration =
       scaling_factor > 1.0f ? 0.1f * logf(scaling_factor) + 1.0f : 1.0f;
@@ -1878,7 +1460,7 @@ void getp_compute_cos_sin(int pos, float base, int head_dim,
     compute_cos_sin_kernel<<<gridDim, blockDim, 0, stream>>>(
         cos_out, sin_out, inv_freq, concentration, pos, d_half);
   }
-  // HIP_CHECK(hipDeviceSynchronize());
+  
 }
 
 __global__ void apply_rotary_emb_kernel(float *x, float *cos, float *sin,
@@ -1901,13 +1483,13 @@ __global__ void apply_rotary_emb_kernel(float *x, float *cos, float *sin,
 }
 void getp_apply_rotary_emb(float *x, float *cos, float *sin, int n_heads,
                            int head_dim, int batch_size, hipStream_t stream) {
-  PROFILE_FUNCTION();
+  
   dim3 blockDim(16, 16);
   dim3 gridDim((head_dim / 2 + blockDim.x - 1) / blockDim.x,
                (n_heads + blockDim.y - 1) / blockDim.y, batch_size);
   apply_rotary_emb_kernel<<<gridDim, blockDim, 0, stream>>>(x, cos, sin,
                                                             n_heads, head_dim);
-  // HIP_CHECK(hipDeviceSynchronize());
+  
 }
 
 __global__ void router_topk_softmax_batch_kernel(
@@ -1991,7 +1573,7 @@ __global__ void router_topk_softmax_batch_kernel(
 static inline void getp_router_topk_softmax_batch(
     const float *router_score, int n_experts, int experts_per_token,
     float *topk_v_out, int *topk_i_out, int batch_size, hipStream_t stream) {
-  PROFILE_FUNCTION();
+  
   const int BLK = 1024;
   const dim3 block(BLK);
   const dim3 grid(batch_size);
@@ -2000,7 +1582,7 @@ static inline void getp_router_topk_softmax_batch(
                        GETP_ROUTER_TOPK_MAXK * (sizeof(float) + sizeof(int));
   router_topk_softmax_batch_kernel<<<grid, block, shmem, stream>>>(
       router_score, n_experts, experts_per_token, topk_v_out, topk_i_out);
-  // HIP_CHECK(hipDeviceSynchronize());
+  
 }
 
 __global__ void map_global_to_local_batch_kernel(
@@ -2033,12 +1615,12 @@ static inline void getp_map_global_to_local_batch(
     const int *topk_i, const float *topk_v, int *local_ids, float *local_wts,
     int *n_local, int K, int expert_start, int expert_end, int B,
     hipStream_t stream) {
-  PROFILE_FUNCTION();
+  
   const int BLK = 128, GRD = (B + BLK - 1) / BLK;
   map_global_to_local_batch_kernel<<<GRD, BLK, 0, stream>>>(
       topk_i, topk_v, local_ids, local_wts, n_local, K, expert_start,
       expert_end, B);
-  // HIP_CHECK(hipDeviceSynchronize());
+  
 }
 
 __global__ void vecadd_kernel(float *x, float *y, int size) {
@@ -2052,11 +1634,11 @@ __global__ void vecadd_kernel(float *x, float *y, int size) {
 }
 void getp_vecadd(float *x, float *y, int size, int batch_size,
                  hipStream_t stream) {
-  PROFILE_FUNCTION();
+  
   dim3 blockDim(1024);
   dim3 gridDim((size + blockDim.x - 1) / blockDim.x, batch_size);
   vecadd_kernel<<<gridDim, blockDim, 0, stream>>>(x, y, size);
-  // HIP_CHECK(hipDeviceSynchronize());
+  
 }
 
 __global__ void __launch_bounds__(512) flash_attn_decode_bf16_kernel(
@@ -2467,10 +2049,10 @@ __global__ void argmax_rows_kernel(const float *__restrict__ logits, int V,
 
 static inline void getp_argmax_rows(const float *logits, int V, int *out, int B,
                                     hipStream_t stream) {
-  PROFILE_FUNCTION();
+  
   dim3 grid(B), block(1024);
   argmax_rows_kernel<<<grid, block, 0, stream>>>(logits, V, out);
-  // HIP_CHECK(hipDeviceSynchronize());
+  
 }
 
 inline void sync_workers(hipStream_t stream, Barrier &sync_point) {
@@ -2490,7 +2072,7 @@ int *getp_forward_120b(Transformer * /*transformer*/,
                        DeviceTransformer **dev_transformers, GPUWorker *workers,
                        Barrier &sync_point, int thread_idx, int token[],
                        int pos) {
-  PROFILE_FUNCTION();
+  
 
   Config *p = &dev_transformers[thread_idx]->config;
   int head_dim = p->head_dim;
@@ -2613,9 +2195,9 @@ int *getp_forward_120b(Transformer * /*transformer*/,
       __hip_bfloat16 *dev_w_o =
           dev_w->w_o_bf16 + 1ll * l * (head_dim * p->n_attn_heads) * hidden_dim;
       __hip_bfloat16 *dev_b_o = dev_w->b_o_bf16 + 1ll * l * hidden_dim;
-      getp_matmul<__hip_bfloat16>(dev_s->tb2, dev_s->tb, dev_w_o, dev_b_o,
-                                  head_dim * p->n_attn_heads, hidden_dim,
-                                  BATCH_SIZE, compute_stream);
+      getp_new_matmul(dev_s->tb2, dev_s->tb, dev_w_o, dev_b_o,
+        head_dim * p->n_attn_heads, hidden_dim,
+        BATCH_SIZE, compute_stream);
 
       getp_vecadd(dev_x, dev_s->tb2, hidden_dim, BATCH_SIZE, compute_stream);
 
@@ -2777,9 +2359,11 @@ int *getp_forward_120b(Transformer * /*transformer*/,
 
   getp_rmsnorm(dev_x, dev_x, dev_w->rms_out_w, BATCH_SIZE, hidden_dim,
                compute_stream);
-  getp_matmul_argmax_bf16(dev_s->topk_i, dev_x, dev_w->out_bf16, BATCH_SIZE,
-                          p->vocab_size, hidden_dim, compute_stream);
+  getp_new_matmul(dev_s->logits, dev_x, dev_w->out_bf16,
+    (__hip_bfloat16 *)NULL, hidden_dim, p->vocab_size,
+    BATCH_SIZE, compute_stream);
 
+getp_argmax_rows(dev_s->logits, p->vocab_size, dev_s->topk_i, BATCH_SIZE, compute_stream);
   int *next_host = (int *)malloc(sizeof(int) * BATCH_SIZE);
 
   HIP_CHECK(hipMemcpyAsync(next_host, dev_s->topk_i, sizeof(int) * BATCH_SIZE,
@@ -2794,7 +2378,7 @@ int *getp_forward_120b(Transformer * /*transformer*/,
 int *getp_forward_20b(Transformer * /*transformer*/,
                       DeviceTransformer **dev_transformeres, GPUWorker *worker,
                       int token[], int pos, int batch_size) {
-  PROFILE_FUNCTION();
+  
 
   int device_index = worker->device_index;
   RunStateExt *ext = ext_get(device_index);
