@@ -219,7 +219,7 @@ void init_device_run_state(RunState *s, Config *p) {
   HIP_CHECK(hipMalloc(&s->value_cache, (size_t)BATCH_SIZE * total_t * (size_t)kv_dim * sizeof(__hip_bfloat16)));
 
   s->att = nullptr;
-  s->logits = nullptr;
+  HIP_CHECK(hipMalloc(&s->logits, (size_t)BATCH_SIZE * p->vocab_size * sizeof(float)));
   s->mask = NULL;
 }
 
