@@ -2226,7 +2226,8 @@ int *getp_forward_120b(Transformer * /*transformer*/,
     // tokens to the experts as the same as in the previous commit
 
     HIP_CHECK(hipStreamWaitEvent(memory_stream, event_rmsnorm));
-    for (int i = 0; i < EXPERT_PARALLELISM; ++i) {
+    for (int delta = 1; delta < EXPERT_PARALLELISM; ++delta) {
+      int i = (device_index + delta) % EXPERT_PARALLELISM;
       GPUWorker *peer_worker = &workers[i];
       int peer_device_index = peer_worker->device_index;
       RunState *peer_dev_s = &dev_transformers[peer_device_index]->state;
@@ -2241,7 +2242,8 @@ int *getp_forward_120b(Transformer * /*transformer*/,
       }
     }
     HIP_CHECK(hipStreamWaitEvent(memory_stream, event_router_topk));
-    for (int i = 0; i < EXPERT_PARALLELISM; ++i) {
+    for (int delta = 1; delta < EXPERT_PARALLELISM; ++delta) {
+      int i = (device_index + delta) % EXPERT_PARALLELISM;
       GPUWorker *peer_worker = &workers[i];
       int peer_device_index = peer_worker->device_index;
 
@@ -2326,7 +2328,8 @@ int *getp_forward_120b(Transformer * /*transformer*/,
     sync_workers(compute_stream, sync_point);
 
     getp_vecadd(dev_x, ext->ext_e_agg + (size_t)device_index * BATCH_SIZE * hidden_dim, hidden_dim, BATCH_SIZE, compute_stream);
-    for (int i = 0, j = 0; i < EXPERT_PARALLELISM; ++i) {
+    for (int delta = 1, j = 0; delta < EXPERT_PARALLELISM; ++delta) {
+      int i = (device_index + delta) % EXPERT_PARALLELISM;
       GPUWorker *peer_worker = &workers[i];
       int peer_device_index = peer_worker->device_index;
 
@@ -2341,7 +2344,8 @@ int *getp_forward_120b(Transformer * /*transformer*/,
         ++j;
       }
     }
-    for (int i = 0, j = 0; i < EXPERT_PARALLELISM; ++i) {
+    for (int delta = 1, j = 0; delta < EXPERT_PARALLELISM; ++delta) {
+      int i = (device_index + delta) % EXPERT_PARALLELISM;
       GPUWorker *peer_worker = &workers[i];
       int peer_device_index = peer_worker->device_index;
 
