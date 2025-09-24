@@ -1,32 +1,24 @@
 #pragma once
-
-#include <cstddef>
-#include <mutex>
-#include <condition_variable>
-
-// Assume: there is no critical point required to be executed by the threads
+#include <atomic>
+#include <thread>
 
 struct Barrier {
-  size_t n_threads; // number of threads;
-  size_t count;
+  const int n_threads;
+  std::atomic<int> count;
+  std::atomic<int> phase;
 
-  std::mutex mtx;
-  std::condition_variable cv;
-
-  Barrier(int n_workers) : n_threads(n_workers) {
-    count = 0;
-  }
+  Barrier(int n) : n_threads(n), count(0), phase(0) {}
   ~Barrier() {}
 
   void wait() {
-    std::unique_lock<std::mutex> lck(mtx);
-    ++count;
-    if (count < n_threads) {
-      cv.wait(lck);
-    }
-    else {
-      count = 0;
-      cv.notify_all();
+    int p = phase.load(std::memory_order_relaxed);
+    if (count.fetch_add(1, std::memory_order_acq_rel) == n_threads - 1) {
+      count.store(0, std::memory_order_release);
+      phase.fetch_add(1, std::memory_order_release);
+    } else {
+      while (phase.load(std::memory_order_acquire) == p) {
+        std::this_thread::yield();
+      }
     }
   }
 };

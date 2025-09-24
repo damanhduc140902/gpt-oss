@@ -27,26 +27,23 @@ static void enable_p2p_allpairs(const std::vector<int>& devs) {
   }
 }
 
-// Create group: record device ids, create a comm stream per device, enable P2P
 void cgCreate(CollectiveGroup& g, const std::vector<int>& devices) {
   g.ranks = devices;
-  g.comm.resize(g.ranks.size());
-  for (size_t i = 0; i < g.ranks.size(); ++i) {
-    HIP_CHECK(hipSetDevice(g.ranks[i]));
-    HIP_CHECK(hipStreamCreate(&g.comm[i]));
+  g.comm.resize(devices.size());
+  for (size_t r = 0; r < devices.size(); ++r) {
+    HIP_CHECK(hipSetDevice(g.ranks[r]));
+    HIP_CHECK(hipStreamCreateWithFlags(&g.comm[r], hipStreamNonBlocking));
   }
-  enable_p2p_allpairs(g.ranks);
+}
+void cgDestroy(CollectiveGroup& g) {
+  for (size_t r = 0; r < g.comm.size(); ++r) {
+    HIP_CHECK(hipSetDevice(g.ranks[r]));
+    if (g.comm[r]) HIP_CHECK(hipStreamDestroy(g.comm[r]));
+  }
+  g.comm.clear();
+  g.ranks.clear();
 }
 
-// Destroy group
-void cgDestroy(CollectiveGroup& g) {
-  for (size_t i = 0; i < g.ranks.size(); ++i) {
-    HIP_CHECK(hipSetDevice(g.ranks[i]));
-    if (g.comm[i]) HIP_CHECK(hipStreamDestroy(g.comm[i]));
-  }
-  g.ranks.clear();
-  g.comm.clear();
-}
 
 // Broadcast from root to all peers (P2P when possible)
 void cgBroadcastF32(const CollectiveGroup& g, float** bufs, size_t count,

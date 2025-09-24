@@ -330,7 +330,7 @@ namespace Model_120b {
       outputs_tokens[b][epos[b] - nums_prompt_tokens[b] + 1] = -1;
     }
     for (int b = 0; b < BATCH_SIZE; ++b) free(prompts_tokens[b]);
-    HIP_CHECK(hipDeviceSynchronize());
+    // HIP_CHECK(hipDeviceSynchronize());
   
     long long acc = 0;
     for (int b = 0; b < BATCH_SIZE; ++b) {
