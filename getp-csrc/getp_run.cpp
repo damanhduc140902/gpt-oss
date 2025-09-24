@@ -9,6 +9,7 @@
 #include "getp_transformer.cpp"
 #include "getp_transformer.hpp"
 #include "getp_barrier.hpp"
+#include "profiler.hpp"
 #include <cstddef>
 #include <cstdio>
 #include <cstdlib>
@@ -127,6 +128,7 @@ namespace Model_20b {
                                  Sampler *sampler, GPUWorker *worker,
                                  const char *inputs_seq[], int *outputs_tokens[],
                                  int steps, int B) {
+    PROFILE_FUNCTION();
 
     const char *empty_prompt = "";
     for (int b = 0; b < B; ++b)
@@ -240,6 +242,7 @@ namespace Model_120b {
                           Barrier &sync_point, int *thread_states,
                           int thread_idx, int steps
   ) {
+    PROFILE_FUNCTION();
     // <|start|>: 200006
     // <|end|>: 200007
     // <|return|>: 200002
@@ -398,7 +401,10 @@ namespace Model_120b {
 
 long long inference(Transformer *transformer, Tokenizer *tokenizer,
                     Sampler *sampler, Requests *requests) {
+  PROFILE_FUNCTION();
 
+  // Reset timing at the start of inference
+  reset_timing_summary();
 
   int n_devices;
   HIP_CHECK(hipGetDeviceCount(&n_devices));
@@ -449,8 +455,11 @@ long long inference(Transformer *transformer, Tokenizer *tokenizer,
   }
   
   // Ensure all GPU work is completed before printing timing
-  // HIP_CHECK(hipDeviceSynchronize());
+  HIP_CHECK(hipDeviceSynchronize());
   
+  // Print timing summary at the end of inference
+  print_timing_summary();
+
   return num_token_out;
 }
 
