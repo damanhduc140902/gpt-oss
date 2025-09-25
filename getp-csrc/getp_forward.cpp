@@ -1681,6 +1681,185 @@ void getp_vecadd(float *x, float *y, int size, int batch_size,
   //HIP_CHECK(hipDeviceSynchronize());
 }
 
+template <int TILE_T>
+__global__ void __launch_bounds__(128)
+flash_attn_decode_bf16_matrix_core_kernel(
+  float *__restrict__ tb, const __hip_bfloat16 *__restrict__ key_cache,
+  const __hip_bfloat16 *__restrict__ value_cache, const float *__restrict__ q,
+  const float *__restrict__ attn_sinks, int head_dim, int n_attn_heads,
+  int n_kv_heads, int pos, int batch_size, int kv_dim, int kv_mul, 
+  float inv_sqrt_d
+) {
+  /* Ignore sliding window mechanism, only consider odd layer */
+  constexpr int HEAD_DIM = 64;
+  constexpr int BLOCK_SIZE = 128;
+
+  constexpr int MFMA_M = 4;
+  constexpr int MFMA_N = 4;
+  constexpr int MFMA_K = 1;
+  constexpr int MFMA_BLOCK = 16;
+  constexpr int GPRs_CD = 4;
+
+  using CDfloat = __attribute__( (__vector_size__(GPRs_CD * sizeof(float)) )) float;
+
+  assert(head_dim == 64);
+  assert(blockDim.x == BLOCK_SIZE);
+
+  // Wave tile
+  constexpr int WM = 4;
+  constexpr int WN = TILE_T;
+
+  constexpr int nIterWaveM = WM / MFMA_M;
+  constexpr int nIterWaveN = WN / MFMA_N;
+
+  const int waveIdx = threadIdx.x / warpSize;
+  const int laneIdx = threadIdx.x % warpSize;
+
+  const int yInBlockTile = waveIdx;
+
+  const int Ai = (laneIdx % 4);
+  const int Ak = 0;
+  const int Ablock = (laneIdx / 4);
+  const int Bj = (laneIdx % 4);
+  const int Bk = 0;
+  const int Bblock = (laneIdx / 4);
+
+  const int nbLoadsKV = TILE_T * HEAD_DIM / BLOCK_SIZE;
+
+  const int kv_h = blockIdx.x;
+  const int b = blockIdx.y;
+
+  const int loadKVIdx_y = threadIdx.x / (HEAD_DIM);
+  const int loadKVIdx_x = threadIdx.x % (HEAD_DIM);
+  constexpr int strideKV = BLOCK_SIZE / (HEAD_DIM);
+
+  const int n_steps = pos + 1;
+
+  __shared__ __hip_bfloat16 ks[HEAD_DIM][TILE_T];
+  __shared__ __hip_bfloat16 vs[HEAD_DIM][TILE_T];
+
+  float out_values[MFMA_M] = {0.f};
+  float m_values[MFMA_M] = {-INFINITY};
+  float l_values[MFMA_M] = {0.f};
+
+  const float *qptr =
+      q + (size_t)b * n_attn_heads * head_dim;
+  
+  float q_values[HEAD_DIM / MFMA_BLOCK];
+  for (int i = 0; i < HEAD_DIM / MFMA_BLOCK; ++i) {
+    q_values[i] = qptr[(Ai + MFMA_M * waveIdx + kv_h * kv_mul) * head_dim + i * MFMA_BLOCK + Ablock];
+  }
+
+  // Load data to shared memory
+  for (int i = 0; i < nbLoadsKV; ++i) {
+    int offset = i * strideKV;
+    int index_x = loadKVIdx_x;
+    int index_y = 0 + loadKVIdx_y + offset;
+    if (index_y < n_steps) {
+      const __hip_bfloat16 *kptr =
+          key_cache + index_y * (size_t)batch_size * (size_t)kv_dim +
+          (size_t)b * (size_t)kv_dim + (size_t)kv_h * (size_t)head_dim + index_x;
+      const __hip_bfloat16 *vptr =
+          value_cache + index_y * (size_t)batch_size * (size_t)kv_dim +
+          (size_t)b * (size_t)kv_dim + (size_t)kv_h * (size_t)head_dim + index_x;
+      ks[loadKVIdx_x][loadKVIdx_y + offset] = kptr[0];
+      vs[loadKVIdx_x][loadKVIdx_y + offset] = vptr[0];
+    }
+    else {
+      ks[loadKVIdx_x][loadKVIdx_y + offset] = 0;
+      vs[loadKVIdx_x][loadKVIdx_y + offset] = 0;
+    }
+  }
+  __syncthreads();
+
+  for (int btIdx = 0; btIdx < n_steps; btIdx += TILE_T) {
+    // Prefetch
+    __hip_bfloat16 regK[nbLoadsKV];
+    __hip_bfloat16 regV[nbLoadsKV];
+    if (btIdx + TILE_T < n_steps) {
+      for (int i = 0; i < nbLoadsKV; ++i) {
+        int offset = i * strideKV;
+        int index_x = loadKVIdx_x;
+        int index_y = btIdx + TILE_T + loadKVIdx_y + offset;
+        if (index_y < n_steps) {
+          const __hip_bfloat16 *kptr =
+              key_cache + index_y * (size_t)batch_size * (size_t)kv_dim +
+              (size_t)b * (size_t)kv_dim + (size_t)kv_h * (size_t)head_dim + index_x;
+          const __hip_bfloat16 *vptr =
+              value_cache + index_y * (size_t)batch_size * (size_t)kv_dim +
+              (size_t)b * (size_t)kv_dim + (size_t)kv_h * (size_t)head_dim + index_x;
+          regK[i] = kptr[0];
+          regV[i] = vptr[0];
+        }
+        else {
+          regK[i] = regV[i] = 0;
+        }
+      }
+    }
+
+    // Computing
+    for (int t = 0; t < TILE_T; t += MFMA_N) {
+      CDfloat acc = {0};
+      for (int dimIdx = 0; dimIdx < HEAD_DIM; dimIdx += MFMA_BLOCK) {
+        float k_value = __bfloat162float(ks[dimIdx + Ablock][t + Bj]);
+        acc = __builtin_amdgcn_mfma_f32_4x4x1f32(q_values[dimIdx / MFMA_BLOCK], k_value, acc, 0, 0, 0);
+      }
+
+      for (int width = warpSize / 2; width >= MFMA_N; width /= 2) {
+        for (int i = 0; i < GPRs_CD; ++i) {
+          acc[i] += __shfl_down(acc[i], width);
+        }
+      }
+
+      for (int i = 0; i < MFMA_M; ++i) {
+        for (int j = 0; j < MFMA_N; ++j) {
+          if (btIdx + t + j >= n_steps) break;
+          float attn_score = __shfl(acc[i], j);
+          attn_score *= inv_sqrt_d;
+          float m_new = fmaxf(m_values[i], attn_score);
+          float alpha = __expf(m_values[i] - m_new);
+          float e = __expf(attn_score - m_new);
+          l_values[i] = l_values[i] * alpha + e;
+          m_values[i] = m_new;
+
+          out_values[i] = alpha * out_values[i] + e * __bfloat162float(vs[laneIdx][t + j]);
+        }
+      }
+    }
+
+    __syncthreads();
+
+    if (btIdx + TILE_T < n_steps) {
+      for (int i = 0; i < nbLoadsKV; ++i) {
+        int offset = i * strideKV;
+        int index_x = loadKVIdx_x;
+        int index_y = btIdx + TILE_T + loadKVIdx_y + offset;
+        ks[loadKVIdx_x][loadKVIdx_y + offset] = regK[i];
+        vs[loadKVIdx_x][loadKVIdx_y + offset] = regV[i];
+      }
+    }
+    __syncthreads();
+  }
+
+  for (int i = 0; i < MFMA_M; ++i) {
+    int h = kv_h * kv_mul + waveIdx * MFMA_M + i;
+
+    float attn_score = attn_sinks[h];
+    float m_new = fmaxf(m_values[i], attn_score);
+    float alpha = __expf(m_values[i] - m_new);
+    float e = __expf(attn_score - m_new);
+    l_values[i] = l_values[i] * alpha + e;
+    m_values[i] = m_new;
+    out_values[i] = alpha * out_values[i] / l_values[i];
+
+    float *obh =
+        tb + (size_t)b * n_attn_heads * head_dim + 
+             (size_t)h * head_dim;
+    obh[laneIdx] = out_values[i];
+  }
+
+}
+
 __global__ void __launch_bounds__(512) flash_attn_decode_bf16_kernel(
     float *__restrict__ tb, const __hip_bfloat16 *__restrict__ key_cache,
     const __hip_bfloat16 *__restrict__ value_cache, const float *__restrict__ q,
@@ -1823,27 +2002,40 @@ static inline void getp_flash_attn_decode_bf16(
                          ? MIN(sliding_window, pos + 1)
                          : (pos + 1);
 
-  int T = (batch_size >= 80 ? 32 : 64);
-  if (T > tsteps) T = tsteps;
-
-  // size_t shmem = (size_t)4 * (size_t)T * (size_t)head_dim * sizeof(float);
-  size_t shmem =
-      (size_t)4 * (size_t)T * (size_t)head_dim * sizeof(unsigned short);
-
-  const size_t LDS_MAX = 64 * 1024;
-  if (shmem > LDS_MAX) {
-    T = (int)(LDS_MAX / (4u * (size_t)head_dim * sizeof(float)));
-    if (T < 1) T = 1;
+  if (apply_mask) {
+    int T = (batch_size >= 80 ? 32 : 64);
     if (T > tsteps) T = tsteps;
-    shmem = (size_t)4 * (size_t)T * (size_t)head_dim * sizeof(unsigned short);
+  
+    // size_t shmem = (size_t)4 * (size_t)T * (size_t)head_dim * sizeof(float);
+    size_t shmem =
+        (size_t)4 * (size_t)T * (size_t)head_dim * sizeof(unsigned short);
+  
+    const size_t LDS_MAX = 64 * 1024;
+    if (shmem > LDS_MAX) {
+      T = (int)(LDS_MAX / (4u * (size_t)head_dim * sizeof(float)));
+      if (T < 1) T = 1;
+      if (T > tsteps) T = tsteps;
+      shmem = (size_t)4 * (size_t)T * (size_t)head_dim * sizeof(unsigned short);
+    }
+  
+    dim3 block(64, kv_mul);
+    dim3 grid(n_kv_heads, batch_size);
+    flash_attn_decode_bf16_kernel<<<grid, block, shmem, stream>>>(
+        tb, key_cache_layer, value_cache_layer, q, attn_sinks_layer, head_dim,
+        n_attn_heads, n_kv_heads, pos, seq_len, sliding_window, apply_mask,
+        batch_size, kv_dim, kv_mul, invsd, T, cache_tcap);
   }
+  else {
+    dim3 block(128);
+    dim3 grid(n_kv_heads, batch_size);
+    flash_attn_decode_bf16_matrix_core_kernel<16><<<grid, block>>>
+      (tb, key_cache_layer, 
+      value_cache_layer, q, 
+      attn_sinks_layer, head_dim, n_attn_heads, 
+      n_kv_heads, pos, batch_size, kv_dim, kv_mul, 
+      invsd);
+    }
 
-  dim3 block(64, kv_mul);
-  dim3 grid(n_kv_heads, batch_size);
-  flash_attn_decode_bf16_kernel<<<grid, block, shmem, stream>>>(
-      tb, key_cache_layer, value_cache_layer, q, attn_sinks_layer, head_dim,
-      n_attn_heads, n_kv_heads, pos, seq_len, sliding_window, apply_mask,
-      batch_size, kv_dim, kv_mul, invsd, T, cache_tcap);
   //HIP_CHECK(hipDeviceSynchronize());
 }
 
