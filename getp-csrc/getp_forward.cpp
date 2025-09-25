@@ -89,6 +89,7 @@ __device__ inline unsigned short f32_to_bf16bits(float v) {
   t.b = __float2bfloat16(v);
   return t.u;
 }
+
 using f32x4 = __attribute__((vector_size(16))) float;
 using bf16x4 = __attribute__((vector_size(8))) unsigned short;
 
@@ -2771,9 +2772,12 @@ int *getp_forward_120b(Transformer * /*transformer*/,
     __hip_bfloat16 *dev_w_o =
         dev_w->w_o_bf16 + 1ll * l * (head_dim * p->n_attn_heads) * hidden_dim;
     __hip_bfloat16 *dev_b_o = dev_w->b_o_bf16 + 1ll * l * hidden_dim;
-    getp_new_matmul(dev_s->tb2, dev_s->tb, dev_w_o, dev_b_o,
-                    head_dim * p->n_attn_heads, hidden_dim, BATCH_SIZE,
-                    compute_stream);
+    // getp_new_matmul(dev_s->tb2, dev_s->tb, dev_w_o, dev_b_o,
+    //                 head_dim * p->n_attn_heads, hidden_dim, BATCH_SIZE,
+    //                 compute_stream);
+    getp_matmul_attn_o_bf16(dev_s->tb2, dev_s->tb, dev_w_o, dev_b_o,
+      head_dim * p->n_attn_heads, hidden_dim,
+      BATCH_SIZE, compute_stream);
 
     getp_vecadd(dev_x, dev_s->tb2, hidden_dim, BATCH_SIZE, compute_stream);
 
@@ -2786,11 +2790,13 @@ int *getp_forward_120b(Transformer * /*transformer*/,
     __hip_bfloat16 *dev_w_router =
         dev_w->w_router_bf16 + 1ll * l * hidden_dim * n_experts;
     __hip_bfloat16 *dev_b_router = dev_w->b_router_bf16 + 1ll * l * n_experts;
-    getp_matmul<__hip_bfloat16>(
-        dev_s->router_score,
-        ext->ext_t + (size_t)device_index * BATCH_SIZE * hidden_dim,
-        dev_w_router, dev_b_router, hidden_dim, n_experts,
-        BATCH_SIZE, compute_stream);
+    // getp_matmul<__hip_bfloat16>(
+    //     dev_s->router_score,
+    //     ext->ext_t + (size_t)device_index * BATCH_SIZE * hidden_dim,
+    //     dev_w_router, dev_b_router, hidden_dim, n_experts,
+    //     BATCH_SIZE, compute_stream);
+    getp_matmul_router_bf16(dev_s->router_score, dev_s->t, dev_w_router,
+      dev_b_router, hidden_dim, n_experts, BATCH_SIZE, compute_stream);
 
     getp_router_topk_softmax_batch(
         dev_s->router_score, n_experts, p->experts_per_token,
@@ -2937,9 +2943,12 @@ int *getp_forward_120b(Transformer * /*transformer*/,
 
   getp_rmsnorm(dev_x, dev_x, dev_w->rms_out_w, BATCH_SIZE, hidden_dim,
                compute_stream);
-  getp_new_matmul(dev_s->logits, dev_x, dev_w->out_bf16,
-                  (__hip_bfloat16 *)NULL, hidden_dim, p->vocab_size,
-                  BATCH_SIZE, compute_stream);
+  // getp_new_matmul(dev_s->logits, dev_x, dev_w->out_bf16,
+  //                 (__hip_bfloat16 *)NULL, hidden_dim, p->vocab_size,
+  //                 BATCH_SIZE, compute_stream);
+  getp_matmul_logits_bf16(dev_s->logits, dev_x, dev_w->out_bf16,
+    hidden_dim, p->vocab_size,
+    BATCH_SIZE, compute_stream);
 
   getp_argmax_rows(dev_s->logits, p->vocab_size, dev_s->topk_i, BATCH_SIZE,
                    compute_stream);
