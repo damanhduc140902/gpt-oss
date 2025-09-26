@@ -1627,7 +1627,187 @@ void getp_vecadd(float *x, float *y, int size, int batch_size,
 
 template <int TILE_T>
 __global__ void __launch_bounds__(128)
-flash_attn_decode_bf16_matrix_core_kernel(
+flash_attn_decode_even_layer_bf16_matrix_core_kernel(
+  float *__restrict__ tb, const __hip_bfloat16 *__restrict__ key_cache,
+  const __hip_bfloat16 *__restrict__ value_cache, const float *__restrict__ q,
+  const float *__restrict__ attn_sinks, int head_dim, int n_attn_heads,
+  int n_kv_heads, int pos, int batch_size, int kv_dim, int kv_mul, 
+  int sliding_window, int cache_tcap, float inv_sqrt_d
+) {
+  /* Ignore sliding window mechanism, only consider odd layer */
+  constexpr int HEAD_DIM = 64;
+  constexpr int BLOCK_SIZE = 128;
+
+  constexpr int MFMA_M = 4;
+  constexpr int MFMA_N = 4;
+  constexpr int MFMA_K = 1;
+  constexpr int MFMA_BLOCK = 16;
+  constexpr int GPRs_CD = 4;
+
+  using CDfloat = __attribute__( (__vector_size__(GPRs_CD * sizeof(float)) )) float;
+
+  assert(head_dim == 64);
+  assert(blockDim.x == BLOCK_SIZE);
+
+  // Wave tile
+  constexpr int WM = 4;
+  constexpr int WN = TILE_T;
+
+  constexpr int nIterWaveM = WM / MFMA_M;
+  constexpr int nIterWaveN = WN / MFMA_N;
+
+  const int waveIdx = threadIdx.x / warpSize;
+  const int laneIdx = threadIdx.x % warpSize;
+
+  const int yInBlockTile = waveIdx;
+
+  const int Ai = (laneIdx % 4);
+  const int Ak = 0;
+  const int Ablock = (laneIdx / 4);
+  const int Bj = (laneIdx % 4);
+  const int Bk = 0;
+  const int Bblock = (laneIdx / 4);
+
+  const int nbLoadsKV = TILE_T * HEAD_DIM / BLOCK_SIZE;
+
+  const int kv_h = blockIdx.x;
+  const int b = blockIdx.y;
+
+  const int loadKVIdx_y = threadIdx.x / (HEAD_DIM);
+  const int loadKVIdx_x = threadIdx.x % (HEAD_DIM);
+  constexpr int strideKV = BLOCK_SIZE / (HEAD_DIM);
+
+  const int t_start = MAX(0, pos - sliding_window + 1);
+  const int n_steps = pos + 1 - t_start;
+
+  __shared__ __hip_bfloat16 ks[TILE_T][HEAD_DIM];
+  __shared__ __hip_bfloat16 vs[TILE_T][HEAD_DIM];
+
+  float out_values[MFMA_M] = {0.f};
+  float m_values[MFMA_M] = {-INFINITY};
+  float l_values[MFMA_M] = {0.f};
+
+  const float *qptr =
+      q + (size_t)b * n_attn_heads * head_dim;
+  
+  float q_values[HEAD_DIM / MFMA_BLOCK];
+  for (int i = 0; i < HEAD_DIM / MFMA_BLOCK; ++i) {
+    q_values[i] = qptr[(Ai + MFMA_M * waveIdx + kv_h * kv_mul) * head_dim + i * MFMA_BLOCK + Ablock];
+  }
+
+  // Load data to shared memory
+  for (int i = 0; i < nbLoadsKV; ++i) {
+    int offset = i * strideKV;
+    int index_x = loadKVIdx_x;
+    int index_y = t_start + loadKVIdx_y + offset;
+    if (index_y < t_start + n_steps) {
+      const __hip_bfloat16 *kptr =
+          key_cache + (index_y % cache_tcap) * (size_t)batch_size * (size_t)kv_dim +
+          (size_t)b * (size_t)kv_dim + (size_t)kv_h * (size_t)head_dim + index_x;
+      const __hip_bfloat16 *vptr =
+          value_cache + (index_y % cache_tcap) * (size_t)batch_size * (size_t)kv_dim +
+          (size_t)b * (size_t)kv_dim + (size_t)kv_h * (size_t)head_dim + index_x;
+      ks[loadKVIdx_y + offset][loadKVIdx_x] = kptr[0];
+      vs[loadKVIdx_y + offset][loadKVIdx_x] = vptr[0];
+    }
+    else {
+      ks[loadKVIdx_y + offset][loadKVIdx_x] = 0;
+      vs[loadKVIdx_y + offset][loadKVIdx_x] = 0;
+    }
+  }
+  __syncthreads();
+
+  for (int btIdx = t_start; btIdx < t_start + n_steps; btIdx += TILE_T) {
+    // Prefetch
+    __hip_bfloat16 regK[nbLoadsKV];
+    __hip_bfloat16 regV[nbLoadsKV];
+    if (btIdx + TILE_T < t_start + n_steps) {
+      for (int i = 0; i < nbLoadsKV; ++i) {
+        int offset = i * strideKV;
+        int index_x = loadKVIdx_x;
+        int index_y = btIdx + TILE_T + loadKVIdx_y + offset;
+        if (index_y < t_start + n_steps) {
+          const __hip_bfloat16 *kptr =
+              key_cache + (index_y % cache_tcap) * (size_t)batch_size * (size_t)kv_dim +
+              (size_t)b * (size_t)kv_dim + (size_t)kv_h * (size_t)head_dim + index_x;
+          const __hip_bfloat16 *vptr =
+              value_cache + (index_y % cache_tcap) * (size_t)batch_size * (size_t)kv_dim +
+              (size_t)b * (size_t)kv_dim + (size_t)kv_h * (size_t)head_dim + index_x;
+          regK[i] = kptr[0];
+          regV[i] = vptr[0];
+        }
+        else {
+          regK[i] = regV[i] = 0;
+        }
+      }
+    }
+
+    // Computing
+    for (int t = 0; t < TILE_T; t += MFMA_N) {
+      CDfloat acc = {0};
+      for (int dimIdx = 0; dimIdx < HEAD_DIM; dimIdx += MFMA_BLOCK) {
+        float k_value = __bfloat162float(ks[t + Bj][dimIdx + Ablock]);
+        acc = __builtin_amdgcn_mfma_f32_4x4x1f32(q_values[dimIdx / MFMA_BLOCK], k_value, acc, 0, 0, 0);
+      }
+
+      for (int width = warpSize / 2; width >= MFMA_N; width /= 2) {
+        for (int i = 0; i < GPRs_CD; ++i) {
+          acc[i] += __shfl_down(acc[i], width);
+        }
+      }
+
+      for (int i = 0; i < MFMA_M; ++i) {
+        for (int j = 0; j < MFMA_N; ++j) {
+          if (btIdx + t + j >= t_start + n_steps) break;
+          float attn_score = __shfl(acc[i], j);
+          attn_score *= inv_sqrt_d;
+          float m_new = fmaxf(m_values[i], attn_score);
+          float alpha = __expf(m_values[i] - m_new);
+          float e = __expf(attn_score - m_new);
+          l_values[i] = l_values[i] * alpha + e;
+          m_values[i] = m_new;
+
+          out_values[i] = alpha * out_values[i] + e * __bfloat162float(vs[t + j][laneIdx]);
+        }
+      }
+    }
+
+    __syncthreads();
+
+    if (btIdx + TILE_T < t_start + n_steps) {
+      for (int i = 0; i < nbLoadsKV; ++i) {
+        int offset = i * strideKV;
+        int index_x = loadKVIdx_x;
+        int index_y = btIdx + TILE_T + loadKVIdx_y + offset;
+        ks[loadKVIdx_y + offset][loadKVIdx_x] = regK[i];
+        vs[loadKVIdx_y + offset][loadKVIdx_x] = regV[i];
+      }
+    }
+    __syncthreads();
+  }
+
+  for (int i = 0; i < MFMA_M; ++i) {
+    int h = kv_h * kv_mul + waveIdx * MFMA_M + i;
+
+    float attn_score = attn_sinks[h];
+    float m_new = fmaxf(m_values[i], attn_score);
+    float alpha = __expf(m_values[i] - m_new);
+    float e = __expf(attn_score - m_new);
+    l_values[i] = l_values[i] * alpha + e;
+    m_values[i] = m_new;
+    out_values[i] = alpha * out_values[i] / l_values[i];
+
+    float *obh =
+        tb + (size_t)b * n_attn_heads * head_dim + 
+             (size_t)h * head_dim;
+    obh[laneIdx] = out_values[i];
+  }
+
+}
+
+template <int TILE_T>
+__global__ void __launch_bounds__(128)
+flash_attn_decode_odd_layer_bf16_matrix_core_kernel(
   float *__restrict__ tb, const __hip_bfloat16 *__restrict__ key_cache,
   const __hip_bfloat16 *__restrict__ value_cache, const float *__restrict__ q,
   const float *__restrict__ attn_sinks, int head_dim, int n_attn_heads,
@@ -1679,8 +1859,8 @@ flash_attn_decode_bf16_matrix_core_kernel(
 
   const int n_steps = pos + 1;
 
-  __shared__ __hip_bfloat16 ks[HEAD_DIM][TILE_T];
-  __shared__ __hip_bfloat16 vs[HEAD_DIM][TILE_T];
+  __shared__ __hip_bfloat16 ks[TILE_T][HEAD_DIM];
+  __shared__ __hip_bfloat16 vs[TILE_T][HEAD_DIM];
 
   float out_values[MFMA_M] = {0.f};
   float m_values[MFMA_M] = {-INFINITY};
@@ -1706,12 +1886,12 @@ flash_attn_decode_bf16_matrix_core_kernel(
       const __hip_bfloat16 *vptr =
           value_cache + index_y * (size_t)batch_size * (size_t)kv_dim +
           (size_t)b * (size_t)kv_dim + (size_t)kv_h * (size_t)head_dim + index_x;
-      ks[loadKVIdx_x][loadKVIdx_y + offset] = kptr[0];
-      vs[loadKVIdx_x][loadKVIdx_y + offset] = vptr[0];
+      ks[loadKVIdx_y + offset][loadKVIdx_x] = kptr[0];
+      vs[loadKVIdx_y + offset][loadKVIdx_x] = vptr[0];
     }
     else {
-      ks[loadKVIdx_x][loadKVIdx_y + offset] = 0;
-      vs[loadKVIdx_x][loadKVIdx_y + offset] = 0;
+      ks[loadKVIdx_y + offset][loadKVIdx_x] = 0;
+      vs[loadKVIdx_y + offset][loadKVIdx_x] = 0;
     }
   }
   __syncthreads();
@@ -1745,7 +1925,7 @@ flash_attn_decode_bf16_matrix_core_kernel(
     for (int t = 0; t < TILE_T; t += MFMA_N) {
       CDfloat acc = {0};
       for (int dimIdx = 0; dimIdx < HEAD_DIM; dimIdx += MFMA_BLOCK) {
-        float k_value = __bfloat162float(ks[dimIdx + Ablock][t + Bj]);
+        float k_value = __bfloat162float(ks[t + Bj][dimIdx + Ablock]);
         acc = __builtin_amdgcn_mfma_f32_4x4x1f32(q_values[dimIdx / MFMA_BLOCK], k_value, acc, 0, 0, 0);
       }
 
@@ -1766,7 +1946,7 @@ flash_attn_decode_bf16_matrix_core_kernel(
           l_values[i] = l_values[i] * alpha + e;
           m_values[i] = m_new;
 
-          out_values[i] = alpha * out_values[i] + e * __bfloat162float(vs[laneIdx][t + j]);
+          out_values[i] = alpha * out_values[i] + e * __bfloat162float(vs[t + j][laneIdx]);
         }
       }
     }
@@ -1778,8 +1958,8 @@ flash_attn_decode_bf16_matrix_core_kernel(
         int offset = i * strideKV;
         int index_x = loadKVIdx_x;
         int index_y = btIdx + TILE_T + loadKVIdx_y + offset;
-        ks[loadKVIdx_x][loadKVIdx_y + offset] = regK[i];
-        vs[loadKVIdx_x][loadKVIdx_y + offset] = regV[i];
+        ks[loadKVIdx_y + offset][loadKVIdx_x] = regK[i];
+        vs[loadKVIdx_y + offset][loadKVIdx_x] = regV[i];
       }
     }
     __syncthreads();
@@ -1803,134 +1983,6 @@ flash_attn_decode_bf16_matrix_core_kernel(
   }
 
 }
-
-__global__ void __launch_bounds__(512) flash_attn_decode_bf16_kernel(
-    float *__restrict__ tb, const __hip_bfloat16 *__restrict__ key_cache,
-    const __hip_bfloat16 *__restrict__ value_cache, const float *__restrict__ q,
-    const float *__restrict__ attn_sinks, int head_dim, int n_attn_heads,
-    int n_kv_heads, int pos, int seq_len, int sliding_window, int apply_mask,
-    int batch_size, int kv_dim, int kv_mul, float inv_sqrt_d, int tile_t,
-    int cache_tcap) {
-  const int kv_h = blockIdx.x;
-  const int b = blockIdx.y;
-  const int warp = threadIdx.y;
-  const int lane = threadIdx.x;
-  const int h = kv_h * kv_mul + warp;
-  if (warp >= kv_mul || h >= n_attn_heads) return;
-
-  extern __shared__ unsigned short smem_flash[];
-  unsigned short *sK0 = smem_flash;
-  unsigned short *sV0 = sK0 + (size_t)tile_t * head_dim;
-  unsigned short *sK1 = sV0 + (size_t)tile_t * head_dim;
-  unsigned short *sV1 = sK1 + (size_t)tile_t * head_dim;
-
-  const float *qptr =
-      q + (size_t)b * n_attn_heads * head_dim + (size_t)h * head_dim;
-  float qi = (lane < head_dim) ? qptr[lane] : 0.0f;
-
-  float out_i = 0.0f, m = -INFINITY, l = 0.0f;
-
-  int t_start = 0;
-  if (apply_mask && sliding_window > 0)
-    t_start = MAX(0, pos - sliding_window + 1);
-  const int n_steps = pos - t_start + 1;
-
-  const int vec8 = head_dim >> 3;
-  const int threads = blockDim.x * blockDim.y;
-  const int tid = threadIdx.y * blockDim.x + lane;
-  const int use_ring = (apply_mask && sliding_window > 0);
-
-  auto prefetch = [&](int base_t, int cur_t, unsigned short *dK,
-                      unsigned short *dV) {
-    const int elems = cur_t * vec8;
-    for (int e8 = tid; e8 < elems; e8 += threads) {
-      int tloc = e8 / vec8;
-      int i8 = (e8 - tloc * vec8) << 3;
-      size_t tindex = use_ring
-                          ? (size_t)((t_start + base_t + tloc) % cache_tcap)
-                          : (size_t)(t_start + base_t + tloc);
-      const __hip_bfloat16 *kptr =
-          key_cache + tindex * (size_t)batch_size * (size_t)kv_dim +
-          (size_t)b * (size_t)kv_dim + (size_t)kv_h * (size_t)head_dim + i8;
-      const __hip_bfloat16 *vptr =
-          value_cache + tindex * (size_t)batch_size * (size_t)kv_dim +
-          (size_t)b * (size_t)kv_dim + (size_t)kv_h * (size_t)head_dim + i8;
-      uint4 k8 = *reinterpret_cast<const uint4 *>(kptr);
-      uint4 v8 = *reinterpret_cast<const uint4 *>(vptr);
-      reinterpret_cast<uint4 *>(dK + (size_t)tloc * head_dim)[i8 >> 3] = k8;
-      reinterpret_cast<uint4 *>(dV + (size_t)tloc * head_dim)[i8 >> 3] = v8;
-    }
-  };
-
-  int base = 0;
-  int cur = MIN(tile_t, n_steps);
-  if (cur > 0) prefetch(0, cur, sK0, sV0);
-  __syncthreads();
-
-  bool ping = true;
-  while (true) {
-    unsigned short *sK = ping ? sK0 : sK1;
-    unsigned short *sV = ping ? sV0 : sV1;
-
-    int nxt = base + cur;
-    int nxt_cur = (nxt < n_steps) ? MIN(tile_t, n_steps - nxt) : 0;
-    if (nxt_cur > 0) {
-      unsigned short *nK = ping ? sK1 : sK0;
-      unsigned short *nV = ping ? sV1 : sV0;
-      prefetch(nxt, nxt_cur, nK, nV);
-    }
-
-    for (int t = 0; t < cur; ++t) {
-      float part = (lane < head_dim)
-                       ? (qi * bf16bits_to_f32(sK[(size_t)t * head_dim + lane]))
-                       : 0.0f;
-#pragma unroll
-      for (int off = warpSize >> 1; off > 0; off >>= 1)
-        part += __shfl_down(part, off);
-      float e = 0.0f, alpha = 0.0f;
-      if (lane == 0) {
-        float s = part * inv_sqrt_d;
-        float m_new = fmaxf(m, s);
-        alpha = __expf(m - m_new);
-        e = __expf(s - m_new);
-        l = l * alpha + e;
-        m = m_new;
-      }
-      e = __shfl(e, 0);
-      alpha = __shfl(alpha, 0);
-      if (lane < head_dim)
-        out_i = alpha * out_i +
-                e * bf16bits_to_f32(sV[(size_t)t * head_dim + lane]);
-    }
-
-    __syncthreads();
-    if (nxt_cur == 0) break;
-    ping = !ping;
-    base = nxt;
-    cur = nxt_cur;
-  }
-
-  float alpha_sink = 0.0f, l_final = 0.0f;
-  if (lane == 0) {
-    float s_sink = attn_sinks[h];
-    float m_new = fmaxf(m, s_sink);
-    float alpha = __expf(m - m_new);
-    float e = __expf(s_sink - m_new);
-    l = l * alpha + e;
-    m = m_new;
-    alpha_sink = alpha;
-    l_final = l;
-  }
-  alpha_sink = __shfl(alpha_sink, 0);
-  l_final = __shfl(l_final, 0);
-
-  if (lane < head_dim) {
-    float v = (alpha_sink * out_i) / l_final;
-    float *obh =
-        tb + (size_t)b * n_attn_heads * head_dim + (size_t)h * head_dim;
-    obh[lane] = v;
-  }
-}
 static inline void getp_flash_attn_decode_bf16(
     float *tb, const __hip_bfloat16 *key_cache_layer,
     const __hip_bfloat16 *value_cache_layer, const float *q,
@@ -1942,37 +1994,21 @@ static inline void getp_flash_attn_decode_bf16(
   const int kv_mul = n_attn_heads / n_kv_heads;
   const float invsd = 1.0f / sqrtf((float)head_dim);
   const int apply_mask = (sliding_window > 0 && ((layer_id & 1) == 0)) ? 1 : 0;
-  const int tsteps = (apply_mask && sliding_window > 0)
-                         ? MIN(sliding_window, pos + 1)
-                         : (pos + 1);
 
   if (apply_mask) {
-    int T = (batch_size >= 80 ? 32 : 64);
-    if (T > tsteps) T = tsteps;
-  
-    // size_t shmem = (size_t)4 * (size_t)T * (size_t)head_dim * sizeof(float);
-    size_t shmem =
-        (size_t)4 * (size_t)T * (size_t)head_dim * sizeof(unsigned short);
-  
-    const size_t LDS_MAX = 64 * 1024;
-    if (shmem > LDS_MAX) {
-      T = (int)(LDS_MAX / (4u * (size_t)head_dim * sizeof(float)));
-      if (T < 1) T = 1;
-      if (T > tsteps) T = tsteps;
-      shmem = (size_t)4 * (size_t)T * (size_t)head_dim * sizeof(unsigned short);
-    }
-  
-    dim3 block(64, kv_mul);
+    dim3 block(128);
     dim3 grid(n_kv_heads, batch_size);
-    flash_attn_decode_bf16_kernel<<<grid, block, shmem, stream>>>(
-        tb, key_cache_layer, value_cache_layer, q, attn_sinks_layer, head_dim,
-        n_attn_heads, n_kv_heads, pos, seq_len, sliding_window, apply_mask,
-        batch_size, kv_dim, kv_mul, invsd, T, cache_tcap);
+    flash_attn_decode_even_layer_bf16_matrix_core_kernel<16><<<grid, block>>>
+      (tb, key_cache_layer, 
+       value_cache_layer, q, 
+       attn_sinks_layer, head_dim, n_attn_heads, 
+       n_kv_heads, pos, batch_size, kv_dim, kv_mul, 
+       sliding_window, cache_tcap, invsd);
   }
   else {
     dim3 block(128);
     dim3 grid(n_kv_heads, batch_size);
-    flash_attn_decode_bf16_matrix_core_kernel<16><<<grid, block>>>
+    flash_attn_decode_odd_layer_bf16_matrix_core_kernel<16><<<grid, block>>>
       (tb, key_cache_layer, 
       value_cache_layer, q, 
       attn_sinks_layer, head_dim, n_attn_heads, 
