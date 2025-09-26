@@ -54,6 +54,10 @@ void ext_alloc_device(int device_index, int batch_size, int expert_parallelism, 
 
   HIP_CHECK(hipMalloc(&g_ext[device_index].a_in,         sizeof(__hip_bfloat16) * (size_t)expert_parallelism * batch_size * experts_per_token * hidden_dim));
   HIP_CHECK(hipMalloc(&g_ext[device_index].gate_up_bf16, sizeof(__hip_bfloat16) * (size_t)expert_parallelism * batch_size * experts_per_token * intermediate_dim));
+  HIP_CHECK(hipMalloc(&g_ext[device_index].pre_qkv_bf16, sizeof(__hip_bfloat16) * (size_t)batch_size * hidden_dim));
+  HIP_CHECK(hipMalloc(&g_ext[device_index].attn_o_bf16,
+                      sizeof(__hip_bfloat16) * (size_t)batch_size *
+                          (size_t)p->head_dim * (size_t)p->n_attn_heads));
 }
 
 
@@ -83,6 +87,8 @@ void ext_free_all(int n_devices) {
 
     if (g_ext[i].a_in)          HIP_CHECK(hipFree(g_ext[i].a_in));
     if (g_ext[i].gate_up_bf16)  HIP_CHECK(hipFree(g_ext[i].gate_up_bf16));
+    if (g_ext[i].pre_qkv_bf16)  HIP_CHECK(hipFree(g_ext[i].pre_qkv_bf16));
+    if (g_ext[i].attn_o_bf16)   HIP_CHECK(hipFree(g_ext[i].attn_o_bf16));
   }
   free(g_ext);
   g_ext = nullptr;

@@ -58,7 +58,7 @@ void print_timing_summary() {
     const std::string& label = kv.first;
     const double total = kv.second;
     const long long cnt = g_timer.count[label];
-    const double avg = (cnt > 0) ? total / (double)cnt : 0.0;
+    const double avg = (cnt > 0) ? total / (double)cnt : 0.0; // seconds
     rows.push_back({label, total, cnt, avg, 0.0});
     sum_total += total;
     if (label.size() > max_label_len) max_label_len = label.size();
@@ -89,11 +89,12 @@ void print_timing_summary() {
   print_repeat('-', W_AVG+2);   putchar('+');
   print_repeat('-', W_PCT+2);   putchar('+'); putchar('\n');
 
+  // Updated header: AVG in ms
   printf("| %-*s | %*s | %*s | %*s | %*s |\n",
           WL, "LABEL",
           W_TOTAL, "TOTAL(s)",
           W_CALLS, "CALLS",
-          W_AVG,   "AVG(s)",
+          W_AVG,   "AVG(ms)",
           W_PCT,   "%");
 
   putchar('+'); print_repeat('-', WL+2); putchar('+');
@@ -107,20 +108,21 @@ void print_timing_summary() {
             WL, "(no timings)", W_TOTAL, "-", W_CALLS, "-", W_AVG, "-", W_PCT, "-");
   } else {
     for (const auto& row : rows) {
+      const double avg_ms = row.avg * 1000.0; // convert seconds -> milliseconds
       if (epoch_sec > 0.0) {
-        printf("| %-*s | %*.6f | %*lld | %*.6f | %*.2f |\n",
+        printf("| %-*s | %*.6f | %*lld | %*.3f | %*.2f |\n",
                 WL, row.label.c_str(),
                 W_TOTAL, row.total,
                 W_CALLS, row.calls,
-                W_AVG,   row.avg,
+                W_AVG,   avg_ms,
                 W_PCT,   row.pct);
       } else {
         // No epoch baseline yet
-        printf("| %-*s | %*.6f | %*lld | %*.6f | %*s |\n",
+        printf("| %-*s | %*.6f | %*lld | %*.3f | %*s |\n",
                 WL, row.label.c_str(),
                 W_TOTAL, row.total,
                 W_CALLS, row.calls,
-                W_AVG,   row.avg,
+                W_AVG,   avg_ms,
                 W_PCT,   "-");
       }
     }
