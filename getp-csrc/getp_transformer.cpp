@@ -191,7 +191,6 @@ static void upload_weights(TransformerWeights *w,
 
 void init_device_run_state(RunState *s, Config *p) {
   int kv_dim = p->head_dim * p->n_kv_heads;
-
   HIP_CHECK(hipMalloc(&s->x, (size_t)BATCH_SIZE * p->hidden_dim * sizeof(float)));
   HIP_CHECK(hipMalloc(&s->t, (size_t)BATCH_SIZE * p->hidden_dim * sizeof(float)));
   HIP_CHECK(hipMalloc(&s->tb, (size_t)BATCH_SIZE * p->head_dim * p->n_attn_heads * sizeof(float)));
@@ -202,12 +201,8 @@ void init_device_run_state(RunState *s, Config *p) {
   HIP_CHECK(hipMalloc(&s->mlp1_out, (size_t)2 * p->intermediate_dim * sizeof(float)));
   HIP_CHECK(hipMalloc(&s->gate, (size_t)p->intermediate_dim * sizeof(float)));
   HIP_CHECK(hipMalloc(&s->up, (size_t)p->intermediate_dim * sizeof(float)));
-  HIP_CHECK(hipMalloc(&s->gate_up, (size_t)BATCH_SIZE * p->experts_per_token * p->intermediate_dim * sizeof(float)));
   HIP_CHECK(hipMalloc(&s->e_agg, (size_t)BATCH_SIZE * p->hidden_dim * sizeof(float)));
   HIP_CHECK(hipMalloc(&s->q, (size_t)BATCH_SIZE * p->n_attn_heads * p->head_dim * sizeof(float)));
-
-  s->qkv = nullptr;
-  HIP_CHECK(hipMalloc(&s->qkv, (size_t)2 * BATCH_SIZE * (size_t)kv_dim * sizeof(float)));
 
   const int even_layers = (p->n_layers + 1) / 2;
   const int even_tcap = (p->sliding_window > 0 ? p->sliding_window : 1);
@@ -218,10 +213,12 @@ void init_device_run_state(RunState *s, Config *p) {
   HIP_CHECK(hipMalloc(&s->key_cache, (size_t)BATCH_SIZE * total_t * (size_t)kv_dim * sizeof(__hip_bfloat16)));
   HIP_CHECK(hipMalloc(&s->value_cache, (size_t)BATCH_SIZE * total_t * (size_t)kv_dim * sizeof(__hip_bfloat16)));
 
+  s->qkv = nullptr;
   s->att = nullptr;
-  HIP_CHECK(hipMalloc(&s->logits, (size_t)BATCH_SIZE * p->vocab_size * sizeof(float)));
+  s->logits = nullptr;
   s->mask = NULL;
 }
+
 
 
 static inline size_t kv_total_t(const Config *p) {
@@ -243,7 +240,6 @@ void resize_kv_cache(DeviceTransformer *dev, int seq_len_eff) {
   HIP_CHECK(hipMalloc(&dev->state.value_cache, (size_t)BATCH_SIZE * total_t * (size_t)kv_dim * sizeof(__hip_bfloat16)));
 }
 
-
 void free_device_run_state(RunState *s) {
   HIP_CHECK(hipFree(s->x));
   HIP_CHECK(hipFree(s->t));
@@ -255,7 +251,6 @@ void free_device_run_state(RunState *s) {
   HIP_CHECK(hipFree(s->mlp1_out));
   HIP_CHECK(hipFree(s->gate));
   HIP_CHECK(hipFree(s->up));
-  HIP_CHECK(hipFree(s->gate_up));
   HIP_CHECK(hipFree(s->e_agg));
   if (s->qkv) HIP_CHECK(hipFree(s->qkv));
   HIP_CHECK(hipFree(s->q));
@@ -265,6 +260,7 @@ void free_device_run_state(RunState *s) {
   HIP_CHECK(hipFree(s->value_cache));
   if (s->mask) HIP_CHECK(hipFree(s->mask));
 }
+
 
 void upload_transformer(Transformer *transformer,
                         DeviceTransformer *dev_transformer, GPUWorker *worker) {
