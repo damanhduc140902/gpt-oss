@@ -161,7 +161,7 @@ namespace Model_20b {
 
     while (pos + 1 < steps) {
       int *next_gpu = getp_forward_20b(transformer, dev_transformers, worker,
-                                       token.data(), pos, B);
+                                       token.data(), pos, mask.data(), B);
 
       pos++;
       for (int b = 0; b < B; ++b) {
@@ -288,7 +288,7 @@ namespace Model_120b {
       int *next_gpu = getp_forward_120b(
         transformer, dev_transformers, workers, 
         sync_point, thread_idx, 
-        token.data(), pos);
+        token.data(), pos, mask.data());
   
       pos++;
       for (int b = 0; b < BATCH_SIZE; ++b) {

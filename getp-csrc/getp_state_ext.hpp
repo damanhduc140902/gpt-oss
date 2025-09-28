@@ -4,6 +4,8 @@
 #include <cstdlib>
 
 struct RunStateExt {
+  int *mask_on;
+
   int *local_ids;
   float *local_wts;
   int *n_local;

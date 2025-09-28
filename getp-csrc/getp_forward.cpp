@@ -1710,6 +1710,7 @@ __global__ void __launch_bounds__(128)
 flash_attn_decode_even_layer_bf16_matrix_core_kernel(
   float *__restrict__ tb, const __hip_bfloat16 *__restrict__ key_cache,
   const __hip_bfloat16 *__restrict__ value_cache, const float *__restrict__ q,
+  const int *__restrict__ mask_on,
   const float *__restrict__ attn_sinks, int head_dim, int n_attn_heads,
   int n_kv_heads, int pos, int batch_size, int kv_dim, int kv_mul, 
   int sliding_window, int cache_tcap, float inv_sqrt_d
@@ -1752,6 +1753,8 @@ flash_attn_decode_even_layer_bf16_matrix_core_kernel(
 
   const int kv_h = blockIdx.x;
   const int b = blockIdx.y;
+
+  if (!mask_on[b]) return;
 
   const int loadKVIdx_y = threadIdx.x / (HEAD_DIM);
   const int loadKVIdx_x = threadIdx.x % (HEAD_DIM);
@@ -1890,6 +1893,7 @@ __global__ void __launch_bounds__(128)
 flash_attn_decode_odd_layer_bf16_matrix_core_kernel(
   float *__restrict__ tb, const __hip_bfloat16 *__restrict__ key_cache,
   const __hip_bfloat16 *__restrict__ value_cache, const float *__restrict__ q,
+  const int *__restrict__ mask_on,
   const float *__restrict__ attn_sinks, int head_dim, int n_attn_heads,
   int n_kv_heads, int pos, int batch_size, int kv_dim, int kv_mul, 
   float inv_sqrt_d
@@ -1933,6 +1937,8 @@ flash_attn_decode_odd_layer_bf16_matrix_core_kernel(
   const int kv_h = blockIdx.x;
   const int b = blockIdx.y;
 
+  if (!mask_on[b]) return;
+  
   const int loadKVIdx_y = threadIdx.x / (HEAD_DIM);
   const int loadKVIdx_x = threadIdx.x % (HEAD_DIM);
   constexpr int strideKV = BLOCK_SIZE / (HEAD_DIM);
@@ -2065,7 +2071,7 @@ flash_attn_decode_odd_layer_bf16_matrix_core_kernel(
 }
 static inline void getp_flash_attn_decode_bf16(
     float *tb, const __hip_bfloat16 *key_cache_layer,
-    const __hip_bfloat16 *value_cache_layer, const float *q,
+    const __hip_bfloat16 *value_cache_layer, const float *q, const int *mask_on,
     const float *attn_sinks_layer, int head_dim, int n_attn_heads,
     int n_kv_heads, int pos, int seq_len, int sliding_window, int layer_id,
     int batch_size, int cache_tcap, hipStream_t stream) {
@@ -2078,9 +2084,10 @@ static inline void getp_flash_attn_decode_bf16(
   if (apply_mask) {
     dim3 block(128);
     dim3 grid(n_kv_heads, batch_size);
-    flash_attn_decode_even_layer_bf16_matrix_core_kernel<16><<<grid, block>>>
+    flash_attn_decode_even_layer_bf16_matrix_core_kernel<16><<<grid, block, 0, stream>>>
       (tb, key_cache_layer, 
        value_cache_layer, q, 
+       mask_on, 
        attn_sinks_layer, head_dim, n_attn_heads, 
        n_kv_heads, pos, batch_size, kv_dim, kv_mul, 
        sliding_window, cache_tcap, invsd);
@@ -2088,9 +2095,10 @@ static inline void getp_flash_attn_decode_bf16(
   else {
     dim3 block(128);
     dim3 grid(n_kv_heads, batch_size);
-    flash_attn_decode_odd_layer_bf16_matrix_core_kernel<16><<<grid, block>>>
+    flash_attn_decode_odd_layer_bf16_matrix_core_kernel<16><<<grid, block, 0, stream>>>
       (tb, key_cache_layer, 
       value_cache_layer, q, 
+      mask_on,
       attn_sinks_layer, head_dim, n_attn_heads, 
       n_kv_heads, pos, batch_size, kv_dim, kv_mul, 
       invsd);
@@ -2686,7 +2694,7 @@ inline void sync_workers(hipStream_t stream, Barrier &sync_point) {
 int *getp_forward_120b(Transformer * /*transformer*/,
                        DeviceTransformer **dev_transformers, GPUWorker *workers,
                        Barrier &sync_point, int thread_idx, int token[],
-                       int pos) {
+                       int pos, int *mask_on) {
   Config *p = &dev_transformers[thread_idx]->config;
   int head_dim = p->head_dim;
   int hidden_dim = p->hidden_dim;
@@ -2716,6 +2724,8 @@ int *getp_forward_120b(Transformer * /*transformer*/,
   HIP_CHECK(hipEventCreate(&event_memset));
   for (int i = 0; i < EXPERT_PARALLELISM; ++i) HIP_CHECK(hipEventCreate(&events_e_agg[i]));
 
+  HIP_CHECK(hipMemcpyAsync(ext->mask_on, mask_on, sizeof(int) * BATCH_SIZE, 
+                           hipMemcpyHostToDevice, compute_stream));
   HIP_CHECK(hipMemcpyAsync(dev_s->topk_i, token, sizeof(int) * BATCH_SIZE,
                            hipMemcpyHostToDevice, compute_stream));
   getp_gather_embedding_bf16(dev_x, dev_w->token_embedding_table_bf16,
@@ -2793,7 +2803,7 @@ int *getp_forward_120b(Transformer * /*transformer*/,
       const float *attn_sinks_layer =
           dev_w->attn_sinks + (size_t)l * p->n_attn_heads;
       getp_flash_attn_decode_bf16(
-          dev_s->tb, k_layer, v_layer, q_ptr, attn_sinks_layer, head_dim,
+          dev_s->tb, k_layer, v_layer, q_ptr, ext->mask_on, attn_sinks_layer, head_dim,
           p->n_attn_heads, p->n_kv_heads, pos, p->seq_len, p->sliding_window,
           (int)l, BATCH_SIZE, tcap, compute_stream);
     }
@@ -2990,7 +3000,7 @@ int *getp_forward_120b(Transformer * /*transformer*/,
 
 int *getp_forward_20b(Transformer * /*transformer*/,
                       DeviceTransformer **dev_transformeres, GPUWorker *worker,
-                      int token[], int pos, int batch_size) {
+                      int token[], int pos, int *mask_on, int batch_size) {
   
   PROFILE_FUNCTION();
   int device_index = worker->device_index;
@@ -3008,6 +3018,7 @@ int *getp_forward_20b(Transformer * /*transformer*/,
 
   HIP_CHECK(hipSetDevice(device_index));
 
+  HIP_CHECK(hipMemcpy(ext->mask_on, mask_on, sizeof(int) * batch_size, hipMemcpyHostToDevice));
   HIP_CHECK(hipMemcpy(dev_s->topk_i, token, sizeof(int) * batch_size,
                       hipMemcpyHostToDevice));
   getp_gather_embedding_bf16(dev_x, dev_w->token_embedding_table_bf16,
@@ -3053,8 +3064,7 @@ int *getp_forward_20b(Transformer * /*transformer*/,
     // float *k_step = dev_s->qkv;
     // float *v_step = dev_s->qkv + (size_t)BATCH_SIZE * (size_t)kv_dim;
     float *k_step = dev_s->tb2;
-float *v_step = dev_s->tb2 + (size_t)BATCH_SIZE * (size_t)kv_dim;
-
+    float *v_step = dev_s->tb2 + (size_t)BATCH_SIZE * (size_t)kv_dim;
 
     __hip_bfloat16 *dev_w_qkv =
         dev_w->w_qkv_bf16 +
@@ -3085,7 +3095,7 @@ float *v_step = dev_s->tb2 + (size_t)BATCH_SIZE * (size_t)kv_dim;
       const float *attn_sinks_layer =
           dev_w->attn_sinks + (size_t)l * p->n_attn_heads;
       getp_flash_attn_decode_bf16(
-          dev_s->tb, k_layer, v_layer, q_ptr, attn_sinks_layer, head_dim,
+          dev_s->tb, k_layer, v_layer, q_ptr, ext->mask_on, attn_sinks_layer, head_dim,
           p->n_attn_heads, p->n_kv_heads, pos, p->seq_len, p->sliding_window,
           (int)l, batch_size, tcap, nullptr);
     }
