@@ -28,6 +28,8 @@ struct RunStateExt {
   __hip_bfloat16 *gate_up_bf16;
   __hip_bfloat16 *pre_qkv_bf16;
   __hip_bfloat16 *attn_o_bf16;
+  __hip_bfloat16 *ext_t_bf16;
+
 };
 
 void ext_create(int n_devices);
