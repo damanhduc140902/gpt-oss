@@ -48,12 +48,12 @@ void warm_up(Transformer *transformer, Tokenizer *tokenizer) {
   if (p->n_experts == 128) {
     // 120b model
     EXPERT_PARALLELISM = n_devices;
-    BATCH_SIZE = 512;
+    BATCH_SIZE = 768;
   }
   else {
     // 20b model
     EXPERT_PARALLELISM = 1;
-    BATCH_SIZE = 896;
+    BATCH_SIZE = 1024;
   }
 
   if (n_devices % EXPERT_PARALLELISM) {
@@ -410,11 +410,6 @@ long long inference(Transformer *transformer, Tokenizer *tokenizer,
   HIP_CHECK(hipGetDeviceCount(&n_devices));
 
   // assert(n_devices == EXPERT_PARALLELISM);
-
-  int seq_len_eff = std::min(transformer->config.seq_len, requests->max_seq_len);
-  for (int i = 0; i < n_devices; ++i) {
-    resize_kv_cache(dev_transformers[i], seq_len_eff);
-  }
 
   int n_parallel_models = n_devices / EXPERT_PARALLELISM;
 

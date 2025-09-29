@@ -206,7 +206,8 @@ void init_device_run_state(RunState *s, Config *p) {
 
   const int even_layers = (p->n_layers + 1) / 2;
   const int even_tcap = (p->sliding_window > 0 ? p->sliding_window : 1);
-  const int odd_tcap = 1;
+  int odd_tcap = p->seq_len / 4;
+  if (odd_tcap < 1) odd_tcap = 1;
   const size_t total_t = (size_t)even_layers * (size_t)even_tcap +
                          (size_t)(p->n_layers - even_layers) * (size_t)odd_tcap;
 
@@ -220,25 +221,6 @@ void init_device_run_state(RunState *s, Config *p) {
 }
 
 
-
-static inline size_t kv_total_t(const Config *p) {
-  const int even_layers = (p->n_layers + 1) / 2;
-  const int even_tcap =
-      (p->sliding_window > 0 ? p->sliding_window : p->seq_len);
-  return (size_t)even_layers * (size_t)even_tcap +
-         (size_t)(p->n_layers - even_layers) * (size_t)p->seq_len;
-}
-
-void resize_kv_cache(DeviceTransformer *dev, int seq_len_eff) {
-  HIP_CHECK(hipSetDevice(dev->device_index));
-  dev->config.seq_len = seq_len_eff;
-  const int kv_dim = dev->config.head_dim * dev->config.n_kv_heads;
-  const size_t total_t = kv_total_t(&dev->config);
-  HIP_CHECK(hipFree(dev->state.key_cache));
-  HIP_CHECK(hipFree(dev->state.value_cache));
-  HIP_CHECK(hipMalloc(&dev->state.key_cache, (size_t)BATCH_SIZE * total_t * (size_t)kv_dim * sizeof(__hip_bfloat16)));
-  HIP_CHECK(hipMalloc(&dev->state.value_cache, (size_t)BATCH_SIZE * total_t * (size_t)kv_dim * sizeof(__hip_bfloat16)));
-}
 
 void free_device_run_state(RunState *s) {
   HIP_CHECK(hipFree(s->x));
