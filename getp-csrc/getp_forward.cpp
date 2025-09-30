@@ -1805,6 +1805,8 @@ flash_attn_decode_even_layer_bf16_matrix_core_kernel(
   const int kv_h = blockIdx.x;
   const int b = blockIdx.y;
 
+  if (!mask_on[b]) return;
+
   const int loadKVIdx_y = threadIdx.x / (HEAD_DIM / 8);
   const int loadKVIdx_x = threadIdx.x % (HEAD_DIM / 8);
   constexpr int strideKV = BLOCK_SIZE / (HEAD_DIM / 8);
@@ -2057,6 +2059,8 @@ flash_attn_decode_odd_layer_bf16_matrix_core_kernel(
 
   const int kv_h = blockIdx.x;
   const int b = blockIdx.y;
+
+  if (!mask_on[b]) return;
 
   const int loadKVIdx_y = threadIdx.x / (HEAD_DIM / 8);
   const int loadKVIdx_x = threadIdx.x % (HEAD_DIM / 8);
