@@ -1,5 +1,6 @@
 #include "getp_state_ext.hpp"
 #include "getp_transformer.cpp"
+#include <cstring>
 
 #ifndef HIP_CHECK
 #define HIP_CHECK(expr) do { hipError_t _e = (expr); if (_e != hipSuccess) { \
@@ -12,7 +13,7 @@ static RunStateExt* g_ext = nullptr;
 void ext_create(int n_devices) {
   g_ext = (RunStateExt*)malloc(sizeof(RunStateExt) * n_devices);
   for (int i = 0; i < n_devices; ++i) {
-    g_ext[i] = {};
+    memset(&g_ext[i], 0, sizeof(RunStateExt));
   }
 }
 
@@ -65,6 +66,13 @@ void ext_alloc_device(int device_index, int batch_size, int expert_parallelism, 
   HIP_CHECK(hipMalloc(&g_ext[device_index].attn_o_bf16,
                       sizeof(__hip_bfloat16) * (size_t)batch_size *
                           (size_t)p->head_dim * (size_t)p->n_attn_heads));
+
+  // Pre-allocate temporary buffer for collective operations
+  // Allocate enough for typical allreduce operations
+  size_t max_allreduce_size = (size_t)batch_size * (size_t)hidden_dim * 2;
+  g_ext[device_index].allreduce_tmp_size = max_allreduce_size;
+  HIP_CHECK(hipMalloc(&g_ext[device_index].allreduce_tmp, 
+                      sizeof(float) * max_allreduce_size));
 }
 
 
@@ -101,6 +109,7 @@ void ext_free_all(int n_devices) {
     if (g_ext[i].pre_qkv_bf16)  HIP_CHECK(hipFree(g_ext[i].pre_qkv_bf16));
     if (g_ext[i].attn_o_bf16)   HIP_CHECK(hipFree(g_ext[i].attn_o_bf16));
     if (g_ext[i].ext_t_bf16) HIP_CHECK(hipFree(g_ext[i].ext_t_bf16));
+    if (g_ext[i].allreduce_tmp) HIP_CHECK(hipFree(g_ext[i].allreduce_tmp));
 
   }
   free(g_ext);

@@ -48,12 +48,12 @@ void warm_up(Transformer *transformer, Tokenizer *tokenizer) {
   if (p->n_experts == 128) {
     // 120b model
     EXPERT_PARALLELISM = n_devices;
-    BATCH_SIZE = 768;
+    BATCH_SIZE = 1280;
   }
   else {
     // 20b model
     EXPERT_PARALLELISM = 1;
-    BATCH_SIZE = 1024;
+    BATCH_SIZE = 1536;
   }
 
   if (n_devices % EXPERT_PARALLELISM) {
@@ -136,9 +136,24 @@ namespace Model_20b {
 
     std::vector<int> nums_prompt_tokens(B, 0);
     std::vector<int *> prompts_tokens(B);
+    // Pre-calculate total size needed and allocate in one pinned memory block
+    size_t total_token_size = 0;
+    std::vector<size_t> token_sizes(B);
     for (int b = 0; b < B; ++b) {
-      prompts_tokens[b] =
-          (int *)malloc((strlen(inputs_seq[b]) + 3) * sizeof(int));
+      size_t size = (strlen(inputs_seq[b]) + 3) * sizeof(int);
+      token_sizes[b] = size;
+      total_token_size += size;
+    }
+    
+    // Allocate one large pinned memory block
+    int *pinned_tokens = nullptr;
+    HIP_CHECK(hipHostMalloc(&pinned_tokens, total_token_size, hipHostMallocDefault));
+    
+    // Assign pointers to each prompt
+    size_t offset = 0;
+    for (int b = 0; b < B; ++b) {
+      prompts_tokens[b] = pinned_tokens + offset / sizeof(int);
+      offset += token_sizes[b];
     }
     for (int b = 0; b < B; ++b) {
       encode(tokenizer, inputs_seq[b], -1, -1, prompts_tokens[b],
@@ -180,12 +195,12 @@ namespace Model_20b {
         if (next[b] == 199999 || next[b] == 200002) mask[b] = 0;
       }
       if (is_all_zero(mask.data(), B)) {
-        free(next_gpu);
+        HIP_CHECK(hipHostFree(next_gpu));
         break;
       }
 
       for (int b = 0; b < B; ++b) token[b] = next[b];
-      free(next_gpu);
+      HIP_CHECK(hipHostFree(next_gpu));
     }
 
     for (int b = 0; b < B; ++b) {
@@ -195,7 +210,8 @@ namespace Model_20b {
       }
       outputs_tokens[b][epos[b] - nums_prompt_tokens[b] + 1] = -1;
     }
-    for (int b = 0; b < B; ++b) free(prompts_tokens[b]);
+    // Free the single pinned memory block
+    HIP_CHECK(hipHostFree(pinned_tokens));
     HIP_CHECK(hipDeviceSynchronize());
 
     long long acc = 0;
@@ -263,8 +279,25 @@ namespace Model_120b {
   
     std::vector<int> nums_prompt_tokens(BATCH_SIZE, 0);
     std::vector<int*> prompts_tokens(BATCH_SIZE);
+    
+    // Pre-calculate total size needed and allocate in one pinned memory block
+    size_t total_token_size = 0;
+    std::vector<size_t> token_sizes(BATCH_SIZE);
     for (int b = 0; b < BATCH_SIZE; ++b) {
-      prompts_tokens[b] = (int *)malloc((strlen(inputs_seq[b]) + 3) * sizeof(int));
+      size_t size = (strlen(inputs_seq[b]) + 3) * sizeof(int);
+      token_sizes[b] = size;
+      total_token_size += size;
+    }
+    
+    // Allocate one large pinned memory block
+    int *pinned_tokens = nullptr;
+    HIP_CHECK(hipHostMalloc(&pinned_tokens, total_token_size, hipHostMallocDefault));
+    
+    // Assign pointers to each prompt
+    size_t offset = 0;
+    for (int b = 0; b < BATCH_SIZE; ++b) {
+      prompts_tokens[b] = pinned_tokens + offset / sizeof(int);
+      offset += token_sizes[b];
     }
     for (int b = 0; b < BATCH_SIZE; ++b) {
       encode(tokenizer, inputs_seq[b], -1, -1, prompts_tokens[b], &nums_prompt_tokens[b],
@@ -311,7 +344,7 @@ namespace Model_120b {
       }
       sync_point.wait();
       if (is_all_zero(thread_states, EXPERT_PARALLELISM)) {
-        free(next_gpu);
+        HIP_CHECK(hipHostFree(next_gpu));
         break;
       }
   
@@ -322,14 +355,15 @@ namespace Model_120b {
       // fflush(stdout);
   
       for (int b = 0; b < BATCH_SIZE; ++b) token[b] = next[b];
-      free(next_gpu);
+      HIP_CHECK(hipHostFree(next_gpu));
     }
   
     for (int b = 0; b < BATCH_SIZE; ++b) {
       if (epos[b] == -1) { fprintf(stderr, "bad epos\n"); exit(EXIT_FAILURE); }
       outputs_tokens[b][epos[b] - nums_prompt_tokens[b] + 1] = -1;
     }
-    for (int b = 0; b < BATCH_SIZE; ++b) free(prompts_tokens[b]);
+    // Free the single pinned memory block
+    HIP_CHECK(hipHostFree(pinned_tokens));
     // HIP_CHECK(hipDeviceSynchronize());
   
     long long acc = 0;

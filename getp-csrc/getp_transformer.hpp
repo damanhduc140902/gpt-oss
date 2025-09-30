@@ -77,6 +77,8 @@ struct DeviceTransformer {
 
   hipStream_t memory_stream;
   hipStream_t compute_stream;
+  hipStream_t h2d_stream;  // Dedicated stream for host-to-device transfers
+  hipStream_t d2h_stream;  // Dedicated stream for device-to-host transfers
 
   ~DeviceTransformer();
 };

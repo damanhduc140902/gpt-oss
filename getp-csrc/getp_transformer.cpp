@@ -5,6 +5,7 @@
 #include <hip/hip_runtime.h>
 
 #include <cmath>
+#include <cstring>
 #include <iostream>
 
 #include "getp_eval.cpp"
@@ -36,15 +37,26 @@ DeviceTransformer::~DeviceTransformer() {
   if (dev_experts) HIP_CHECK(hipFree(dev_experts));
   if (dev_linear_bf16) HIP_CHECK(hipFree(dev_linear_bf16));
   free_device_run_state(&state);
+  if (memory_stream) HIP_CHECK(hipStreamDestroy(memory_stream));
+  if (compute_stream) HIP_CHECK(hipStreamDestroy(compute_stream));
+  if (h2d_stream) HIP_CHECK(hipStreamDestroy(h2d_stream));
+  if (d2h_stream) HIP_CHECK(hipStreamDestroy(d2h_stream));
 }
 
 void getp_memcpy_fp32_to_bf16(__hip_bfloat16 *dst, float *src, int n_elements) {
-  __hip_bfloat16 *tmp = reinterpret_cast<__hip_bfloat16 *>(
-      malloc(sizeof(__hip_bfloat16) * n_elements));
+  // Use pinned memory for faster host-to-device transfer
+  __hip_bfloat16 *tmp = nullptr;
+  HIP_CHECK(hipHostMalloc(&tmp, sizeof(__hip_bfloat16) * n_elements, hipHostMallocDefault));
+  
+  // Convert FP32 to BF16 on host
   for (int i = 0; i < n_elements; ++i) tmp[i] = __float2bfloat16(src[i]);
-  HIP_CHECK(hipMemcpy(dst, tmp, sizeof(__hip_bfloat16) * n_elements,
-                      hipMemcpyHostToDevice));
-  free(tmp);
+  
+  // Use async copy for better performance
+  HIP_CHECK(hipMemcpyAsync(dst, tmp, sizeof(__hip_bfloat16) * n_elements,
+                      hipMemcpyHostToDevice, 0));
+  HIP_CHECK(hipStreamSynchronize(0));
+  
+  HIP_CHECK(hipHostFree(tmp));
 }
 
 static void upload_weights(TransformerWeights *w,
@@ -72,25 +84,34 @@ static void upload_weights(TransformerWeights *w,
   HIP_CHECK(hipMalloc(_dev_data, keep_fp32_elems * sizeof(float)));
   float *p32 = *_dev_data;
 
+  // Use pinned memory and async copies for better performance
+  float* h_pinned = nullptr;
+  HIP_CHECK(hipHostMalloc(&h_pinned, keep_fp32_elems * sizeof(float), hipHostMallocDefault));
+  
+  // Copy all data to pinned memory first
+  memcpy(h_pinned, w->rms_attn_w, rms_attn_elems * sizeof(float));
+  memcpy(h_pinned + rms_attn_elems, w->rms_ffn_w, rms_ffn_elems * sizeof(float));
+  memcpy(h_pinned + rms_attn_elems + rms_ffn_elems, w->rms_out_w, rms_out_elems * sizeof(float));
+  memcpy(h_pinned + rms_attn_elems + rms_ffn_elems + rms_out_elems, w->attn_sinks, sinks_elems * sizeof(float));
+  
+  // Single async transfer
+  HIP_CHECK(hipMemcpyAsync(p32, h_pinned, keep_fp32_elems * sizeof(float),
+                           hipMemcpyHostToDevice, 0));
+  
   dev_w->rms_attn_w = p32;
-  HIP_CHECK(hipMemcpy(p32, w->rms_attn_w, rms_attn_elems * sizeof(float),
-                      hipMemcpyHostToDevice));
   p32 += rms_attn_elems;
 
   dev_w->rms_ffn_w = p32;
-  HIP_CHECK(hipMemcpy(p32, w->rms_ffn_w, rms_ffn_elems * sizeof(float),
-                      hipMemcpyHostToDevice));
   p32 += rms_ffn_elems;
 
   dev_w->rms_out_w = p32;
-  HIP_CHECK(hipMemcpy(p32, w->rms_out_w, rms_out_elems * sizeof(float),
-                      hipMemcpyHostToDevice));
   p32 += rms_out_elems;
 
   dev_w->attn_sinks = p32;
-  HIP_CHECK(hipMemcpy(p32, w->attn_sinks, sinks_elems * sizeof(float),
-                      hipMemcpyHostToDevice));
   p32 += sinks_elems;
+  
+  HIP_CHECK(hipStreamSynchronize(0));
+  HIP_CHECK(hipHostFree(h_pinned));
 
   dev_w->token_embedding_table = nullptr;
   dev_w->w_qkv = dev_w->b_qkv = nullptr;
@@ -246,18 +267,29 @@ void free_device_run_state(RunState *s) {
 
 void upload_transformer(Transformer *transformer,
                         DeviceTransformer *dev_transformer, GPUWorker *worker) {
+  // Initialize streams to nullptr first
+  dev_transformer->memory_stream = nullptr;
+  dev_transformer->compute_stream = nullptr;
+  dev_transformer->h2d_stream = nullptr;
+  dev_transformer->d2h_stream = nullptr;
+  
   dev_transformer->config = transformer->config;
   upload_weights(
       &transformer->weights, &dev_transformer->weights, &transformer->config,
       &dev_transformer->dev_data, &dev_transformer->dev_experts,
       &dev_transformer->dev_linear_bf16, worker, dev_transformer->device_index);
   init_device_run_state(&dev_transformer->state, &dev_transformer->config);
-  HIP_CHECK(hipStreamCreate(&dev_transformer->memory_stream));
-  HIP_CHECK(hipStreamCreate(&dev_transformer->compute_stream));
+  // Create non-blocking streams for better concurrency
+  HIP_CHECK(hipStreamCreateWithFlags(&dev_transformer->memory_stream, hipStreamNonBlocking));
+  HIP_CHECK(hipStreamCreateWithFlags(&dev_transformer->compute_stream, hipStreamNonBlocking));
+  HIP_CHECK(hipStreamCreateWithFlags(&dev_transformer->h2d_stream, hipStreamNonBlocking));
+  HIP_CHECK(hipStreamCreateWithFlags(&dev_transformer->d2h_stream, hipStreamNonBlocking));
 }
 
 void cleanup(Transformer *transformer, DeviceTransformer *dev_transformer) {
   free_device_run_state(&dev_transformer->state);
   HIP_CHECK(hipStreamDestroy(dev_transformer->memory_stream));
   HIP_CHECK(hipStreamDestroy(dev_transformer->compute_stream));
+  HIP_CHECK(hipStreamDestroy(dev_transformer->h2d_stream));
+  HIP_CHECK(hipStreamDestroy(dev_transformer->d2h_stream));
 }

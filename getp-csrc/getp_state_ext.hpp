@@ -32,6 +32,9 @@ struct RunStateExt {
   __hip_bfloat16 *attn_o_bf16;
   __hip_bfloat16 *ext_t_bf16;
 
+  // Pre-allocated temporary buffers for collective operations
+  float *allreduce_tmp;
+  size_t allreduce_tmp_size;
 };
 
 void ext_create(int n_devices);

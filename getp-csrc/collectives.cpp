@@ -1,4 +1,5 @@
 #include "collectives.hpp"
+#include "getp_state_ext.hpp"
 #include <algorithm>
 #include <cstdio>
 
@@ -77,15 +78,22 @@ void cgAllReduceSumF32(const CollectiveGroup& g, float** bufs, size_t count,
 
   const int root_dev = g.ranks[root_rank];
 
-  // assert(root_dev == 0);
-  // assert(root_rank == 0);
-
-  // Root scratch buffer
-  HIP_CHECK(hipSetDevice(root_dev));
+  // Use pre-allocated buffer from ext_get if available
+  RunStateExt* ext = ext_get(root_dev);
   float* tmp = nullptr;
-  HIP_CHECK(hipMalloc(&tmp, bytes * (g.ranks.size() - 1)));
+  bool use_preallocated = false;
+  
+  size_t required_size = count * (g.ranks.size() - 1);
+  if (ext && ext->allreduce_tmp && required_size <= ext->allreduce_tmp_size) {
+    tmp = ext->allreduce_tmp;
+    use_preallocated = true;
+  } else {
+    // Fallback to dynamic allocation
+    HIP_CHECK(hipSetDevice(root_dev));
+    HIP_CHECK(hipMalloc(&tmp, bytes * (g.ranks.size() - 1)));
+  }
 
-  // Gather peer buffers
+  // Gather peer buffers - overlap copies with computation
   for (size_t r = 0, peer_order = 0; r < g.ranks.size(); ++r) {
     if ((int)r == root_rank) continue;
 
@@ -111,11 +119,14 @@ void cgAllReduceSumF32(const CollectiveGroup& g, float** bufs, size_t count,
     ++peer_order;
   }
 
-  // Make sure reduction is finished
+  // Synchronize stream instead of device for better concurrency
   HIP_CHECK(hipSetDevice(root_dev));
-  HIP_CHECK(hipDeviceSynchronize());
+  HIP_CHECK(hipStreamSynchronize(g.comm[root_rank]));
   
-  HIP_CHECK(hipFree(tmp));
+  // Only free if we allocated dynamically
+  if (!use_preallocated) {
+    HIP_CHECK(hipFree(tmp));
+  }
 
   // Broadcast the reduced buffer from root to all
   cgBroadcastF32(g, bufs, count, root_rank, /*sync=*/sync);
@@ -129,13 +140,20 @@ void cgReduceSumF32(const CollectiveGroup& g, float** bufs, size_t count,
 
   const int root_dev = g.ranks[root_rank];
 
-  // assert(root_dev == 0);
-  // assert(root_rank == 0);
-
-  // Root scratch buffer
-  HIP_CHECK(hipSetDevice(root_dev));
+  // Use pre-allocated buffer from ext_get if available
+  RunStateExt* ext = ext_get(root_dev);
   float* tmp = nullptr;
-  HIP_CHECK(hipMalloc(&tmp, bytes * (g.ranks.size() - 1)));
+  bool use_preallocated = false;
+  
+  size_t required_size = count * (g.ranks.size() - 1);
+  if (ext && ext->allreduce_tmp && required_size <= ext->allreduce_tmp_size) {
+    tmp = ext->allreduce_tmp;
+    use_preallocated = true;
+  } else {
+    // Fallback to dynamic allocation
+    HIP_CHECK(hipSetDevice(root_dev));
+    HIP_CHECK(hipMalloc(&tmp, bytes * (g.ranks.size() - 1)));
+  }
 
   // Gather peer buffers
   for (size_t r = 0, peer_order = 0; r < g.ranks.size(); ++r) {
@@ -163,11 +181,14 @@ void cgReduceSumF32(const CollectiveGroup& g, float** bufs, size_t count,
     ++peer_order;
   }
 
-  // Make sure reduction is finished
+  // Synchronize stream instead of device for better concurrency
   HIP_CHECK(hipSetDevice(root_dev));
-  HIP_CHECK(hipDeviceSynchronize());
+  HIP_CHECK(hipStreamSynchronize(g.comm[root_rank]));
   
-  HIP_CHECK(hipFree(tmp));
+  // Only free if we allocated dynamically
+  if (!use_preallocated) {
+    HIP_CHECK(hipFree(tmp));
+  }
 }
 
 // Argmax across ranks for a **single** (val, idx) (host staging; tiny payload)

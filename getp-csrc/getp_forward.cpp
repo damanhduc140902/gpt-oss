@@ -3272,7 +3272,9 @@ int *getp_forward_120b(Transformer * /*transformer*/,
     hidden_dim, p->vocab_size,
     BATCH_SIZE, dev_s->topk_i, compute_stream);
 
-  int *next_host = (int *)malloc(sizeof(int) * BATCH_SIZE);
+  // Use pinned memory for faster device-to-host transfer
+  int *next_host = nullptr;
+  HIP_CHECK(hipHostMalloc(&next_host, sizeof(int) * BATCH_SIZE, hipHostMallocDefault));
   HIP_CHECK(hipMemcpyAsync(next_host, dev_s->topk_i, sizeof(int) * BATCH_SIZE,
                            hipMemcpyDeviceToHost, compute_stream));
   HIP_CHECK(hipStreamSynchronize(compute_stream));
@@ -3299,10 +3301,15 @@ int *getp_forward_20b(Transformer * /*transformer*/,
   int n_experts = p->n_experts;
 
   HIP_CHECK(hipSetDevice(device_index));
+  
+  hipStream_t h2d_stream = dev_transformeres[device_index]->h2d_stream;
 
-  HIP_CHECK(hipMemcpy(ext->mask_on, mask_on, sizeof(int) * batch_size, hipMemcpyHostToDevice));
-  HIP_CHECK(hipMemcpy(dev_s->topk_i, token, sizeof(int) * batch_size,
-                      hipMemcpyHostToDevice));
+  // Use async copies for better performance
+  HIP_CHECK(hipMemcpyAsync(ext->mask_on, mask_on, sizeof(int) * batch_size, 
+                           hipMemcpyHostToDevice, h2d_stream));
+  HIP_CHECK(hipMemcpyAsync(dev_s->topk_i, token, sizeof(int) * batch_size,
+                           hipMemcpyHostToDevice, h2d_stream));
+  HIP_CHECK(hipStreamSynchronize(h2d_stream));
   getp_gather_embedding_bf16(dev_x, dev_w->token_embedding_table_bf16,
                              dev_s->topk_i, hidden_dim, batch_size, nullptr);
 
@@ -3480,9 +3487,13 @@ int *getp_forward_20b(Transformer * /*transformer*/,
     hidden_dim, p->vocab_size,
     batch_size, dev_s->topk_i, nullptr);
 
-  int *next_host = (int *)malloc(sizeof(int) * batch_size);
-  HIP_CHECK(hipMemcpy(next_host, dev_s->topk_i, sizeof(int) * batch_size,
-                      hipMemcpyDeviceToHost));
+  // Use pinned memory for faster device-to-host transfer
+  int *next_host = nullptr;
+  HIP_CHECK(hipHostMalloc(&next_host, sizeof(int) * batch_size, hipHostMallocDefault));
+  hipStream_t d2h_stream = dev_transformeres[device_index]->d2h_stream;
+  HIP_CHECK(hipMemcpyAsync(next_host, dev_s->topk_i, sizeof(int) * batch_size,
+                           hipMemcpyDeviceToHost, d2h_stream));
+  HIP_CHECK(hipStreamSynchronize(d2h_stream));
                       //HIP_CHECK(hipDeviceSynchronize());
   return next_host;
 }
