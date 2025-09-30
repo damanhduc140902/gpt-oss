@@ -72,6 +72,19 @@ union __bf16_bits_u {
   __hip_bfloat16 b;
   unsigned short u;
 };
+
+__device__ inline unsigned short bf16_to_bf16bits(__hip_bfloat16 b) {
+  __bf16_bits_u t;
+  t.b = b;
+  return t.u;
+}
+
+__device__ inline __hip_bfloat16 bf16bits_to_bf16(unsigned short u) {
+  __bf16_bits_u t;
+  t.u = u;
+  return t.b;
+}
+
 __device__ inline float bf16bits_to_f32(unsigned short u) {
   __bf16_bits_u t;
   t.u = u;
@@ -1754,10 +1767,15 @@ flash_attn_decode_even_layer_bf16_matrix_core_kernel(
 
   constexpr int MFMA_M = 4;
   constexpr int MFMA_N = 4;
-  constexpr int MFMA_K = 1;
+  constexpr int MFMA_K = 4;
   constexpr int MFMA_BLOCK = 16;
+
+  constexpr int GPRs_A = 2;
+  constexpr int GPRs_B = 2;
   constexpr int GPRs_CD = 4;
 
+  using Afloat  = __attribute__( (__vector_size__(GPRs_A  * sizeof(float)) )) unsigned short;
+  using Bfloat  = __attribute__( (__vector_size__(GPRs_B  * sizeof(float)) )) unsigned short;
   using CDfloat = __attribute__( (__vector_size__(GPRs_CD * sizeof(float)) )) float;
 
   assert(head_dim == 64);
@@ -1782,21 +1800,19 @@ flash_attn_decode_even_layer_bf16_matrix_core_kernel(
   const int Bk = 0;
   const int Bblock = (laneIdx / 4);
 
-  const int nbLoadsKV = TILE_T * HEAD_DIM / BLOCK_SIZE;
+  const int nbLoadsKV = TILE_T * (HEAD_DIM / 8) / BLOCK_SIZE;
 
   const int kv_h = blockIdx.x;
   const int b = blockIdx.y;
 
-  if (!mask_on[b]) return;
-
-  const int loadKVIdx_y = threadIdx.x / (HEAD_DIM);
-  const int loadKVIdx_x = threadIdx.x % (HEAD_DIM);
-  constexpr int strideKV = BLOCK_SIZE / (HEAD_DIM);
+  const int loadKVIdx_y = threadIdx.x / (HEAD_DIM / 8);
+  const int loadKVIdx_x = threadIdx.x % (HEAD_DIM / 8);
+  constexpr int strideKV = BLOCK_SIZE / (HEAD_DIM / 8);
 
   const int t_start = MAX(0, pos - sliding_window + 1);
   const int n_steps = pos + 1 - t_start;
 
-  __shared__ __hip_bfloat16 ks[TILE_T][HEAD_DIM];
+  __shared__ unsigned short ks[TILE_T][HEAD_DIM];
   __shared__ __hip_bfloat16 vs[TILE_T][HEAD_DIM];
 
   float out_values[MFMA_M] = {0.f};
@@ -1806,15 +1822,21 @@ flash_attn_decode_even_layer_bf16_matrix_core_kernel(
   const float *qptr =
       q + (size_t)b * n_attn_heads * head_dim;
   
-  float q_values[HEAD_DIM / MFMA_BLOCK];
-  for (int i = 0; i < HEAD_DIM / MFMA_BLOCK; ++i) {
-    q_values[i] = qptr[(Ai + MFMA_M * waveIdx + kv_h * kv_mul) * head_dim + i * MFMA_BLOCK + Ablock];
+  Afloat q_values[HEAD_DIM / (MFMA_BLOCK * MFMA_K)];
+  for (int i = 0; i < HEAD_DIM / (MFMA_BLOCK * MFMA_K); ++i) {
+    for (int j = 0; j < MFMA_K; ++j) {
+      q_values[i][j] = 
+        f32_to_bf16bits(
+          qptr[(Ai + MFMA_M * waveIdx + kv_h * kv_mul) * head_dim + 
+                  i * (MFMA_BLOCK * MFMA_K) + 
+                  Ablock * MFMA_K + j]);
+    }
   }
 
   // Load data to shared memory
   for (int i = 0; i < nbLoadsKV; ++i) {
     int offset = i * strideKV;
-    int index_x = loadKVIdx_x;
+    int index_x = 8 * loadKVIdx_x;
     int index_y = t_start + loadKVIdx_y + offset;
     if (index_y < t_start + n_steps) {
       const __hip_bfloat16 *kptr =
@@ -1823,24 +1845,58 @@ flash_attn_decode_even_layer_bf16_matrix_core_kernel(
       const __hip_bfloat16 *vptr =
           value_cache + (index_y % cache_tcap) * (size_t)batch_size * (size_t)kv_dim +
           (size_t)b * (size_t)kv_dim + (size_t)kv_h * (size_t)head_dim + index_x;
-      ks[loadKVIdx_y + offset][loadKVIdx_x] = kptr[0];
-      vs[loadKVIdx_y + offset][loadKVIdx_x] = vptr[0];
+
+      uint4 tmp_k = *reinterpret_cast<const uint4 *>(kptr);
+      uint4 tmp_v = *reinterpret_cast<const uint4 *>(vptr);
+
+      ks[loadKVIdx_y + offset][loadKVIdx_x * 8 + 0] = (unsigned short)(tmp_k.x & 0xFFFF);
+      ks[loadKVIdx_y + offset][loadKVIdx_x * 8 + 1] = (unsigned short)(tmp_k.x >> 16);
+      ks[loadKVIdx_y + offset][loadKVIdx_x * 8 + 2] = (unsigned short)(tmp_k.y & 0xFFFF);
+      ks[loadKVIdx_y + offset][loadKVIdx_x * 8 + 3] = (unsigned short)(tmp_k.y >> 16);
+      ks[loadKVIdx_y + offset][loadKVIdx_x * 8 + 4] = (unsigned short)(tmp_k.z & 0xFFFF);
+      ks[loadKVIdx_y + offset][loadKVIdx_x * 8 + 5] = (unsigned short)(tmp_k.z >> 16);
+      ks[loadKVIdx_y + offset][loadKVIdx_x * 8 + 6] = (unsigned short)(tmp_k.w & 0xFFFF);
+      ks[loadKVIdx_y + offset][loadKVIdx_x * 8 + 7] = (unsigned short)(tmp_k.w >> 16);
+
+      vs[loadKVIdx_y + offset][loadKVIdx_x * 8 + 0] = bf16bits_to_bf16((unsigned short)(tmp_v.x & 0xFFFF));
+      vs[loadKVIdx_y + offset][loadKVIdx_x * 8 + 1] = bf16bits_to_bf16((unsigned short)(tmp_v.x >> 16));
+      vs[loadKVIdx_y + offset][loadKVIdx_x * 8 + 2] = bf16bits_to_bf16((unsigned short)(tmp_v.y & 0xFFFF));
+      vs[loadKVIdx_y + offset][loadKVIdx_x * 8 + 3] = bf16bits_to_bf16((unsigned short)(tmp_v.y >> 16));
+      vs[loadKVIdx_y + offset][loadKVIdx_x * 8 + 4] = bf16bits_to_bf16((unsigned short)(tmp_v.z & 0xFFFF));
+      vs[loadKVIdx_y + offset][loadKVIdx_x * 8 + 5] = bf16bits_to_bf16((unsigned short)(tmp_v.z >> 16));
+      vs[loadKVIdx_y + offset][loadKVIdx_x * 8 + 6] = bf16bits_to_bf16((unsigned short)(tmp_v.w & 0xFFFF));
+      vs[loadKVIdx_y + offset][loadKVIdx_x * 8 + 7] = bf16bits_to_bf16((unsigned short)(tmp_v.w >> 16));
     }
     else {
-      ks[loadKVIdx_y + offset][loadKVIdx_x] = 0;
-      vs[loadKVIdx_y + offset][loadKVIdx_x] = 0;
+      ks[loadKVIdx_y + offset][loadKVIdx_x * 8 + 0] = 0;
+      ks[loadKVIdx_y + offset][loadKVIdx_x * 8 + 1] = 0;
+      ks[loadKVIdx_y + offset][loadKVIdx_x * 8 + 2] = 0;
+      ks[loadKVIdx_y + offset][loadKVIdx_x * 8 + 3] = 0;
+      ks[loadKVIdx_y + offset][loadKVIdx_x * 8 + 4] = 0;
+      ks[loadKVIdx_y + offset][loadKVIdx_x * 8 + 5] = 0;
+      ks[loadKVIdx_y + offset][loadKVIdx_x * 8 + 6] = 0;
+      ks[loadKVIdx_y + offset][loadKVIdx_x * 8 + 7] = 0;
+
+      vs[loadKVIdx_y + offset][loadKVIdx_x * 8 + 0] = 0;
+      vs[loadKVIdx_y + offset][loadKVIdx_x * 8 + 1] = 0;
+      vs[loadKVIdx_y + offset][loadKVIdx_x * 8 + 2] = 0;
+      vs[loadKVIdx_y + offset][loadKVIdx_x * 8 + 3] = 0;
+      vs[loadKVIdx_y + offset][loadKVIdx_x * 8 + 4] = 0;
+      vs[loadKVIdx_y + offset][loadKVIdx_x * 8 + 5] = 0;
+      vs[loadKVIdx_y + offset][loadKVIdx_x * 8 + 6] = 0;
+      vs[loadKVIdx_y + offset][loadKVIdx_x * 8 + 7] = 0;
     }
   }
   __syncthreads();
 
   for (int btIdx = t_start; btIdx < t_start + n_steps; btIdx += TILE_T) {
     // Prefetch
-    __hip_bfloat16 regK[nbLoadsKV];
-    __hip_bfloat16 regV[nbLoadsKV];
+    uint4 regK[nbLoadsKV];
+    uint4 regV[nbLoadsKV];
     if (btIdx + TILE_T < t_start + n_steps) {
       for (int i = 0; i < nbLoadsKV; ++i) {
         int offset = i * strideKV;
-        int index_x = loadKVIdx_x;
+        int index_x = 8 * loadKVIdx_x;
         int index_y = btIdx + TILE_T + loadKVIdx_y + offset;
         if (index_y < t_start + n_steps) {
           const __hip_bfloat16 *kptr =
@@ -1849,11 +1905,15 @@ flash_attn_decode_even_layer_bf16_matrix_core_kernel(
           const __hip_bfloat16 *vptr =
               value_cache + (index_y % cache_tcap) * (size_t)batch_size * (size_t)kv_dim +
               (size_t)b * (size_t)kv_dim + (size_t)kv_h * (size_t)head_dim + index_x;
-          regK[i] = kptr[0];
-          regV[i] = vptr[0];
+
+          uint4 tmp_k = *reinterpret_cast<const uint4 *>(kptr);
+          uint4 tmp_v = *reinterpret_cast<const uint4 *>(vptr);
+
+          regK[i] = tmp_k;
+          regV[i] = tmp_v;
         }
         else {
-          regK[i] = regV[i] = 0;
+          regK[i] = regV[i] = make_uint4(0, 0, 0, 0);
         }
       }
     }
@@ -1861,9 +1921,13 @@ flash_attn_decode_even_layer_bf16_matrix_core_kernel(
     // Computing
     for (int t = 0; t < TILE_T; t += MFMA_N) {
       CDfloat acc = {0};
-      for (int dimIdx = 0; dimIdx < HEAD_DIM; dimIdx += MFMA_BLOCK) {
-        float k_value = __bfloat162float(ks[t + Bj][dimIdx + Ablock]);
-        acc = __builtin_amdgcn_mfma_f32_4x4x1f32(q_values[dimIdx / MFMA_BLOCK], k_value, acc, 0, 0, 0);
+      for (int dimIdx = 0; dimIdx < HEAD_DIM; dimIdx += MFMA_BLOCK * MFMA_K) {
+        // float k_value = __bfloat162float(ks[t + Bj][dimIdx + Ablock]);
+        Bfloat k_value;
+        for (int i = 0; i < MFMA_K; ++i) {
+          k_value[i] = ks[t + Bj][dimIdx + Ablock * MFMA_K + i];
+        }
+        acc = __builtin_amdgcn_mfma_f32_4x4x4bf16_1k(q_values[dimIdx / (MFMA_BLOCK * MFMA_K)], k_value, acc, 0, 0, 0);
       }
 
       for (int width = warpSize / 2; width >= MFMA_N; width /= 2) {
@@ -1893,10 +1957,29 @@ flash_attn_decode_even_layer_bf16_matrix_core_kernel(
     if (btIdx + TILE_T < t_start + n_steps) {
       for (int i = 0; i < nbLoadsKV; ++i) {
         int offset = i * strideKV;
-        int index_x = loadKVIdx_x;
+        int index_x = 8 * loadKVIdx_x;
         int index_y = btIdx + TILE_T + loadKVIdx_y + offset;
-        ks[loadKVIdx_y + offset][loadKVIdx_x] = regK[i];
-        vs[loadKVIdx_y + offset][loadKVIdx_x] = regV[i];
+
+        uint4 tmp_k = regK[i];
+        uint4 tmp_v = regV[i];
+
+        ks[loadKVIdx_y + offset][loadKVIdx_x * 8 + 0] = (unsigned short)(tmp_k.x & 0xFFFF);
+        ks[loadKVIdx_y + offset][loadKVIdx_x * 8 + 1] = (unsigned short)(tmp_k.x >> 16);
+        ks[loadKVIdx_y + offset][loadKVIdx_x * 8 + 2] = (unsigned short)(tmp_k.y & 0xFFFF);
+        ks[loadKVIdx_y + offset][loadKVIdx_x * 8 + 3] = (unsigned short)(tmp_k.y >> 16);
+        ks[loadKVIdx_y + offset][loadKVIdx_x * 8 + 4] = (unsigned short)(tmp_k.z & 0xFFFF);
+        ks[loadKVIdx_y + offset][loadKVIdx_x * 8 + 5] = (unsigned short)(tmp_k.z >> 16);
+        ks[loadKVIdx_y + offset][loadKVIdx_x * 8 + 6] = (unsigned short)(tmp_k.w & 0xFFFF);
+        ks[loadKVIdx_y + offset][loadKVIdx_x * 8 + 7] = (unsigned short)(tmp_k.w >> 16);
+
+        vs[loadKVIdx_y + offset][loadKVIdx_x * 8 + 0] = bf16bits_to_bf16((unsigned short)(tmp_v.x & 0xFFFF));
+        vs[loadKVIdx_y + offset][loadKVIdx_x * 8 + 1] = bf16bits_to_bf16((unsigned short)(tmp_v.x >> 16));
+        vs[loadKVIdx_y + offset][loadKVIdx_x * 8 + 2] = bf16bits_to_bf16((unsigned short)(tmp_v.y & 0xFFFF));
+        vs[loadKVIdx_y + offset][loadKVIdx_x * 8 + 3] = bf16bits_to_bf16((unsigned short)(tmp_v.y >> 16));
+        vs[loadKVIdx_y + offset][loadKVIdx_x * 8 + 4] = bf16bits_to_bf16((unsigned short)(tmp_v.z & 0xFFFF));
+        vs[loadKVIdx_y + offset][loadKVIdx_x * 8 + 5] = bf16bits_to_bf16((unsigned short)(tmp_v.z >> 16));
+        vs[loadKVIdx_y + offset][loadKVIdx_x * 8 + 6] = bf16bits_to_bf16((unsigned short)(tmp_v.w & 0xFFFF));
+        vs[loadKVIdx_y + offset][loadKVIdx_x * 8 + 7] = bf16bits_to_bf16((unsigned short)(tmp_v.w >> 16));
       }
     }
     __syncthreads();
@@ -1937,10 +2020,15 @@ flash_attn_decode_odd_layer_bf16_matrix_core_kernel(
 
   constexpr int MFMA_M = 4;
   constexpr int MFMA_N = 4;
-  constexpr int MFMA_K = 1;
+  constexpr int MFMA_K = 4;
   constexpr int MFMA_BLOCK = 16;
+
+  constexpr int GPRs_A = 2;
+  constexpr int GPRs_B = 2;
   constexpr int GPRs_CD = 4;
 
+  using Afloat  = __attribute__( (__vector_size__(GPRs_A  * sizeof(float)) )) unsigned short;
+  using Bfloat  = __attribute__( (__vector_size__(GPRs_B  * sizeof(float)) )) unsigned short;
   using CDfloat = __attribute__( (__vector_size__(GPRs_CD * sizeof(float)) )) float;
 
   assert(head_dim == 64);
@@ -1965,21 +2053,19 @@ flash_attn_decode_odd_layer_bf16_matrix_core_kernel(
   const int Bk = 0;
   const int Bblock = (laneIdx / 4);
 
-  const int nbLoadsKV = TILE_T * HEAD_DIM / BLOCK_SIZE;
+  const int nbLoadsKV = TILE_T * (HEAD_DIM / 8) / BLOCK_SIZE;
 
   const int kv_h = blockIdx.x;
   const int b = blockIdx.y;
 
-  if (!mask_on[b]) return;
-  
-  const int loadKVIdx_y = threadIdx.x / (HEAD_DIM);
-  const int loadKVIdx_x = threadIdx.x % (HEAD_DIM);
-  constexpr int strideKV = BLOCK_SIZE / (HEAD_DIM);
+  const int loadKVIdx_y = threadIdx.x / (HEAD_DIM / 8);
+  const int loadKVIdx_x = threadIdx.x % (HEAD_DIM / 8);
+  constexpr int strideKV = BLOCK_SIZE / (HEAD_DIM / 8);
 
   const int t_start = MAX(0, pos + 1 - cache_tcap);
   const int n_steps = pos + 1 - t_start;
 
-  __shared__ __hip_bfloat16 ks[TILE_T][HEAD_DIM];
+  __shared__ unsigned short ks[TILE_T][HEAD_DIM];
   __shared__ __hip_bfloat16 vs[TILE_T][HEAD_DIM];
 
   float out_values[MFMA_M] = {0.f};
@@ -1989,15 +2075,21 @@ flash_attn_decode_odd_layer_bf16_matrix_core_kernel(
   const float *qptr =
       q + (size_t)b * n_attn_heads * head_dim;
   
-  float q_values[HEAD_DIM / MFMA_BLOCK];
-  for (int i = 0; i < HEAD_DIM / MFMA_BLOCK; ++i) {
-    q_values[i] = qptr[(Ai + MFMA_M * waveIdx + kv_h * kv_mul) * head_dim + i * MFMA_BLOCK + Ablock];
+  Afloat q_values[HEAD_DIM / (MFMA_BLOCK * MFMA_K)];
+  for (int i = 0; i < HEAD_DIM / (MFMA_BLOCK * MFMA_K); ++i) {
+    for (int j = 0; j < MFMA_K; ++j) {
+      q_values[i][j] = 
+        f32_to_bf16bits(
+          qptr[(Ai + MFMA_M * waveIdx + kv_h * kv_mul) * head_dim + 
+                  i * (MFMA_BLOCK * MFMA_K) + 
+                  Ablock * MFMA_K + j]);
+    }
   }
 
   // Load data to shared memory
   for (int i = 0; i < nbLoadsKV; ++i) {
     int offset = i * strideKV;
-    int index_x = loadKVIdx_x;
+    int index_x = 8 * loadKVIdx_x;
     int index_y = t_start + loadKVIdx_y + offset;
     if (index_y < t_start + n_steps) {
       const __hip_bfloat16 *kptr =
@@ -2006,24 +2098,58 @@ flash_attn_decode_odd_layer_bf16_matrix_core_kernel(
       const __hip_bfloat16 *vptr =
           value_cache + (index_y % cache_tcap) * (size_t)batch_size * (size_t)kv_dim +
           (size_t)b * (size_t)kv_dim + (size_t)kv_h * (size_t)head_dim + index_x;
-      ks[loadKVIdx_y + offset][loadKVIdx_x] = kptr[0];
-      vs[loadKVIdx_y + offset][loadKVIdx_x] = vptr[0];
+
+      uint4 tmp_k = *reinterpret_cast<const uint4 *>(kptr);
+      uint4 tmp_v = *reinterpret_cast<const uint4 *>(vptr);
+
+      ks[loadKVIdx_y + offset][loadKVIdx_x * 8 + 0] = (unsigned short)(tmp_k.x & 0xFFFF);
+      ks[loadKVIdx_y + offset][loadKVIdx_x * 8 + 1] = (unsigned short)(tmp_k.x >> 16);
+      ks[loadKVIdx_y + offset][loadKVIdx_x * 8 + 2] = (unsigned short)(tmp_k.y & 0xFFFF);
+      ks[loadKVIdx_y + offset][loadKVIdx_x * 8 + 3] = (unsigned short)(tmp_k.y >> 16);
+      ks[loadKVIdx_y + offset][loadKVIdx_x * 8 + 4] = (unsigned short)(tmp_k.z & 0xFFFF);
+      ks[loadKVIdx_y + offset][loadKVIdx_x * 8 + 5] = (unsigned short)(tmp_k.z >> 16);
+      ks[loadKVIdx_y + offset][loadKVIdx_x * 8 + 6] = (unsigned short)(tmp_k.w & 0xFFFF);
+      ks[loadKVIdx_y + offset][loadKVIdx_x * 8 + 7] = (unsigned short)(tmp_k.w >> 16);
+
+      vs[loadKVIdx_y + offset][loadKVIdx_x * 8 + 0] = bf16bits_to_bf16((unsigned short)(tmp_v.x & 0xFFFF));
+      vs[loadKVIdx_y + offset][loadKVIdx_x * 8 + 1] = bf16bits_to_bf16((unsigned short)(tmp_v.x >> 16));
+      vs[loadKVIdx_y + offset][loadKVIdx_x * 8 + 2] = bf16bits_to_bf16((unsigned short)(tmp_v.y & 0xFFFF));
+      vs[loadKVIdx_y + offset][loadKVIdx_x * 8 + 3] = bf16bits_to_bf16((unsigned short)(tmp_v.y >> 16));
+      vs[loadKVIdx_y + offset][loadKVIdx_x * 8 + 4] = bf16bits_to_bf16((unsigned short)(tmp_v.z & 0xFFFF));
+      vs[loadKVIdx_y + offset][loadKVIdx_x * 8 + 5] = bf16bits_to_bf16((unsigned short)(tmp_v.z >> 16));
+      vs[loadKVIdx_y + offset][loadKVIdx_x * 8 + 6] = bf16bits_to_bf16((unsigned short)(tmp_v.w & 0xFFFF));
+      vs[loadKVIdx_y + offset][loadKVIdx_x * 8 + 7] = bf16bits_to_bf16((unsigned short)(tmp_v.w >> 16));
     }
     else {
-      ks[loadKVIdx_y + offset][loadKVIdx_x] = 0;
-      vs[loadKVIdx_y + offset][loadKVIdx_x] = 0;
+      ks[loadKVIdx_y + offset][loadKVIdx_x * 8 + 0] = 0;
+      ks[loadKVIdx_y + offset][loadKVIdx_x * 8 + 1] = 0;
+      ks[loadKVIdx_y + offset][loadKVIdx_x * 8 + 2] = 0;
+      ks[loadKVIdx_y + offset][loadKVIdx_x * 8 + 3] = 0;
+      ks[loadKVIdx_y + offset][loadKVIdx_x * 8 + 4] = 0;
+      ks[loadKVIdx_y + offset][loadKVIdx_x * 8 + 5] = 0;
+      ks[loadKVIdx_y + offset][loadKVIdx_x * 8 + 6] = 0;
+      ks[loadKVIdx_y + offset][loadKVIdx_x * 8 + 7] = 0;
+
+      vs[loadKVIdx_y + offset][loadKVIdx_x * 8 + 0] = 0;
+      vs[loadKVIdx_y + offset][loadKVIdx_x * 8 + 1] = 0;
+      vs[loadKVIdx_y + offset][loadKVIdx_x * 8 + 2] = 0;
+      vs[loadKVIdx_y + offset][loadKVIdx_x * 8 + 3] = 0;
+      vs[loadKVIdx_y + offset][loadKVIdx_x * 8 + 4] = 0;
+      vs[loadKVIdx_y + offset][loadKVIdx_x * 8 + 5] = 0;
+      vs[loadKVIdx_y + offset][loadKVIdx_x * 8 + 6] = 0;
+      vs[loadKVIdx_y + offset][loadKVIdx_x * 8 + 7] = 0;
     }
   }
   __syncthreads();
 
   for (int btIdx = t_start; btIdx < t_start + n_steps; btIdx += TILE_T) {
     // Prefetch
-    __hip_bfloat16 regK[nbLoadsKV];
-    __hip_bfloat16 regV[nbLoadsKV];
+    uint4 regK[nbLoadsKV];
+    uint4 regV[nbLoadsKV];
     if (btIdx + TILE_T < t_start + n_steps) {
       for (int i = 0; i < nbLoadsKV; ++i) {
         int offset = i * strideKV;
-        int index_x = loadKVIdx_x;
+        int index_x = 8 * loadKVIdx_x;
         int index_y = btIdx + TILE_T + loadKVIdx_y + offset;
         if (index_y < t_start + n_steps) {
           const __hip_bfloat16 *kptr =
@@ -2032,10 +2158,15 @@ flash_attn_decode_odd_layer_bf16_matrix_core_kernel(
           const __hip_bfloat16 *vptr =
               value_cache + (index_y % cache_tcap) * (size_t)batch_size * (size_t)kv_dim +
               (size_t)b * (size_t)kv_dim + (size_t)kv_h * (size_t)head_dim + index_x;
-          regK[i] = kptr[0];
-          regV[i] = vptr[0];
-        } else {
-          regK[i] = regV[i] = 0;
+
+          uint4 tmp_k = *reinterpret_cast<const uint4 *>(kptr);
+          uint4 tmp_v = *reinterpret_cast<const uint4 *>(vptr);
+
+          regK[i] = tmp_k;
+          regV[i] = tmp_v;
+        }
+        else {
+          regK[i] = regV[i] = make_uint4(0, 0, 0, 0);
         }
       }
     }
@@ -2043,9 +2174,13 @@ flash_attn_decode_odd_layer_bf16_matrix_core_kernel(
     // Computing
     for (int t = 0; t < TILE_T; t += MFMA_N) {
       CDfloat acc = {0};
-      for (int dimIdx = 0; dimIdx < HEAD_DIM; dimIdx += MFMA_BLOCK) {
-        float k_value = __bfloat162float(ks[t + Bj][dimIdx + Ablock]);
-        acc = __builtin_amdgcn_mfma_f32_4x4x1f32(q_values[dimIdx / MFMA_BLOCK], k_value, acc, 0, 0, 0);
+      for (int dimIdx = 0; dimIdx < HEAD_DIM; dimIdx += MFMA_BLOCK * MFMA_K) {
+        // float k_value = __bfloat162float(ks[t + Bj][dimIdx + Ablock]);
+        Bfloat k_value;
+        for (int i = 0; i < MFMA_K; ++i) {
+          k_value[i] = ks[t + Bj][dimIdx + Ablock * MFMA_K + i];
+        }
+        acc = __builtin_amdgcn_mfma_f32_4x4x4bf16_1k(q_values[dimIdx / (MFMA_BLOCK * MFMA_K)], k_value, acc, 0, 0, 0);
       }
 
       for (int width = warpSize / 2; width >= MFMA_N; width /= 2) {
@@ -2075,10 +2210,29 @@ flash_attn_decode_odd_layer_bf16_matrix_core_kernel(
     if (btIdx + TILE_T < t_start + n_steps) {
       for (int i = 0; i < nbLoadsKV; ++i) {
         int offset = i * strideKV;
-        int index_x = loadKVIdx_x;
+        int index_x = 8 * loadKVIdx_x;
         int index_y = btIdx + TILE_T + loadKVIdx_y + offset;
-        ks[loadKVIdx_y + offset][loadKVIdx_x] = regK[i];
-        vs[loadKVIdx_y + offset][loadKVIdx_x] = regV[i];
+
+        uint4 tmp_k = regK[i];
+        uint4 tmp_v = regV[i];
+
+        ks[loadKVIdx_y + offset][loadKVIdx_x * 8 + 0] = (unsigned short)(tmp_k.x & 0xFFFF);
+        ks[loadKVIdx_y + offset][loadKVIdx_x * 8 + 1] = (unsigned short)(tmp_k.x >> 16);
+        ks[loadKVIdx_y + offset][loadKVIdx_x * 8 + 2] = (unsigned short)(tmp_k.y & 0xFFFF);
+        ks[loadKVIdx_y + offset][loadKVIdx_x * 8 + 3] = (unsigned short)(tmp_k.y >> 16);
+        ks[loadKVIdx_y + offset][loadKVIdx_x * 8 + 4] = (unsigned short)(tmp_k.z & 0xFFFF);
+        ks[loadKVIdx_y + offset][loadKVIdx_x * 8 + 5] = (unsigned short)(tmp_k.z >> 16);
+        ks[loadKVIdx_y + offset][loadKVIdx_x * 8 + 6] = (unsigned short)(tmp_k.w & 0xFFFF);
+        ks[loadKVIdx_y + offset][loadKVIdx_x * 8 + 7] = (unsigned short)(tmp_k.w >> 16);
+
+        vs[loadKVIdx_y + offset][loadKVIdx_x * 8 + 0] = bf16bits_to_bf16((unsigned short)(tmp_v.x & 0xFFFF));
+        vs[loadKVIdx_y + offset][loadKVIdx_x * 8 + 1] = bf16bits_to_bf16((unsigned short)(tmp_v.x >> 16));
+        vs[loadKVIdx_y + offset][loadKVIdx_x * 8 + 2] = bf16bits_to_bf16((unsigned short)(tmp_v.y & 0xFFFF));
+        vs[loadKVIdx_y + offset][loadKVIdx_x * 8 + 3] = bf16bits_to_bf16((unsigned short)(tmp_v.y >> 16));
+        vs[loadKVIdx_y + offset][loadKVIdx_x * 8 + 4] = bf16bits_to_bf16((unsigned short)(tmp_v.z & 0xFFFF));
+        vs[loadKVIdx_y + offset][loadKVIdx_x * 8 + 5] = bf16bits_to_bf16((unsigned short)(tmp_v.z >> 16));
+        vs[loadKVIdx_y + offset][loadKVIdx_x * 8 + 6] = bf16bits_to_bf16((unsigned short)(tmp_v.w & 0xFFFF));
+        vs[loadKVIdx_y + offset][loadKVIdx_x * 8 + 7] = bf16bits_to_bf16((unsigned short)(tmp_v.w >> 16));
       }
     }
     __syncthreads();
