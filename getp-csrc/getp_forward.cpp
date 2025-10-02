@@ -3165,7 +3165,7 @@ int *getp_forward_120b(Transformer * /*transformer*/,
 
   const int even_layers = (p->n_layers + 1) / 2;
   const int even_tcap = (p->sliding_window > 0 ? p->sliding_window : 1);
-  int odd_tcap = p->seq_len / 4;
+  int odd_tcap = p->seq_len / 2;
   if (odd_tcap < 1) odd_tcap = 1;
   const size_t even_stride = (size_t)even_tcap;
   const size_t odd_stride = (size_t)odd_tcap;
@@ -3469,7 +3469,7 @@ int *getp_forward_20b(Transformer * /*transformer*/,
 
   const int even_layers = (p->n_layers + 1) / 2;
   const int even_tcap = (p->sliding_window > 0 ? p->sliding_window : 1);
-  int odd_tcap = p->seq_len / 4;
+  int odd_tcap = p->seq_len / 2;
   if (odd_tcap < 1) odd_tcap = 1;
   const size_t even_stride = (size_t)even_tcap;
   const size_t odd_stride = (size_t)odd_tcap;

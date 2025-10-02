@@ -227,7 +227,7 @@ void init_device_run_state(RunState *s, Config *p) {
 
   const int even_layers = (p->n_layers + 1) / 2;
   const int even_tcap = (p->sliding_window > 0 ? p->sliding_window : 1);
-  int odd_tcap = p->seq_len / 4;
+  int odd_tcap = p->seq_len / 2;
   if (odd_tcap < 1) odd_tcap = 1;
   const size_t total_t = (size_t)even_layers * (size_t)even_tcap +
                          (size_t)(p->n_layers - even_layers) * (size_t)odd_tcap;

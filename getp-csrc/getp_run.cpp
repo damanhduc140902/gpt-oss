@@ -48,12 +48,12 @@ void warm_up(Transformer *transformer, Tokenizer *tokenizer) {
   if (p->n_experts == 128) {
     // 120b model
     EXPERT_PARALLELISM = n_devices;
-    BATCH_SIZE = 1280;
+    BATCH_SIZE = 512;
   }
   else {
     // 20b model
     EXPERT_PARALLELISM = 1;
-    BATCH_SIZE = 1536;
+    BATCH_SIZE = 896;
   }
 
   if (n_devices % EXPERT_PARALLELISM) {
