@@ -52,8 +52,9 @@ void warm_up(Transformer *transformer, Tokenizer *tokenizer) {
   }
   else {
     // 20b model
-    EXPERT_PARALLELISM = 1;
-    BATCH_SIZE = 896;
+    EXPERT_PARALLELISM = 2;
+    BATCH_SIZE = 1536;
+    // BATCH_SIZE = 256;
   }
 
   if (n_devices % EXPERT_PARALLELISM) {
@@ -124,22 +125,39 @@ int is_all_zero(int *a, int size) {
 }
 
 namespace Model_20b {
-  long long simple_getp_generate(Transformer *transformer, Tokenizer *tokenizer,
-                                 Sampler *sampler, GPUWorker *worker,
-                                 const char *inputs_seq[], int *outputs_tokens[],
-                                 int steps, int B) {
+  void coop_getp_generate(Transformer *transformer, Tokenizer *tokenizer,
+                          Sampler * /* sampler */, GPUWorker *workers, 
+                          const char *inputs_seq[], int *outputs_tokens[], 
+                          long long *num_token_out_ptr, 
+                          Barrier &sync_point, int *thread_states,
+                          int base_thread_idx, int thread_idx_offset, int steps
+  ) {
     PROFILE_FUNCTION();
-
+    // <|start|>: 200006
+    // <|end|>: 200007
+    // <|return|>: 200002
+    // <|message|>: 200008
+    // <|channel|>: 200005
+    // <|constrain|>: 200003
+    // <|endoftext|>: 199999
+  
+    // Inference here
+  
+    cpu_set_t cpuset;
+    CPU_ZERO(&cpuset);
+    CPU_SET(base_thread_idx + thread_idx_offset, &cpuset);
+    sched_setaffinity(0, sizeof(cpu_set_t), &cpuset);
+  
     const char *empty_prompt = "";
-    for (int b = 0; b < B; ++b)
-      if (inputs_seq[b] == NULL) inputs_seq[b] = empty_prompt;
-
-    std::vector<int> nums_prompt_tokens(B, 0);
-    std::vector<int *> prompts_tokens(B);
+    for (int b = 0; b < BATCH_SIZE; ++b) if (inputs_seq[b] == NULL) inputs_seq[b] = empty_prompt;
+  
+    std::vector<int> nums_prompt_tokens(BATCH_SIZE, 0);
+    std::vector<int*> prompts_tokens(BATCH_SIZE);
+    
     // Pre-calculate total size needed and allocate in one pinned memory block
     size_t total_token_size = 0;
-    std::vector<size_t> token_sizes(B);
-    for (int b = 0; b < B; ++b) {
+    std::vector<size_t> token_sizes(BATCH_SIZE);
+    for (int b = 0; b < BATCH_SIZE; ++b) {
       size_t size = (strlen(inputs_seq[b]) + 3) * sizeof(int);
       token_sizes[b] = size;
       total_token_size += size;
@@ -151,35 +169,36 @@ namespace Model_20b {
     
     // Assign pointers to each prompt
     size_t offset = 0;
-    for (int b = 0; b < B; ++b) {
+    for (int b = 0; b < BATCH_SIZE; ++b) {
       prompts_tokens[b] = pinned_tokens + offset / sizeof(int);
       offset += token_sizes[b];
     }
-    for (int b = 0; b < B; ++b) {
-      encode(tokenizer, inputs_seq[b], -1, -1, prompts_tokens[b],
-            &nums_prompt_tokens[b], transformer->config.initial_context_length);
-      if (nums_prompt_tokens[b] < 1) {
-        fprintf(stderr, "bad prompt\n");
-        exit(EXIT_FAILURE);
-      }
+    for (int b = 0; b < BATCH_SIZE; ++b) {
+      encode(tokenizer, inputs_seq[b], -1, -1, prompts_tokens[b], &nums_prompt_tokens[b],
+             transformer->config.initial_context_length);
+      if (nums_prompt_tokens[b] < 1) { fprintf(stderr, "bad prompt\n"); exit(EXIT_FAILURE); }
     }
-
-    std::vector<int> next(B), token(B), epos(B, -1), mask(B, 1);
+  
+    std::vector<int> next(BATCH_SIZE), token(BATCH_SIZE), epos(BATCH_SIZE, -1), mask(BATCH_SIZE, 1);
     int pos = 0;
-    for (int b = 0; b < B; ++b) token[b] = prompts_tokens[b][0];
-
+    for (int b = 0; b < BATCH_SIZE; ++b) token[b] = prompts_tokens[b][0];
+  
     Config *p = &transformer->config;
     if (!p) {
       fprintf(stderr, "Config missing\n");
       exit(EXIT_FAILURE);
     }
-
+  
     while (pos + 1 < steps) {
-      int *next_gpu = getp_forward_20b(transformer, dev_transformers, worker,
-                                       token.data(), pos, mask.data(), B);
-
+  
+      // forward the transformer to get logits for the next token
+      int *next_gpu = getp_forward_120b(
+        transformer, dev_transformers, workers, 
+        sync_point, thread_idx_offset, 
+        token.data(), pos, mask.data());
+  
       pos++;
-      for (int b = 0; b < B; ++b) {
+      for (int b = 0; b < BATCH_SIZE; ++b) {
         if (!mask[b]) continue;
         epos[b] = pos;
         if (pos < nums_prompt_tokens[b])
@@ -189,64 +208,108 @@ namespace Model_20b {
           outputs_tokens[b][pos - nums_prompt_tokens[b]] = next[b];
         }
       }
-
-      for (int b = 0; b < B; ++b) {
+  
+      for (int b = 0; b < BATCH_SIZE; ++b) {
         if (!mask[b]) continue;
         if (next[b] == 199999 || next[b] == 200002) mask[b] = 0;
       }
-      if (is_all_zero(mask.data(), B)) {
+      if (thread_states[thread_idx_offset] && is_all_zero(mask.data(), BATCH_SIZE)) {
+        thread_states[thread_idx_offset] = 0;
+      }
+      sync_point.wait();
+      if (is_all_zero(thread_states, EXPERT_PARALLELISM)) {
         HIP_CHECK(hipHostFree(next_gpu));
         break;
       }
-
-      for (int b = 0; b < B; ++b) token[b] = next[b];
+  
+      // print the token as string, decode it with the Tokenizer object
+      // should be removed
+      // const char *piece = decode_piece(tokenizer, token, next);
+      // safe_printf(piece); // same as printf("%s", piece), but skips "unsafe" bytes
+      // fflush(stdout);
+  
+      for (int b = 0; b < BATCH_SIZE; ++b) token[b] = next[b];
       HIP_CHECK(hipHostFree(next_gpu));
     }
-
-    for (int b = 0; b < B; ++b) {
-      if (epos[b] == -1) {
-        fprintf(stderr, "bad epos\n");
-        exit(EXIT_FAILURE);
-      }
+  
+    for (int b = 0; b < BATCH_SIZE; ++b) {
+      if (epos[b] == -1) { fprintf(stderr, "bad epos\n"); exit(EXIT_FAILURE); }
       outputs_tokens[b][epos[b] - nums_prompt_tokens[b] + 1] = -1;
     }
     // Free the single pinned memory block
     HIP_CHECK(hipHostFree(pinned_tokens));
-    HIP_CHECK(hipDeviceSynchronize());
-
+    // HIP_CHECK(hipDeviceSynchronize());
+  
     long long acc = 0;
-    for (int b = 0; b < B; ++b) acc += epos[b] - nums_prompt_tokens[b] + 1;
-    return acc;
-  }
-
-  void single_thread_generate(Transformer *transformer, Tokenizer *tokenizer,
-                              Sampler *sampler, Requests *requests,
-                              GPUWorker *worker, long long *num_token_out_ptr,
-                              int thread_idx) {
-    Sampler *local_sampler = reinterpret_cast<Sampler *>(malloc(sizeof(Sampler)));
-    build_sampler(local_sampler, sampler->vocab_size, sampler->temperature,
-                  sampler->topp, sampler->rng_state + thread_idx);
-
-    long long num_token_out = 0;
-    // const char *inputs_seq[BATCH_SIZE];
-    // int *outputs_tokens[BATCH_SIZE];
-    std::vector<const char*> inputs_seq(BATCH_SIZE);
-    std::vector<int*> outputs_tokens(BATCH_SIZE);
-
-    int idx0 = worker->request_start;
-    int requests_per_thread = worker->request_end - worker->request_start;
-
-    for (int idx = 0; idx < requests_per_thread; idx += BATCH_SIZE) {
-      int B = std::min(BATCH_SIZE, requests_per_thread - idx);
-      for (int b = 0; b < B; ++b) {
-        inputs_seq[b] = get_str_req_ptr(requests, idx0 + idx + b);
-        outputs_tokens[b] = get_tok_gen_ptr(requests, idx0 + idx + b);
-      }
-      num_token_out += simple_getp_generate(transformer, tokenizer, local_sampler,
-                                            worker, inputs_seq.data(), outputs_tokens.data(),
-                                            requests->max_seq_len, B);
+    for (int b = 0; b < BATCH_SIZE; ++b) {
+      acc += epos[b] - nums_prompt_tokens[b] + 1;
     }
-    *num_token_out_ptr = num_token_out;
+  
+    *num_token_out_ptr = acc;
+  }
+  
+  void distribute_requests(Transformer *transformer, 
+                           Tokenizer *tokenizer, 
+                           Sampler *sampler, 
+                           Requests *requests,
+                           GPUWorker *workers,
+                           long long *num_token_out_ptr,
+                           int n_devices,
+                           int n_parallel_models
+  ) {
+    std::vector<std::vector<const char *>> inputs_seq(n_parallel_models, std::vector<const char *>(EXPERT_PARALLELISM * BATCH_SIZE));
+    std::vector<std::vector<int *>> outputs_tokens(n_parallel_models, std::vector<int *>(EXPERT_PARALLELISM * BATCH_SIZE));
+    std::vector<std::vector<long long>> nums_token_out(n_parallel_models, std::vector<long long>(EXPERT_PARALLELISM));
+  
+    long long acc_token_out = 0;
+  
+    GPUWorker *main_worker = workers;
+    int requests_per_model = main_worker->request_end - main_worker->request_start;
+
+    assert(n_parallel_models * requests_per_model == requests->num_reqs);
+    assert(requests_per_model == EXPERT_PARALLELISM * BATCH_SIZE);
+
+    std::vector<std::vector<int>> thread_states(n_parallel_models, std::vector<int>(EXPERT_PARALLELISM, 1));
+    std::vector<std::thread> threads(n_parallel_models * EXPERT_PARALLELISM);
+    std::vector<Barrier *> sync_points;
+    // sync_points.reserve(n_parallel_models);
+    for (int i = 0; i < n_parallel_models; ++i) {
+      sync_points.push_back(new Barrier(EXPERT_PARALLELISM));
+    }
+
+    for (int model_idx = 0; model_idx < n_parallel_models; ++model_idx) {
+      int idx0 = model_idx * requests_per_model;
+      for (int b = 0; b < EXPERT_PARALLELISM * BATCH_SIZE; ++b) {
+        inputs_seq[model_idx][b] = get_str_req_ptr(requests, idx0 + b);
+        outputs_tokens[model_idx][b] = get_tok_gen_ptr(requests, idx0 + b);
+      }
+    }
+
+    for (int model_idx = 0; model_idx < n_parallel_models; ++model_idx) {
+      for (int i = 0; i < EXPERT_PARALLELISM; ++i) {
+        threads[model_idx * EXPERT_PARALLELISM + i] = std::thread(coop_getp_generate,
+          transformer, tokenizer, (Sampler *)NULL, workers + EXPERT_PARALLELISM * model_idx, 
+          inputs_seq[model_idx].data() + (size_t)i * BATCH_SIZE, outputs_tokens[model_idx].data() + (size_t)i * BATCH_SIZE, 
+          &nums_token_out[model_idx][i],
+          std::ref(*sync_points[model_idx]), thread_states[model_idx].data(),
+          EXPERT_PARALLELISM * model_idx, i, requests->max_seq_len
+        );
+      }
+    }
+
+    for (int model_idx = 0; model_idx < n_parallel_models; ++model_idx) {
+      for (int i = 0; i < EXPERT_PARALLELISM; ++i) {
+        threads[model_idx * EXPERT_PARALLELISM + i].join();
+      }
+    }
+
+    for (int model_idx = 0; model_idx < n_parallel_models; ++model_idx) {
+      for (int i = 0; i < EXPERT_PARALLELISM; ++i) {
+        acc_token_out += nums_token_out[model_idx][i];
+      }
+    }
+  
+    *num_token_out_ptr = acc_token_out;
   }
 }
 
@@ -399,8 +462,8 @@ namespace Model_120b {
   
     GPUWorker *main_worker = workers;
     int idx0 = main_worker->request_start;
-    int requests_per_thread = main_worker->request_end - main_worker->request_start;
-    for (int idx = 0; idx < requests_per_thread; idx += EXPERT_PARALLELISM * BATCH_SIZE) {
+    int requests_per_model = main_worker->request_end - main_worker->request_start;
+    for (int idx = 0; idx < requests_per_model; idx += EXPERT_PARALLELISM * BATCH_SIZE) {
       for (int b = 0; b < EXPERT_PARALLELISM * BATCH_SIZE; ++b) {
         inputs_seq[b] = get_str_req_ptr(requests, idx0 + idx + b);
         outputs_tokens[b] = get_tok_gen_ptr(requests, idx0 + idx + b);
@@ -465,22 +528,7 @@ long long inference(Transformer *transformer, Tokenizer *tokenizer,
   }
   else {
     // Model 20b
-    num_token_out = 0;
-    std::vector<long long> nums_token_out(n_devices);
-    std::vector<std::thread> threads(n_devices);
-    for (int i = 0; i < n_devices; ++i) {
-      threads[i] =
-          std::thread(Model_20b::single_thread_generate, transformer, tokenizer, sampler,
-                      requests, &workers[i], &nums_token_out[i], i);
-    }
-
-    for (int i = 0; i < n_devices; ++i) {
-      threads[i].join();
-    }
-
-    for (int i = 0; i < n_devices; ++i) {
-      num_token_out += nums_token_out[i];
-    }
+    Model_20b::distribute_requests(transformer, tokenizer, sampler, requests, workers, &num_token_out, n_devices, n_parallel_models);
   }
   
   // Ensure all GPU work is completed before printing timing
