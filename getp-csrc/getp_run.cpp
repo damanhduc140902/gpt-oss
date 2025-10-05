@@ -51,8 +51,8 @@ void warm_up(Transformer *transformer, Tokenizer *tokenizer) {
   }
   else {
     // 20b model
-    EXPERT_PARALLELISM = 1;
-    BATCH_SIZE = 896;
+    EXPERT_PARALLELISM = 2;
+    BATCH_SIZE = 1536;
     // BATCH_SIZE = 256;
   }
 
@@ -191,12 +191,10 @@ namespace Model_20b {
     while (pos + 1 < steps) {
   
       // forward the transformer to get logits for the next token
-      // int *next_gpu = getp_forward_120b(
-      //   transformer, dev_transformers, workers, 
-      //   sync_point, thread_idx_offset, 
-      //   token.data(), pos, mask.data());
-      int *next_gpu = getp_forward_20b(transformer, dev_transformers, workers,
-        token.data(), pos, mask.data(), BATCH_SIZE);
+      int *next_gpu = getp_forward_120b(
+        transformer, dev_transformers, workers, 
+        sync_point, thread_idx_offset, 
+        token.data(), pos, mask.data());
   
       pos++;
       for (int b = 0; b < BATCH_SIZE; ++b) {
