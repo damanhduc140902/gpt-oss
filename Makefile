@@ -6,7 +6,7 @@ ifneq ($(CC),g++)
 CFLAGS += --offload-arch=gfx90a
 endif
 
-CPP_FILES = run.cpp tokenizer.cpp getp-csrc/profiler.cpp
+CPP_FILES = run.cpp tokenizer.cpp
 
 # Basic build that should work on most systems.
 .PHONY: run

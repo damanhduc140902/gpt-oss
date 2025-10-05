@@ -9,7 +9,6 @@
 #include "getp_transformer.cpp"
 #include "getp_transformer.hpp"
 #include "getp_barrier.hpp"
-#include "profiler.hpp"
 #include <cstddef>
 #include <cstdio>
 #include <cstdlib>
@@ -48,12 +47,12 @@ void warm_up(Transformer *transformer, Tokenizer *tokenizer) {
   if (p->n_experts == 128) {
     // 120b model
     EXPERT_PARALLELISM = n_devices;
-    BATCH_SIZE = 512;
+    BATCH_SIZE = 768;
   }
   else {
     // 20b model
-    EXPERT_PARALLELISM = 2;
-    BATCH_SIZE = 1536;
+    EXPERT_PARALLELISM = 1;
+    BATCH_SIZE = 896;
     // BATCH_SIZE = 256;
   }
 
@@ -132,7 +131,7 @@ namespace Model_20b {
                           Barrier &sync_point, int *thread_states,
                           int base_thread_idx, int thread_idx_offset, int steps
   ) {
-    PROFILE_FUNCTION();
+    
     // <|start|>: 200006
     // <|end|>: 200007
     // <|return|>: 200002
@@ -192,10 +191,12 @@ namespace Model_20b {
     while (pos + 1 < steps) {
   
       // forward the transformer to get logits for the next token
-      int *next_gpu = getp_forward_120b(
-        transformer, dev_transformers, workers, 
-        sync_point, thread_idx_offset, 
-        token.data(), pos, mask.data());
+      // int *next_gpu = getp_forward_120b(
+      //   transformer, dev_transformers, workers, 
+      //   sync_point, thread_idx_offset, 
+      //   token.data(), pos, mask.data());
+      int *next_gpu = getp_forward_20b(transformer, dev_transformers, workers,
+        token.data(), pos, mask.data(), BATCH_SIZE);
   
       pos++;
       for (int b = 0; b < BATCH_SIZE; ++b) {
@@ -321,7 +322,7 @@ namespace Model_120b {
                           Barrier &sync_point, int *thread_states,
                           int thread_idx, int steps
   ) {
-    PROFILE_FUNCTION();
+    
     // <|start|>: 200006
     // <|end|>: 200007
     // <|return|>: 200002
@@ -498,10 +499,10 @@ namespace Model_120b {
 
 long long inference(Transformer *transformer, Tokenizer *tokenizer,
                     Sampler *sampler, Requests *requests) {
-  PROFILE_FUNCTION();
+  
 
   // Reset timing at the start of inference
-  reset_timing_summary();
+  
 
   int n_devices;
   HIP_CHECK(hipGetDeviceCount(&n_devices));
@@ -535,7 +536,6 @@ long long inference(Transformer *transformer, Tokenizer *tokenizer,
   HIP_CHECK(hipDeviceSynchronize());
   
   // Print timing summary at the end of inference
-  print_timing_summary();
 
   return num_token_out;
 }
