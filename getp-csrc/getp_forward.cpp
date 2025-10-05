@@ -1221,7 +1221,8 @@ matmul_qkv_fused_bf16_kernel_opt(
     const __hip_bfloat16* __restrict__ x,
     const __hip_bfloat16* __restrict__ w,
     const __hip_bfloat16* __restrict__ b,
-    int n, int q_len, int k_len, int v_len, int batch_size) {
+    int n, int q_len, int k_len, int v_len, int batch_size
+) {
   constexpr int MFMA_M = 16;
   constexpr int MFMA_N = 16;
   constexpr int MFMA_K = 16;
@@ -1403,6 +1404,214 @@ matmul_qkv_fused_bf16_kernel_opt(
   }
 }
 
+__global__ void __launch_bounds__(256)
+new_matmul_qkv_fused_kernel(
+  float *__restrict__ q_out, float *__restrict__ k_out,
+  float *__restrict__ v_out, const __hip_bfloat16 *__restrict__ x,
+  const __hip_bfloat16 *__restrict__ w, const __hip_bfloat16 *__restrict__ b,
+  int n, int q_len, int k_len, int v_len, int batch_size
+) {
+  constexpr int BLOCK_SIZE = 256;
+
+  const int M = batch_size;
+  const int N = q_len + k_len + v_len;
+  const int K = n;
+
+  // MFMA config
+  constexpr int MFMA_M = 16;
+  constexpr int MFMA_N = 16;
+  constexpr int MFMA_K = 16;
+  
+  constexpr int GPRs_A  = 2;
+  constexpr int GPRs_B  = 2;
+  constexpr int GPRs_CD = 4;
+
+  using CDfloat = __attribute__( (__vector_size__(GPRs_CD * sizeof(float)) )) float;
+  using Afloat  = __attribute__( (__vector_size__(GPRs_A  * sizeof(float)) )) unsigned short;
+  using Bfloat  = __attribute__( (__vector_size__(GPRs_B  * sizeof(float)) )) unsigned short;
+
+  // Block tile
+  constexpr int BM = 128;
+  constexpr int BN = 128;
+  constexpr int BK = 32;
+  // Wave tile
+  constexpr int WM = 64;
+  constexpr int WN = 64;
+
+  constexpr int nIterWaveM = WM / MFMA_M;
+  constexpr int nIterWaveN = WN / MFMA_N;
+
+  const int waveIdx = threadIdx.x / warpSize;
+  const int xInBlockTile = waveIdx % (BM / WM);
+  const int yInBlockTile = waveIdx / (BM / WM);
+  const int laneIdx = threadIdx.x % warpSize;
+
+  const int Ai = (laneIdx % 16);
+  const int Ak = 4 * (laneIdx / 16);
+  const int Bj = (laneIdx % 16);
+  const int Bk = 4 * (laneIdx / 16);
+
+  constexpr int nbLoadsX = BM * (BK / 8) / BLOCK_SIZE;
+  constexpr int nbLoadsW = BN * (BK / 8) / BLOCK_SIZE;
+
+  const int loadXIdx_y = threadIdx.x / (BK / 8);
+  const int loadXIdx_x = threadIdx.x % (BK / 8);
+  const int loadWIdx_y = threadIdx.x / (BK / 8);
+  const int loadWIdx_x = threadIdx.x % (BK / 8);
+  constexpr int strideX = BLOCK_SIZE / (BK / 8);
+  constexpr int strideW = BLOCK_SIZE / (BK / 8);
+
+  assert(blockDim.x == BLOCK_SIZE);
+
+  __shared__ unsigned short xs[BK][BM];
+  __shared__ unsigned short ws[BK][BN];
+
+  Afloat x_local;
+  Bfloat w_local;
+
+  CDfloat acc_local[nIterWaveM * nIterWaveN] = {0};
+
+  // Load x and w from global memory to shared memory
+  #pragma unroll
+  for (int i = 0; i < nbLoadsX; ++i) {
+    int offset = i * strideX;
+    int index_x = 0 + 8 * loadXIdx_x;
+    int index_y = BM * blockIdx.y + loadXIdx_y + offset;
+    uint4 tmp = index_x < K && index_y < M ?
+      *reinterpret_cast<const uint4 *>(&x[index_y * K + index_x]) : make_uint4(0, 0, 0, 0);
+    xs[8 * loadXIdx_x + 0][loadXIdx_y + offset] = (unsigned short)(tmp.x & 0xFFFF);
+    xs[8 * loadXIdx_x + 1][loadXIdx_y + offset] = (unsigned short)(tmp.x >> 16);
+    xs[8 * loadXIdx_x + 2][loadXIdx_y + offset] = (unsigned short)(tmp.y & 0xFFFF);
+    xs[8 * loadXIdx_x + 3][loadXIdx_y + offset] = (unsigned short)(tmp.y >> 16);
+    xs[8 * loadXIdx_x + 4][loadXIdx_y + offset] = (unsigned short)(tmp.z & 0xFFFF);
+    xs[8 * loadXIdx_x + 5][loadXIdx_y + offset] = (unsigned short)(tmp.z >> 16);
+    xs[8 * loadXIdx_x + 6][loadXIdx_y + offset] = (unsigned short)(tmp.w & 0xFFFF);
+    xs[8 * loadXIdx_x + 7][loadXIdx_y + offset] = (unsigned short)(tmp.w >> 16);
+  }
+  #pragma unroll
+  for (int i = 0; i < nbLoadsW; ++i) {
+    int offset = i * strideW;
+    int index_x = 0 + 8 * loadWIdx_x;
+    int index_y = BN * blockIdx.x + loadWIdx_y + offset;
+    uint4 tmp = index_x < K && index_y < N ?
+      *reinterpret_cast<const uint4 *>(&w[index_y * K + index_x]) : uint4(0, 0, 0, 0);
+    ws[8 * loadWIdx_x + 0][loadWIdx_y + offset] = (unsigned short)(tmp.x & 0xFFFF);
+    ws[8 * loadWIdx_x + 1][loadWIdx_y + offset] = (unsigned short)(tmp.x >> 16);
+    ws[8 * loadWIdx_x + 2][loadWIdx_y + offset] = (unsigned short)(tmp.y & 0xFFFF);
+    ws[8 * loadWIdx_x + 3][loadWIdx_y + offset] = (unsigned short)(tmp.y >> 16);
+    ws[8 * loadWIdx_x + 4][loadWIdx_y + offset] = (unsigned short)(tmp.z & 0xFFFF);
+    ws[8 * loadWIdx_x + 5][loadWIdx_y + offset] = (unsigned short)(tmp.z >> 16);
+    ws[8 * loadWIdx_x + 6][loadWIdx_y + offset] = (unsigned short)(tmp.w & 0xFFFF);
+    ws[8 * loadWIdx_x + 7][loadWIdx_y + offset] = (unsigned short)(tmp.w >> 16);
+  }
+  __syncthreads();
+  
+  #pragma unroll 1
+  for (int bkIdx = 0; bkIdx < K; bkIdx += BK) {
+    // Prefetch
+    uint4 regX[nbLoadsX];
+    uint4 regW[nbLoadsW];
+    if (bkIdx < K - BK) {
+      #pragma unroll
+      for (int i = 0; i < nbLoadsX; ++i) {
+        int offset = i * strideX;
+        int index_x = bkIdx + BK + 8 * loadXIdx_x;
+        int index_y = BM * blockIdx.y + loadXIdx_y + offset;
+        regX[i] = index_x < K && index_y < M ?
+          *reinterpret_cast<const uint4 *>(&x[index_y * K + index_x]) : make_uint4(0, 0, 0, 0);
+      }
+      #pragma unroll
+      for (int i = 0; i < nbLoadsW; ++i) {
+        int offset = i * strideW;
+        int index_x = bkIdx + BK + 8 * loadWIdx_x;
+        int index_y = BN * blockIdx.x + loadWIdx_y + offset;
+        regW[i] = index_x < K && index_y < N ?
+          *reinterpret_cast<const uint4 *>(&w[index_y * K + index_x]) : uint4(0, 0, 0, 0);
+      }
+    }
+
+    // Computing
+    #pragma unroll
+    for (int k = 0; k < BK; k += MFMA_K) {
+      #pragma unroll
+      for (int iterWaveM = 0; iterWaveM < nIterWaveM; ++iterWaveM) {
+        #pragma unroll
+        for (int iterWaveN = 0; iterWaveN < nIterWaveN; ++iterWaveN) {
+          #pragma unroll
+          for (int i = 0; i < 4; ++i) {
+            x_local[i] = xs[k + Ak + i][yInBlockTile * WM + MFMA_M * iterWaveM + Ai];
+            w_local[i] = ws[k + Bk + i][xInBlockTile * WN + MFMA_N * iterWaveN + Bj];
+          }
+
+          CDfloat y_local = acc_local[iterWaveM * nIterWaveN + iterWaveN]; 
+          y_local  = __builtin_amdgcn_mfma_f32_16x16x16bf16_1k(x_local, w_local, y_local, 0, 0, 0);
+          acc_local[iterWaveM * nIterWaveN + iterWaveN] = y_local;
+        }
+      }
+    }
+    __syncthreads();
+    if (bkIdx < K - BK) {
+      #pragma unroll
+      for (int i = 0; i < nbLoadsX; ++i) {
+        int offset = i * strideX;
+        xs[8 * loadXIdx_x + 0][loadXIdx_y + offset] = (unsigned short)(regX[i].x & 0xFFFF);
+        xs[8 * loadXIdx_x + 1][loadXIdx_y + offset] = (unsigned short)(regX[i].x >> 16);
+        xs[8 * loadXIdx_x + 2][loadXIdx_y + offset] = (unsigned short)(regX[i].y & 0xFFFF);
+        xs[8 * loadXIdx_x + 3][loadXIdx_y + offset] = (unsigned short)(regX[i].y >> 16);
+        xs[8 * loadXIdx_x + 4][loadXIdx_y + offset] = (unsigned short)(regX[i].z & 0xFFFF);
+        xs[8 * loadXIdx_x + 5][loadXIdx_y + offset] = (unsigned short)(regX[i].z >> 16);
+        xs[8 * loadXIdx_x + 6][loadXIdx_y + offset] = (unsigned short)(regX[i].w & 0xFFFF);
+        xs[8 * loadXIdx_x + 7][loadXIdx_y + offset] = (unsigned short)(regX[i].w >> 16);
+      }
+      #pragma unroll
+      for (int i = 0; i < nbLoadsW; ++i) {
+        int offset = i * strideW;
+        ws[8 * loadWIdx_x + 0][loadWIdx_y + offset] = (unsigned short)(regW[i].x & 0xFFFF);
+        ws[8 * loadWIdx_x + 1][loadWIdx_y + offset] = (unsigned short)(regW[i].x >> 16);
+        ws[8 * loadWIdx_x + 2][loadWIdx_y + offset] = (unsigned short)(regW[i].y & 0xFFFF);
+        ws[8 * loadWIdx_x + 3][loadWIdx_y + offset] = (unsigned short)(regW[i].y >> 16);
+        ws[8 * loadWIdx_x + 4][loadWIdx_y + offset] = (unsigned short)(regW[i].z & 0xFFFF);
+        ws[8 * loadWIdx_x + 5][loadWIdx_y + offset] = (unsigned short)(regW[i].z >> 16);
+        ws[8 * loadWIdx_x + 6][loadWIdx_y + offset] = (unsigned short)(regW[i].w & 0xFFFF);
+        ws[8 * loadWIdx_x + 7][loadWIdx_y + offset] = (unsigned short)(regW[i].w >> 16);
+      }
+    }
+    __syncthreads();
+  }
+
+  #pragma unroll
+  for (int iterWaveM = 0; iterWaveM < nIterWaveM; ++iterWaveM) {
+    #pragma unroll
+    for (int iterWaveN = 0; iterWaveN < nIterWaveN; ++iterWaveN) {
+      int acc_index = iterWaveM * nIterWaveN + iterWaveN;
+      #pragma unroll
+      for (int i = 0; i < GPRs_CD; ++i) {
+        int CDi = 4 * (laneIdx / 16) + (i % 4);
+        int CDj = (laneIdx % 16);
+        int global_x = blockIdx.x * BN + WN * xInBlockTile + iterWaveN * MFMA_N + CDj;
+        int global_y = blockIdx.y * BM + WM * yInBlockTile + iterWaveM * MFMA_M + CDi;
+        float result = acc_local[acc_index][i];
+        if (global_x < N && global_y < M) {
+          if (b) result += __bfloat162float(b[global_x]);
+          float *dst;
+          int outIdx;
+          if (global_x < q_len) {
+            dst = q_out + (size_t)global_y * q_len;
+            outIdx = global_x;
+          } else if (global_x < q_len + k_len) {
+            dst = k_out + (size_t)global_y * k_len;
+            outIdx = global_x - q_len;
+          } else {
+            dst = v_out + (size_t)global_y * v_len;
+            outIdx = global_x - q_len - k_len;
+          }
+          dst[outIdx] = result;
+        }
+      }
+    }
+  }
+}
+
 static inline void getp_matmul_qkv_fused_bf16(
     float *q, float *k, float *v,
     const __hip_bfloat16 *x_bf16,
@@ -1414,19 +1623,20 @@ static inline void getp_matmul_qkv_fused_bf16(
   const int q_len = head_dim * n_attn_heads;
   const int k_len = head_dim * n_kv_heads;
   const int v_len = head_dim * n_kv_heads;
+
   const int M = batch_size;
   const int N = q_len + k_len + v_len;
-  constexpr int BM = MATMUL_QKV_BLOCK_ROWS;
-  constexpr int BN = MATMUL_QKV_BLOCK_COLS;
-  constexpr int BK = MATMUL_QKV_BLOCK_DEPTH;
-  constexpr int WM = MATMUL_QKV_WARP_TILE_M;
-  constexpr int WN = MATMUL_QKV_WARP_TILE_N;
-  constexpr int WARPS = MATMUL_QKV_WAVES_PER_BLOCK;
-  dim3 block(64 * WARPS);
+  const int K = n;
+
+  const int BN = 128;
+  const int BM = 128;
+  const int BK = 16;
+
+  dim3 block(256);
   dim3 grid((N + BN - 1) / BN, (M + BM - 1) / BM);
-  matmul_qkv_fused_bf16_kernel_opt<BM,BN,BK,WM,WN,WARPS>
-      <<<grid, block, 0, stream>>>(q, k, v, x_bf16, w_qkv_bf16, b_qkv_bf16,
-                                   n, q_len, k_len, v_len, batch_size);
+
+  new_matmul_qkv_fused_kernel<<<grid, block, 0, stream>>>(
+      q, k, v, x_bf16, w_qkv_bf16, b_qkv_bf16, n, q_len, k_len, v_len, batch_size);
   // HIP_CHECK(hipDeviceSynchronize());
 }
 
