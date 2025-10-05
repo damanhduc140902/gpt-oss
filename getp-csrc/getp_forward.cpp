@@ -66,6 +66,7 @@ void getp_rmsnorm(float *o, float *x, float *weight, int batch_size, int dim,
   rmsnorm_kernel<<<gridDim, blockDim, sizeof(float) * (blockDim.x + 1),
                    stream>>>(o, x, weight, dim);
   // HIP_CHECK(hipDeviceSynchronize());
+  // HIP_CHECK(hipDeviceSynchronize());
 }
 
 union __bf16_bits_u {
@@ -433,6 +434,9 @@ mlp1_swiglu_bf16_bucketed_kernel_outbf16_tuned(
   const int* __restrict__ blk_offs,
   int H, int I, int E, float swiglu_limit
 ) {
+  // BM = BN = 64, BK = 32
+  // WM = WN = 32
+  // TILE_N = 64 * ((BM/WM) * (BN/WN)) = 64 * 2 * 2 = 256
   static_assert(BM % WM == 0 && BN % WN == 0, "tile mismatch");
   static_assert(BK % 16 == 0, "BK % 16");
   static_assert(WM % 16 == 0 && WN % 16 == 0, "WM/WN % 16");
@@ -487,84 +491,129 @@ mlp1_swiglu_bf16_bucketed_kernel_outbf16_tuned(
   const size_t b1_e = (size_t)e * (size_t)(2 * I);
   const int colBase = blockIdx.x * BNt;
 
+  constexpr int LOAD_VEC = 8;
+  const int loadX_x8 = threadIdx.x % (BK / LOAD_VEC);
+  const int loadX_y8 = threadIdx.x / (BK / LOAD_VEC);
+  constexpr int strideX8 = TILE_N / (BK / LOAD_VEC); // 256 / (32 / 8) = 64
+  constexpr int nbLoadsX = BM / strideX8;
+  constexpr int nbLoadsW = BNt / strideW;
+
+  #pragma unroll
+  for (int off = 0; off < BM; off += strideX8) {
+    const int kk = 0 + LOAD_VEC * loadX_x8;
+    const int r = loadX_y8 + off;
+    const int pos = base + r;
+    
+    unsigned short* dst = &sx[(LOAD_VEC * loadX_x8) * BM + r];
+    
+    if (r < tcnt && kk + 7 < H) {
+      const uint4* p = reinterpret_cast<const uint4*>(A_in + (size_t)pos * H + kk);
+      const uint4 v = *p;
+      
+      dst[0 * BM] = (unsigned short)(v.x & 0xFFFF);
+      dst[1 * BM] = (unsigned short)(v.x >> 16);
+      dst[2 * BM] = (unsigned short)(v.y & 0xFFFF);
+      dst[3 * BM] = (unsigned short)(v.y >> 16);
+      dst[4 * BM] = (unsigned short)(v.z & 0xFFFF);
+      dst[5 * BM] = (unsigned short)(v.z >> 16);
+      dst[6 * BM] = (unsigned short)(v.w & 0xFFFF);
+      dst[7 * BM] = (unsigned short)(v.w >> 16);
+    } else {
+      #pragma unroll
+      for (int i = 0; i < LOAD_VEC; ++i) {
+        dst[i * BM] = 0;
+      }
+    }
+  }
+
+  #pragma unroll
+  for (int off = 0; off < BNt; off += strideW) {
+    const int kk = 0 + 8 * loadW_x;
+    const int col = colBase + loadW_y + off;
+
+    unsigned short* dg = swg + (size_t)(8 * loadW_x) * BNt + (loadW_y + off);
+    unsigned short* du = swu + (size_t)(8 * loadW_x) * BNt + (loadW_y + off);
+    
+    if (col < I && kk + 7 < H) {
+      const size_t w1_gate_off = w1_e + (size_t)(2 * col + 0) * H + kk;
+      const size_t w1_up_off = w1_e + (size_t)(2 * col + 1) * H + kk;
+      const uint4* pg = reinterpret_cast<const uint4*>(W1 + w1_gate_off);
+      const uint4* pu = reinterpret_cast<const uint4*>(W1 + w1_up_off);
+      const uint4 wg = *pg;
+      const uint4 wu = *pu;
+      
+      dg[0 * BNt] = (unsigned short)(wg.x & 0xFFFF);
+      dg[1 * BNt] = (unsigned short)(wg.x >> 16);
+      dg[2 * BNt] = (unsigned short)(wg.y & 0xFFFF);
+      dg[3 * BNt] = (unsigned short)(wg.y >> 16);
+      dg[4 * BNt] = (unsigned short)(wg.z & 0xFFFF);
+      dg[5 * BNt] = (unsigned short)(wg.z >> 16);
+      dg[6 * BNt] = (unsigned short)(wg.w & 0xFFFF);
+      dg[7 * BNt] = (unsigned short)(wg.w >> 16);
+      
+      du[0 * BNt] = (unsigned short)(wu.x & 0xFFFF);
+      du[1 * BNt] = (unsigned short)(wu.x >> 16);
+      du[2 * BNt] = (unsigned short)(wu.y & 0xFFFF);
+      du[3 * BNt] = (unsigned short)(wu.y >> 16);
+      du[4 * BNt] = (unsigned short)(wu.z & 0xFFFF);
+      du[5 * BNt] = (unsigned short)(wu.z >> 16);
+      du[6 * BNt] = (unsigned short)(wu.w & 0xFFFF);
+      du[7 * BNt] = (unsigned short)(wu.w >> 16);
+    } else {
+      #pragma unroll
+      for (int i = 0; i < 8; ++i) {
+        dg[i * BNt] = 0;
+        du[i * BNt] = 0;
+      }
+    }
+  }
+  __syncthreads();
+
   #pragma unroll 1
   for (int bk = 0; bk < H; bk += BK) {
-    constexpr int LOAD_VEC = 8;
-    const int loadX_x8 = threadIdx.x % (BK / LOAD_VEC);
-    const int loadX_y8 = threadIdx.x / (BK / LOAD_VEC);
-    constexpr int strideX8 = TILE_N / (BK / LOAD_VEC);
-    
-    #pragma unroll
-    for (int off = 0; off < BM; off += strideX8) {
-      const int kk = bk + LOAD_VEC * loadX_x8;
-      const int r = loadX_y8 + off;
-      const int pos = base + r;
-      
-      unsigned short* dst = &sx[(LOAD_VEC * loadX_x8) * BM + r];
-      
-      if (r < tcnt && kk + 7 < H) {
-        const uint4* p = reinterpret_cast<const uint4*>(A_in + (size_t)pos * H + kk);
-        const uint4 v = *p;
+    uint4 regX[nbLoadsX];
+    uint4 regWU[nbLoadsW];
+    uint4 regWG[nbLoadsW];
+    if (bk + BK < H) {
+      #pragma unroll
+      for (int i = 0; i < nbLoadsX; ++i) {
+        int off = i * strideX8;
+        const int kk = bk + BK + LOAD_VEC * loadX_x8;
+        const int r = loadX_y8 + off;
+        const int pos = base + r;
         
-        dst[0 * BM] = (unsigned short)(v.x & 0xFFFF);
-        dst[1 * BM] = (unsigned short)(v.x >> 16);
-        dst[2 * BM] = (unsigned short)(v.y & 0xFFFF);
-        dst[3 * BM] = (unsigned short)(v.y >> 16);
-        dst[4 * BM] = (unsigned short)(v.z & 0xFFFF);
-        dst[5 * BM] = (unsigned short)(v.z >> 16);
-        dst[6 * BM] = (unsigned short)(v.w & 0xFFFF);
-        dst[7 * BM] = (unsigned short)(v.w >> 16);
-      } else {
-        #pragma unroll
-        for (int i = 0; i < LOAD_VEC; ++i) {
-          dst[i * BM] = 0;
+        if (r < tcnt && kk + 7 < H) {
+          const uint4* p = reinterpret_cast<const uint4*>(A_in + (size_t)pos * H + kk);
+          regX[i] = *p;
+        } else {
+          regX[i] = make_uint4(0, 0, 0, 0);
+        }
+      }
+  
+      #pragma unroll
+      for (int i = 0; i < nbLoadsW; ++i) {
+        int off = i * strideW;
+        const int kk = bk + BK + 8 * loadW_x;
+        const int col = colBase + loadW_y + off;
+  
+        unsigned short* dg = swg + (size_t)(8 * loadW_x) * BNt + (loadW_y + off);
+        unsigned short* du = swu + (size_t)(8 * loadW_x) * BNt + (loadW_y + off);
+        
+        if (col < I && kk + 7 < H) {
+          const size_t w1_gate_off = w1_e + (size_t)(2 * col + 0) * H + kk;
+          const size_t w1_up_off = w1_e + (size_t)(2 * col + 1) * H + kk;
+          const uint4* pg = reinterpret_cast<const uint4*>(W1 + w1_gate_off);
+          const uint4* pu = reinterpret_cast<const uint4*>(W1 + w1_up_off);
+          
+          regWG[i] = *pg;
+          regWU[i] = *pu;
+          
+        } else {
+          regWG[i] = make_uint4(0, 0, 0, 0);
+          regWU[i] = make_uint4(0, 0, 0, 0);
         }
       }
     }
-
-    #pragma unroll
-    for (int off = 0; off < BNt; off += strideW) {
-      const int kk = bk + 8 * loadW_x;
-      const int col = colBase + loadW_y + off;
-
-      unsigned short* dg = swg + (size_t)(8 * loadW_x) * BNt + (loadW_y + off);
-      unsigned short* du = swu + (size_t)(8 * loadW_x) * BNt + (loadW_y + off);
-      
-      if (col < I && kk + 7 < H) {
-        const size_t w1_gate_off = w1_e + (size_t)(2 * col + 0) * H + kk;
-        const size_t w1_up_off = w1_e + (size_t)(2 * col + 1) * H + kk;
-        const uint4* pg = reinterpret_cast<const uint4*>(W1 + w1_gate_off);
-        const uint4* pu = reinterpret_cast<const uint4*>(W1 + w1_up_off);
-        const uint4 wg = *pg;
-        const uint4 wu = *pu;
-        
-        dg[0 * BNt] = (unsigned short)(wg.x & 0xFFFF);
-        dg[1 * BNt] = (unsigned short)(wg.x >> 16);
-        dg[2 * BNt] = (unsigned short)(wg.y & 0xFFFF);
-        dg[3 * BNt] = (unsigned short)(wg.y >> 16);
-        dg[4 * BNt] = (unsigned short)(wg.z & 0xFFFF);
-        dg[5 * BNt] = (unsigned short)(wg.z >> 16);
-        dg[6 * BNt] = (unsigned short)(wg.w & 0xFFFF);
-        dg[7 * BNt] = (unsigned short)(wg.w >> 16);
-        
-        du[0 * BNt] = (unsigned short)(wu.x & 0xFFFF);
-        du[1 * BNt] = (unsigned short)(wu.x >> 16);
-        du[2 * BNt] = (unsigned short)(wu.y & 0xFFFF);
-        du[3 * BNt] = (unsigned short)(wu.y >> 16);
-        du[4 * BNt] = (unsigned short)(wu.z & 0xFFFF);
-        du[5 * BNt] = (unsigned short)(wu.z >> 16);
-        du[6 * BNt] = (unsigned short)(wu.w & 0xFFFF);
-        du[7 * BNt] = (unsigned short)(wu.w >> 16);
-      } else {
-        #pragma unroll
-        for (int i = 0; i < 8; ++i) {
-          dg[i * BNt] = 0;
-          du[i * BNt] = 0;
-        }
-      }
-    }
-
-    __syncthreads();
 
     #pragma unroll
     for (int k = 0; k < BK; k += 16) {
@@ -606,6 +655,60 @@ mlp1_swiglu_bf16_bucketed_kernel_outbf16_tuned(
             du_acc[g][im][in] = __builtin_amdgcn_mfma_f32_16x16x16bf16_1k(av, uv_cur, du_acc[g][im][in], 0, 0, 0);
           }
         }
+      }
+    }
+
+    __syncthreads();
+
+    if (bk + BK < H) {
+      #pragma unroll
+      for (int i = 0; i < nbLoadsX; ++i) {
+        int off = i * strideX8;
+        const int r = loadX_y8 + off;
+        const int pos = base + r;
+        
+        unsigned short* dst = &sx[(LOAD_VEC * loadX_x8) * BM + r];
+        
+        const uint4 v = regX[i];
+        
+        dst[0 * BM] = (unsigned short)(v.x & 0xFFFF);
+        dst[1 * BM] = (unsigned short)(v.x >> 16);
+        dst[2 * BM] = (unsigned short)(v.y & 0xFFFF);
+        dst[3 * BM] = (unsigned short)(v.y >> 16);
+        dst[4 * BM] = (unsigned short)(v.z & 0xFFFF);
+        dst[5 * BM] = (unsigned short)(v.z >> 16);
+        dst[6 * BM] = (unsigned short)(v.w & 0xFFFF);
+        dst[7 * BM] = (unsigned short)(v.w >> 16);
+      }
+
+      #pragma unroll
+      for (int i = 0; i < nbLoadsW; ++i) {
+        int off = i * strideW;
+        const int col = colBase + loadW_y + off;
+
+        unsigned short* dg = swg + (size_t)(8 * loadW_x) * BNt + (loadW_y + off);
+        unsigned short* du = swu + (size_t)(8 * loadW_x) * BNt + (loadW_y + off);
+        
+        const uint4 wg = regWG[i];
+        const uint4 wu = regWU[i];
+        
+        dg[0 * BNt] = (unsigned short)(wg.x & 0xFFFF);
+        dg[1 * BNt] = (unsigned short)(wg.x >> 16);
+        dg[2 * BNt] = (unsigned short)(wg.y & 0xFFFF);
+        dg[3 * BNt] = (unsigned short)(wg.y >> 16);
+        dg[4 * BNt] = (unsigned short)(wg.z & 0xFFFF);
+        dg[5 * BNt] = (unsigned short)(wg.z >> 16);
+        dg[6 * BNt] = (unsigned short)(wg.w & 0xFFFF);
+        dg[7 * BNt] = (unsigned short)(wg.w >> 16);
+        
+        du[0 * BNt] = (unsigned short)(wu.x & 0xFFFF);
+        du[1 * BNt] = (unsigned short)(wu.x >> 16);
+        du[2 * BNt] = (unsigned short)(wu.y & 0xFFFF);
+        du[3 * BNt] = (unsigned short)(wu.y >> 16);
+        du[4 * BNt] = (unsigned short)(wu.z & 0xFFFF);
+        du[5 * BNt] = (unsigned short)(wu.z >> 16);
+        du[6 * BNt] = (unsigned short)(wu.w & 0xFFFF);
+        du[7 * BNt] = (unsigned short)(wu.w >> 16);
       }
     }
 
@@ -749,73 +852,118 @@ mlp2_partial_bf16_bucketed_splitk_kernel_inbf16_tuned(
 
   const int colBase = blockIdx.x * BNt;
 
+  constexpr int LOAD_VEC = 8;
+  const int loadX_x8 = threadIdx.x % (BK / LOAD_VEC);
+  const int loadX_y8 = threadIdx.x / (BK / LOAD_VEC);
+  constexpr int strideX8 = TILE_N / (BK / LOAD_VEC);
+
+  static_assert(BM % strideX8 == 0);
+  static_assert(BNt % strideX8 == 0);
+  constexpr int nbLoadsX = BM / strideX8;
+  constexpr int nbLoadsW = BNt / strideW;
+
+  // Optimized activation load: uint4 (8 bf16)
+  #pragma unroll
+  for (int off = 0; off < BM; off += strideX8) {
+    const int kk = kBeg + LOAD_VEC * loadX_x8;
+    const int r = loadX_y8 + off;
+    const int pos = base + r;
+    
+    unsigned short* dst = &sx[(LOAD_VEC * loadX_x8) * BM + r];
+    
+    if (r < tcnt && kk + 7 < kEnd) {
+      // Vectorized uint4 load (8 bf16)
+      const __hip_bfloat16* src = gate_up_bf16 + (size_t)pos * (size_t)I + kk;
+      const uint4* p = reinterpret_cast<const uint4*>(src);
+      const uint4 v = *p;
+      
+      dst[0 * BM] = (unsigned short)(v.x & 0xFFFF);
+      dst[1 * BM] = (unsigned short)(v.x >> 16);
+      dst[2 * BM] = (unsigned short)(v.y & 0xFFFF);
+      dst[3 * BM] = (unsigned short)(v.y >> 16);
+      dst[4 * BM] = (unsigned short)(v.z & 0xFFFF);
+      dst[5 * BM] = (unsigned short)(v.z >> 16);
+      dst[6 * BM] = (unsigned short)(v.w & 0xFFFF);
+      dst[7 * BM] = (unsigned short)(v.w >> 16);
+    } else {
+      #pragma unroll
+      for (int i = 0; i < LOAD_VEC; ++i) {
+        dst[i * BM] = 0;
+      }
+    }
+  }
+
+  // Optimized weight load: uint4 with full unroll
+  #pragma unroll
+  for (int off = 0; off < BNt; off += strideW) {
+    const int kk = kBeg + 8 * loadW_x;
+    const int col = colBase + loadW_y + off;
+    
+    unsigned short* dst = sw + (size_t)(8 * loadW_x) * BNt + (loadW_y + off);
+    
+    if (col < H && kk + 7 < kEnd) {
+      // Vectorized uint4 load (8 bf16)
+      const size_t w2_off = w2_e + (size_t)col * (size_t)I + kk;
+      const uint4* pw = reinterpret_cast<const uint4*>(W2 + w2_off);
+      const uint4 wb = *pw;
+      
+      dst[0 * BNt] = (unsigned short)(wb.x & 0xFFFF);
+      dst[1 * BNt] = (unsigned short)(wb.x >> 16);
+      dst[2 * BNt] = (unsigned short)(wb.y & 0xFFFF);
+      dst[3 * BNt] = (unsigned short)(wb.y >> 16);
+      dst[4 * BNt] = (unsigned short)(wb.z & 0xFFFF);
+      dst[5 * BNt] = (unsigned short)(wb.z >> 16);
+      dst[6 * BNt] = (unsigned short)(wb.w & 0xFFFF);
+      dst[7 * BNt] = (unsigned short)(wb.w >> 16);
+    } else {
+      #pragma unroll
+      for (int i = 0; i < 8; ++i) dst[i * BNt] = 0;
+    }
+  }
+
+  __syncthreads();
+
   #pragma unroll 1
   for (int bk = kBeg; bk < kEnd; bk += BK) {
-    // Optimized activation load: uint4 (8 bf16)
-    constexpr int LOAD_VEC = 8;
-    const int loadX_x8 = threadIdx.x % (BK / LOAD_VEC);
-    const int loadX_y8 = threadIdx.x / (BK / LOAD_VEC);
-    constexpr int strideX8 = TILE_N / (BK / LOAD_VEC);
-    
-    #pragma unroll
-    for (int off = 0; off < BM; off += strideX8) {
-      const int kk = bk + LOAD_VEC * loadX_x8;
-      const int r = loadX_y8 + off;
-      const int pos = base + r;
-      
-      unsigned short* dst = &sx[(LOAD_VEC * loadX_x8) * BM + r];
-      
-      if (r < tcnt && kk + 7 < kEnd) {
-        // Vectorized uint4 load (8 bf16)
-        const __hip_bfloat16* src = gate_up_bf16 + (size_t)pos * (size_t)I + kk;
-        const uint4* p = reinterpret_cast<const uint4*>(src);
-        const uint4 v = *p;
+    uint4 regX[nbLoadsX];
+    uint4 regW[nbLoadsW];
+
+    if (bk + BK < kEnd) {
+      // Optimized activation load: uint4 (8 bf16)
+      #pragma unroll
+      for (int i = 0; i < nbLoadsX; ++i) {
+        int off = i * strideX8;
+        const int kk = bk + BK + LOAD_VEC * loadX_x8;
+        const int r = loadX_y8 + off;
+        const int pos = base + r;
         
-        dst[0 * BM] = (unsigned short)(v.x & 0xFFFF);
-        dst[1 * BM] = (unsigned short)(v.x >> 16);
-        dst[2 * BM] = (unsigned short)(v.y & 0xFFFF);
-        dst[3 * BM] = (unsigned short)(v.y >> 16);
-        dst[4 * BM] = (unsigned short)(v.z & 0xFFFF);
-        dst[5 * BM] = (unsigned short)(v.z >> 16);
-        dst[6 * BM] = (unsigned short)(v.w & 0xFFFF);
-        dst[7 * BM] = (unsigned short)(v.w >> 16);
-      } else {
-        #pragma unroll
-        for (int i = 0; i < LOAD_VEC; ++i) {
-          dst[i * BM] = 0;
+        if (r < tcnt && kk + 7 < kEnd) {
+          // Vectorized uint4 load (8 bf16)
+          const __hip_bfloat16* src = gate_up_bf16 + (size_t)pos * (size_t)I + kk;
+          const uint4* p = reinterpret_cast<const uint4*>(src);
+          regX[i] = *p;
+        } else {
+          regX[i] = make_uint4(0, 0, 0, 0);
+        }
+      }
+
+      // Optimized weight load: uint4 with full unroll
+      #pragma unroll
+      for (int i = 0; i < nbLoadsW; ++i) {
+        int off = i * strideW;
+        const int kk = bk + BK + 8 * loadW_x;
+        const int col = colBase + loadW_y + off;
+        
+        if (col < H && kk + 7 < kEnd) {
+          // Vectorized uint4 load (8 bf16)
+          const size_t w2_off = w2_e + (size_t)col * (size_t)I + kk;
+          const uint4* pw = reinterpret_cast<const uint4*>(W2 + w2_off);
+          regW[i] = *pw;
+        } else {
+          regW[i] = make_uint4(0, 0, 0, 0);
         }
       }
     }
-
-    // Optimized weight load: uint4 with full unroll
-    #pragma unroll
-    for (int off = 0; off < BNt; off += strideW) {
-      const int kk = bk + 8 * loadW_x;
-      const int col = colBase + loadW_y + off;
-      
-      unsigned short* dst = sw + (size_t)(8 * loadW_x) * BNt + (loadW_y + off);
-      
-      if (col < H && kk + 7 < kEnd) {
-        // Vectorized uint4 load (8 bf16)
-        const size_t w2_off = w2_e + (size_t)col * (size_t)I + kk;
-        const uint4* pw = reinterpret_cast<const uint4*>(W2 + w2_off);
-        const uint4 wb = *pw;
-        
-        dst[0 * BNt] = (unsigned short)(wb.x & 0xFFFF);
-        dst[1 * BNt] = (unsigned short)(wb.x >> 16);
-        dst[2 * BNt] = (unsigned short)(wb.y & 0xFFFF);
-        dst[3 * BNt] = (unsigned short)(wb.y >> 16);
-        dst[4 * BNt] = (unsigned short)(wb.z & 0xFFFF);
-        dst[5 * BNt] = (unsigned short)(wb.z >> 16);
-        dst[6 * BNt] = (unsigned short)(wb.w & 0xFFFF);
-        dst[7 * BNt] = (unsigned short)(wb.w >> 16);
-      } else {
-        #pragma unroll
-        for (int i = 0; i < 8; ++i) dst[i * BNt] = 0;
-      }
-    }
-
-    __syncthreads();
 
     // MFMA compute loop - fully unrolled with prefetching
     #pragma unroll
@@ -852,6 +1000,50 @@ mlp2_partial_bf16_bucketed_splitk_kernel_inbf16_tuned(
             d_acc[g][im][in] = __builtin_amdgcn_mfma_f32_16x16x16bf16_1k(av, bv_cur, d_acc[g][im][in], 0, 0, 0);
           }
         }
+      }
+    }
+    __syncthreads();
+
+    if (bk + BK < kEnd) {
+      // Optimized activation load: uint4 (8 bf16)
+      #pragma unroll
+      for (int i = 0; i < nbLoadsX; ++i) {
+        int off = i * strideX8;
+        const int r = loadX_y8 + off;
+        const int pos = base + r;
+        
+        unsigned short* dst = &sx[(LOAD_VEC * loadX_x8) * BM + r];
+        
+        const uint4 v = regX[i];
+        
+        dst[0 * BM] = (unsigned short)(v.x & 0xFFFF);
+        dst[1 * BM] = (unsigned short)(v.x >> 16);
+        dst[2 * BM] = (unsigned short)(v.y & 0xFFFF);
+        dst[3 * BM] = (unsigned short)(v.y >> 16);
+        dst[4 * BM] = (unsigned short)(v.z & 0xFFFF);
+        dst[5 * BM] = (unsigned short)(v.z >> 16);
+        dst[6 * BM] = (unsigned short)(v.w & 0xFFFF);
+        dst[7 * BM] = (unsigned short)(v.w >> 16);
+      }
+
+      // Optimized weight load: uint4 with full unroll
+      #pragma unroll
+      for (int i = 0; i < nbLoadsW; ++i) {
+        int off = i * strideW;
+        const int col = colBase + loadW_y + off;
+        
+        unsigned short* dst = sw + (size_t)(8 * loadW_x) * BNt + (loadW_y + off);
+        
+        const uint4 wb = regW[i];
+        
+        dst[0 * BNt] = (unsigned short)(wb.x & 0xFFFF);
+        dst[1 * BNt] = (unsigned short)(wb.x >> 16);
+        dst[2 * BNt] = (unsigned short)(wb.y & 0xFFFF);
+        dst[3 * BNt] = (unsigned short)(wb.y >> 16);
+        dst[4 * BNt] = (unsigned short)(wb.z & 0xFFFF);
+        dst[5 * BNt] = (unsigned short)(wb.z >> 16);
+        dst[6 * BNt] = (unsigned short)(wb.w & 0xFFFF);
+        dst[7 * BNt] = (unsigned short)(wb.w >> 16);
       }
     }
 
@@ -1030,7 +1222,8 @@ matmul_qkv_fused_bf16_kernel_opt(
     const __hip_bfloat16* __restrict__ x,
     const __hip_bfloat16* __restrict__ w,
     const __hip_bfloat16* __restrict__ b,
-    int n, int q_len, int k_len, int v_len, int batch_size) {
+    int n, int q_len, int k_len, int v_len, int batch_size
+) {
   constexpr int MFMA_M = 16;
   constexpr int MFMA_N = 16;
   constexpr int MFMA_K = 16;
@@ -1212,6 +1405,214 @@ matmul_qkv_fused_bf16_kernel_opt(
   }
 }
 
+__global__ void __launch_bounds__(256)
+new_matmul_qkv_fused_kernel(
+  float *__restrict__ q_out, float *__restrict__ k_out,
+  float *__restrict__ v_out, const __hip_bfloat16 *__restrict__ x,
+  const __hip_bfloat16 *__restrict__ w, const __hip_bfloat16 *__restrict__ b,
+  int n, int q_len, int k_len, int v_len, int batch_size
+) {
+  constexpr int BLOCK_SIZE = 256;
+
+  const int M = batch_size;
+  const int N = q_len + k_len + v_len;
+  const int K = n;
+
+  // MFMA config
+  constexpr int MFMA_M = 16;
+  constexpr int MFMA_N = 16;
+  constexpr int MFMA_K = 16;
+  
+  constexpr int GPRs_A  = 2;
+  constexpr int GPRs_B  = 2;
+  constexpr int GPRs_CD = 4;
+
+  using CDfloat = __attribute__( (__vector_size__(GPRs_CD * sizeof(float)) )) float;
+  using Afloat  = __attribute__( (__vector_size__(GPRs_A  * sizeof(float)) )) unsigned short;
+  using Bfloat  = __attribute__( (__vector_size__(GPRs_B  * sizeof(float)) )) unsigned short;
+
+  // Block tile
+  constexpr int BM = 128;
+  constexpr int BN = 128;
+  constexpr int BK = 32;
+  // Wave tile
+  constexpr int WM = 64;
+  constexpr int WN = 64;
+
+  constexpr int nIterWaveM = WM / MFMA_M;
+  constexpr int nIterWaveN = WN / MFMA_N;
+
+  const int waveIdx = threadIdx.x / warpSize;
+  const int xInBlockTile = waveIdx % (BM / WM);
+  const int yInBlockTile = waveIdx / (BM / WM);
+  const int laneIdx = threadIdx.x % warpSize;
+
+  const int Ai = (laneIdx % 16);
+  const int Ak = 4 * (laneIdx / 16);
+  const int Bj = (laneIdx % 16);
+  const int Bk = 4 * (laneIdx / 16);
+
+  constexpr int nbLoadsX = BM * (BK / 8) / BLOCK_SIZE;
+  constexpr int nbLoadsW = BN * (BK / 8) / BLOCK_SIZE;
+
+  const int loadXIdx_y = threadIdx.x / (BK / 8);
+  const int loadXIdx_x = threadIdx.x % (BK / 8);
+  const int loadWIdx_y = threadIdx.x / (BK / 8);
+  const int loadWIdx_x = threadIdx.x % (BK / 8);
+  constexpr int strideX = BLOCK_SIZE / (BK / 8);
+  constexpr int strideW = BLOCK_SIZE / (BK / 8);
+
+  assert(blockDim.x == BLOCK_SIZE);
+
+  __shared__ unsigned short xs[BK][BM];
+  __shared__ unsigned short ws[BK][BN];
+
+  Afloat x_local;
+  Bfloat w_local;
+
+  CDfloat acc_local[nIterWaveM * nIterWaveN] = {0};
+
+  // Load x and w from global memory to shared memory
+  #pragma unroll
+  for (int i = 0; i < nbLoadsX; ++i) {
+    int offset = i * strideX;
+    int index_x = 0 + 8 * loadXIdx_x;
+    int index_y = BM * blockIdx.y + loadXIdx_y + offset;
+    uint4 tmp = index_x < K && index_y < M ?
+      *reinterpret_cast<const uint4 *>(&x[index_y * K + index_x]) : make_uint4(0, 0, 0, 0);
+    xs[8 * loadXIdx_x + 0][loadXIdx_y + offset] = (unsigned short)(tmp.x & 0xFFFF);
+    xs[8 * loadXIdx_x + 1][loadXIdx_y + offset] = (unsigned short)(tmp.x >> 16);
+    xs[8 * loadXIdx_x + 2][loadXIdx_y + offset] = (unsigned short)(tmp.y & 0xFFFF);
+    xs[8 * loadXIdx_x + 3][loadXIdx_y + offset] = (unsigned short)(tmp.y >> 16);
+    xs[8 * loadXIdx_x + 4][loadXIdx_y + offset] = (unsigned short)(tmp.z & 0xFFFF);
+    xs[8 * loadXIdx_x + 5][loadXIdx_y + offset] = (unsigned short)(tmp.z >> 16);
+    xs[8 * loadXIdx_x + 6][loadXIdx_y + offset] = (unsigned short)(tmp.w & 0xFFFF);
+    xs[8 * loadXIdx_x + 7][loadXIdx_y + offset] = (unsigned short)(tmp.w >> 16);
+  }
+  #pragma unroll
+  for (int i = 0; i < nbLoadsW; ++i) {
+    int offset = i * strideW;
+    int index_x = 0 + 8 * loadWIdx_x;
+    int index_y = BN * blockIdx.x + loadWIdx_y + offset;
+    uint4 tmp = index_x < K && index_y < N ?
+      *reinterpret_cast<const uint4 *>(&w[index_y * K + index_x]) : uint4(0, 0, 0, 0);
+    ws[8 * loadWIdx_x + 0][loadWIdx_y + offset] = (unsigned short)(tmp.x & 0xFFFF);
+    ws[8 * loadWIdx_x + 1][loadWIdx_y + offset] = (unsigned short)(tmp.x >> 16);
+    ws[8 * loadWIdx_x + 2][loadWIdx_y + offset] = (unsigned short)(tmp.y & 0xFFFF);
+    ws[8 * loadWIdx_x + 3][loadWIdx_y + offset] = (unsigned short)(tmp.y >> 16);
+    ws[8 * loadWIdx_x + 4][loadWIdx_y + offset] = (unsigned short)(tmp.z & 0xFFFF);
+    ws[8 * loadWIdx_x + 5][loadWIdx_y + offset] = (unsigned short)(tmp.z >> 16);
+    ws[8 * loadWIdx_x + 6][loadWIdx_y + offset] = (unsigned short)(tmp.w & 0xFFFF);
+    ws[8 * loadWIdx_x + 7][loadWIdx_y + offset] = (unsigned short)(tmp.w >> 16);
+  }
+  __syncthreads();
+  
+  #pragma unroll 1
+  for (int bkIdx = 0; bkIdx < K; bkIdx += BK) {
+    // Prefetch
+    uint4 regX[nbLoadsX];
+    uint4 regW[nbLoadsW];
+    if (bkIdx < K - BK) {
+      #pragma unroll
+      for (int i = 0; i < nbLoadsX; ++i) {
+        int offset = i * strideX;
+        int index_x = bkIdx + BK + 8 * loadXIdx_x;
+        int index_y = BM * blockIdx.y + loadXIdx_y + offset;
+        regX[i] = index_x < K && index_y < M ?
+          *reinterpret_cast<const uint4 *>(&x[index_y * K + index_x]) : make_uint4(0, 0, 0, 0);
+      }
+      #pragma unroll
+      for (int i = 0; i < nbLoadsW; ++i) {
+        int offset = i * strideW;
+        int index_x = bkIdx + BK + 8 * loadWIdx_x;
+        int index_y = BN * blockIdx.x + loadWIdx_y + offset;
+        regW[i] = index_x < K && index_y < N ?
+          *reinterpret_cast<const uint4 *>(&w[index_y * K + index_x]) : uint4(0, 0, 0, 0);
+      }
+    }
+
+    // Computing
+    #pragma unroll
+    for (int k = 0; k < BK; k += MFMA_K) {
+      #pragma unroll
+      for (int iterWaveM = 0; iterWaveM < nIterWaveM; ++iterWaveM) {
+        #pragma unroll
+        for (int iterWaveN = 0; iterWaveN < nIterWaveN; ++iterWaveN) {
+          #pragma unroll
+          for (int i = 0; i < 4; ++i) {
+            x_local[i] = xs[k + Ak + i][yInBlockTile * WM + MFMA_M * iterWaveM + Ai];
+            w_local[i] = ws[k + Bk + i][xInBlockTile * WN + MFMA_N * iterWaveN + Bj];
+          }
+
+          CDfloat y_local = acc_local[iterWaveM * nIterWaveN + iterWaveN]; 
+          y_local  = __builtin_amdgcn_mfma_f32_16x16x16bf16_1k(x_local, w_local, y_local, 0, 0, 0);
+          acc_local[iterWaveM * nIterWaveN + iterWaveN] = y_local;
+        }
+      }
+    }
+    __syncthreads();
+    if (bkIdx < K - BK) {
+      #pragma unroll
+      for (int i = 0; i < nbLoadsX; ++i) {
+        int offset = i * strideX;
+        xs[8 * loadXIdx_x + 0][loadXIdx_y + offset] = (unsigned short)(regX[i].x & 0xFFFF);
+        xs[8 * loadXIdx_x + 1][loadXIdx_y + offset] = (unsigned short)(regX[i].x >> 16);
+        xs[8 * loadXIdx_x + 2][loadXIdx_y + offset] = (unsigned short)(regX[i].y & 0xFFFF);
+        xs[8 * loadXIdx_x + 3][loadXIdx_y + offset] = (unsigned short)(regX[i].y >> 16);
+        xs[8 * loadXIdx_x + 4][loadXIdx_y + offset] = (unsigned short)(regX[i].z & 0xFFFF);
+        xs[8 * loadXIdx_x + 5][loadXIdx_y + offset] = (unsigned short)(regX[i].z >> 16);
+        xs[8 * loadXIdx_x + 6][loadXIdx_y + offset] = (unsigned short)(regX[i].w & 0xFFFF);
+        xs[8 * loadXIdx_x + 7][loadXIdx_y + offset] = (unsigned short)(regX[i].w >> 16);
+      }
+      #pragma unroll
+      for (int i = 0; i < nbLoadsW; ++i) {
+        int offset = i * strideW;
+        ws[8 * loadWIdx_x + 0][loadWIdx_y + offset] = (unsigned short)(regW[i].x & 0xFFFF);
+        ws[8 * loadWIdx_x + 1][loadWIdx_y + offset] = (unsigned short)(regW[i].x >> 16);
+        ws[8 * loadWIdx_x + 2][loadWIdx_y + offset] = (unsigned short)(regW[i].y & 0xFFFF);
+        ws[8 * loadWIdx_x + 3][loadWIdx_y + offset] = (unsigned short)(regW[i].y >> 16);
+        ws[8 * loadWIdx_x + 4][loadWIdx_y + offset] = (unsigned short)(regW[i].z & 0xFFFF);
+        ws[8 * loadWIdx_x + 5][loadWIdx_y + offset] = (unsigned short)(regW[i].z >> 16);
+        ws[8 * loadWIdx_x + 6][loadWIdx_y + offset] = (unsigned short)(regW[i].w & 0xFFFF);
+        ws[8 * loadWIdx_x + 7][loadWIdx_y + offset] = (unsigned short)(regW[i].w >> 16);
+      }
+    }
+    __syncthreads();
+  }
+
+  #pragma unroll
+  for (int iterWaveM = 0; iterWaveM < nIterWaveM; ++iterWaveM) {
+    #pragma unroll
+    for (int iterWaveN = 0; iterWaveN < nIterWaveN; ++iterWaveN) {
+      int acc_index = iterWaveM * nIterWaveN + iterWaveN;
+      #pragma unroll
+      for (int i = 0; i < GPRs_CD; ++i) {
+        int CDi = 4 * (laneIdx / 16) + (i % 4);
+        int CDj = (laneIdx % 16);
+        int global_x = blockIdx.x * BN + WN * xInBlockTile + iterWaveN * MFMA_N + CDj;
+        int global_y = blockIdx.y * BM + WM * yInBlockTile + iterWaveM * MFMA_M + CDi;
+        float result = acc_local[acc_index][i];
+        if (global_x < N && global_y < M) {
+          if (b) result += __bfloat162float(b[global_x]);
+          float *dst;
+          int outIdx;
+          if (global_x < q_len) {
+            dst = q_out + (size_t)global_y * q_len;
+            outIdx = global_x;
+          } else if (global_x < q_len + k_len) {
+            dst = k_out + (size_t)global_y * k_len;
+            outIdx = global_x - q_len;
+          } else {
+            dst = v_out + (size_t)global_y * v_len;
+            outIdx = global_x - q_len - k_len;
+          }
+          dst[outIdx] = result;
+        }
+      }
+    }
+  }
+}
+
 static inline void getp_matmul_qkv_fused_bf16(
     float *q, float *k, float *v,
     const __hip_bfloat16 *x_bf16,
@@ -1223,19 +1624,20 @@ static inline void getp_matmul_qkv_fused_bf16(
   const int q_len = head_dim * n_attn_heads;
   const int k_len = head_dim * n_kv_heads;
   const int v_len = head_dim * n_kv_heads;
+
   const int M = batch_size;
   const int N = q_len + k_len + v_len;
-  constexpr int BM = MATMUL_QKV_BLOCK_ROWS;
-  constexpr int BN = MATMUL_QKV_BLOCK_COLS;
-  constexpr int BK = MATMUL_QKV_BLOCK_DEPTH;
-  constexpr int WM = MATMUL_QKV_WARP_TILE_M;
-  constexpr int WN = MATMUL_QKV_WARP_TILE_N;
-  constexpr int WARPS = MATMUL_QKV_WAVES_PER_BLOCK;
-  dim3 block(64 * WARPS);
+  const int K = n;
+
+  const int BN = 128;
+  const int BM = 128;
+  const int BK = 16;
+
+  dim3 block(256);
   dim3 grid((N + BN - 1) / BN, (M + BM - 1) / BM);
-  matmul_qkv_fused_bf16_kernel_opt<BM,BN,BK,WM,WN,WARPS>
-      <<<grid, block, 0, stream>>>(q, k, v, x_bf16, w_qkv_bf16, b_qkv_bf16,
-                                   n, q_len, k_len, v_len, batch_size);
+
+  new_matmul_qkv_fused_kernel<<<grid, block, 0, stream>>>(
+      q, k, v, x_bf16, w_qkv_bf16, b_qkv_bf16, n, q_len, k_len, v_len, batch_size);
   // HIP_CHECK(hipDeviceSynchronize());
 }
 
