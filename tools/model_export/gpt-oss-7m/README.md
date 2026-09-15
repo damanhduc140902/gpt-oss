@@ -7,18 +7,18 @@ The process converts the Hugging Face checkpoint into a single `.bin` file that 
    Run the key conversion script on the downloaded Hugging Face weights. This step renames tensors’ keys into the expected format.
 
 ```bash
-python "${GPT_OSS_REPO_ROOT}/export_model_bin/gpt-oss-7m/convert_state_dict.py" \
+python "${GPT_OSS_REPO_ROOT}/tools/model_export/gpt-oss-7m/convert_state_dict.py" \
   --input  "${MODELS_ROOT}/gpt-oss-7m/model.safetensors" \
-  --output "${GPT_OSS_REPO_ROOT}/export_model_bin/gpt-oss-7m/model.safetensors"
+  --output "${GPT_OSS_REPO_ROOT}/tools/model_export/gpt-oss-7m/model.safetensors"
 ```
 
 2. **Generate binary**
    Use the conversion output and `config.json` to build the `.bin` file.
 
 ```bash
-python "${GPT_OSS_REPO_ROOT}/export_model_bin/gpt-oss-7m/generate_bin.py" \
-  --config "${GPT_OSS_REPO_ROOT}/export_model_bin/gpt-oss-7m/config.json" \
-  --input  "${GPT_OSS_REPO_ROOT}/export_model_bin/gpt-oss-7m/model.safetensors" \
+python "${GPT_OSS_REPO_ROOT}/tools/model_export/gpt-oss-7m/generate_bin.py" \
+  --config "${GPT_OSS_REPO_ROOT}/tools/model_export/gpt-oss-7m/config.json" \
+  --input  "${GPT_OSS_REPO_ROOT}/tools/model_export/gpt-oss-7m/model.safetensors" \
   --output "${GPT_OSS_REPO_ROOT}/gpt-oss-7m.bin"
 ```
 
