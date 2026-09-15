@@ -8,6 +8,7 @@ it; these pages cover why it is shaped the way it is.
 | [MODEL.md](MODEL.md) | The gpt-oss architecture, and what the 20B and 120B variants share. |
 | [KERNELS.md](KERNELS.md) | Matrix multiply, multi-head attention and the mixture-of-experts kernel. |
 | [PARALLELISM.md](PARALLELISM.md) | Expert × Data parallelism, and the collectives built on peer-to-peer copies. |
+| [SERVING.md](SERVING.md) | The `getp` batch runtime: request partitioning, KV cache sizing, warm-up and throughput. |
 
 ## Ground rules
 

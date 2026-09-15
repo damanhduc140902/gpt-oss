@@ -1,49 +1,280 @@
-# Parallelism and communication
+# Expert × Data parallelism and the collectives
 
-Code: [`src/getp/run.cpp`](../src/getp/run.cpp) for the runtime and
-[`src/getp/collectives.cpp`](../src/getp/collectives.cpp) for the collectives.
+Every GPU in this engine holds a full copy of the attention stack and its own KV cache, and only the
+MoE experts are split. That is Expert × Data parallelism: attention runs with no coordination at all,
+and the expert layer pays for it twice per decoder layer with an all-gather and a reduce-scatter. The
+project may not link RCCL or MPI, so both collectives are open-coded from `hipMemcpyPeerAsync` inside
+the forward pass in [`src/hip/forward.hip`](../src/hip/forward.hip). This page covers how the split is
+chosen, how the two collectives are built, what they cost in bytes, and why the order of the copies
+inside each collective is not arbitrary.
 
-## Expert × Data parallelism
+<picture>
+  <source media="(prefers-color-scheme: dark)" srcset="assets/topology-dark.svg">
+  <img alt="Node topology: an 8-GPU node split into replicas, each replica holding a full attention stack and KV cache per device and a disjoint window of experts, with all-gather and reduce-scatter between the devices of a replica" src="assets/topology-light.svg" width="100%">
+</picture>
 
-To fully leverage a multi-GPU system, an appropriate parallelism model has to be built into the
-inference system. Both `gpt-oss-20b` and `gpt-oss-120b` use a combination of expert and data
-parallelism, referred to as **Expert × Data parallelism**, illustrated below.
-
-Each GPU has its own transformer weights and key/value cache, independent of the others. Only the
-experts are distributed evenly across devices. The transformer layers can therefore be computed in
-parallel with no coordination, whereas the mixture-of-experts layers require synchronization between
-devices.
+## The parallelism model
 
 ![Expert x Data parallelism](assets/expert-data.png)
 
-For `gpt-oss-120b`, the memory footprint of the weights is substantial, so the expert parallelism
-parameter (EP) is set to 8 — the experts are spread across every GPU in the system.
+Each device owns a contiguous window of experts, `[expert_start, expert_end)`, and a contiguous slice
+of the global batch. Weights that are not experts — embeddings, attention projections, norms, the
+output head — are replicated on every device. `upload_transformer` in
+[`src/getp/transformer.cpp`](../src/getp/transformer.cpp) uploads only the device's own expert window,
+offsetting `w_mlp1`, `w_mlp2` and their biases by `worker->expert_start`, so the expert weights are
+genuinely partitioned rather than replicated and masked.
 
-`gpt-oss-20b` can run on a single AMD MI250 with 64 GB, yet EP is still set to 2. The reason is not
-capacity but headroom: expert parallelism reduces the memory taken by the model weights, which leaves
-more room for a larger batch size, which is what actually raises throughput.
+The consequence is a clean division of labour inside a decoder layer. Attention is data-parallel: the
+device sees only its own `BATCH_SIZE` rows and never talks to anyone. The MoE block is expert-parallel:
+a token routed to expert 97 must be computed by whichever device owns expert 97, so the activations
+have to travel there and the results have to travel back.
 
-The number of GPUs is detected at runtime with `hipGetDeviceCount`, with a compile-time ceiling of 8
-(`MAXIMUM_GPU` in [`include/transformer.hpp`](../include/transformer.hpp)). To run on a subset, set
-`HIP_VISIBLE_DEVICES`.
+The shape is set in `warm_up` in [`src/getp/run.cpp`](../src/getp/run.cpp), from the expert count
+rather than from a command-line flag:
 
-## Communication
+```c
+if (p->n_experts == 128) {
+  // 120b model
+  EXPERT_PARALLELISM = n_devices;
+  BATCH_SIZE = 768;
+}
+else {
+  // 20b model
+  EXPERT_PARALLELISM = 2;
+  BATCH_SIZE = 1536;
+}
+```
 
-Expert parallelism needs two collective operations: **all-gather** and **reduce-scatter**. Both are
-implemented with peer-to-peer (P2P) communication, and the send and fetch operations are built solely
-from `hipMemcpyPeerAsync`. No RCCL, no MPI.
+| | `gpt-oss-20b` | `gpt-oss-120b` |
+| --- | --- | --- |
+| Experts in the model | 32 | 128 |
+| Decoder layers | 24 | 36 |
+| `EXPERT_PARALLELISM` (EP) | 2 | 8 (`n_devices`) |
+| `BATCH_SIZE` per device | 1536 | 768 |
+| Experts per device | 16 | 16 |
+| Replicas on an 8-GPU node | 4 | 1 |
+| Tokens in flight per replica | 3072 | 6144 |
+| Tokens in flight per node | 12288 | 6144 |
 
-The abstraction of the two collectives is illustrated below — all-gather on the left, reduce-scatter on
-the right.
+`hidden_dim` is 2880 and `experts_per_token` is 4 in both models
+([`tools/model_export/gpt-oss-20b/config.json`](../tools/model_export/gpt-oss-20b/config.json),
+[`tools/model_export/gpt-oss-120b/config.json`](../tools/model_export/gpt-oss-120b/config.json)).
+
+Note the coincidence in the middle of that table: both configurations land on exactly 16 experts per
+device. It falls out of 32/2 and 128/8, but it is a useful one — the bucketed MoE kernel described in
+[KERNELS.md](KERNELS.md) sees the same number of expert buckets in both models, so it is tuned once.
+
+## Why EP = 2 when 20B's weights fit on one GPU
+
+An MI250 die has 64 GB. `gpt-oss-20b` is 20,914,757,184 parameters as the loader lays them out, and
+this engine keeps them resident in bf16 — nothing stays quantised — so the weights are
+20,914,757,184 × 2 B = **41.8 GB**. They do fit on a single die, with about 22 GB to spare. (The
+13 GB figure that circulates for this model is the size of the original MXFP4 checkpoint on disk, not
+of what this engine puts in HBM; see the size table in [MODEL.md](MODEL.md).) So EP = 1 would load,
+and it would remove the collectives entirely. It is still not chosen, and there are two reasons, not
+one.
+
+The first is capacity, via the KV cache rather than the weights. At `seq_len` 1024 one batch row costs
+15.7 MB of cache across the 24 layers, and at 2048 it costs 28.3 MB (the KV table in
+[SERVING.md](SERVING.md) derives both). The ~22 GB that EP = 1 leaves free is about 1400 rows at 1024
+and about 780 at 2048 — under the 1536 the engine actually runs, and that is before the MoE pair
+buffers (`z_partial`, `a_in` and `gate_up_bf16`, ~142 MB at 1536 rows) and the per-row activation
+state. The EP staging buffers below are not part of that bill: `ext_alloc_device` skips them
+entirely when `expert_parallelism == 1`. EP = 1 is not merely slower at the shipped
+`BATCH_SIZE`; it does not fit.
+
+The second is throughput, which is what the freed memory is spent on. EP = 2 halves the expert shard
+and takes resident weights from 41.8 GB to 22.7 GB — 3.60 GB dense plus 19.12 GB for 16 of the 32
+experts — roughly doubling what is available to the cache, and that is what lets `BATCH_SIZE` be 1536.
+Throughput on this workload is dominated by how many rows the GEMMs see: the MoE MLPs are
+memory-bound at small M, because each expert weight matrix is read from HBM once regardless of how
+many tokens it serves. Doubling the tokens per expert roughly doubles the arithmetic done per byte of
+weight fetched. The collectives are the price paid for that, and on 20B they are cheap — a single
+peer, 26.6 MB per layer, over 24 layers.
+
+Put plainly: EP = 2 buys headroom and spends it on batch size. Neither reason forces it alone, and the
+size of the effect is worth pinning down. At EP = 2 a replica holds 3072 tokens, and with
+`experts_per_token` = 4 over 32 experts that is 12288/32 = **384 rows per expert GEMM**. A `BATCH_SIZE`
+of 1024 — a round number inside the ~1400 rows that do fit at EP = 1 — gives 4096/32 = **128 rows** — three times thinner, against the
+same weight fetch, in exchange for removing the P2P traffic entirely. The repository contains no
+measurement of that trade, so read this as the project's judgement rather than as a demonstrated
+optimum.
+
+On `gpt-oss-120b` the argument is shorter and admits no trade. 116,829,156,672 parameters in bf16 is
+116,829,156,672 × 2 B = **233.7 GB**, so a single 64 GB device cannot hold the weights at any batch
+size, and EP = 8 is forced; with the experts split eight ways and the dense weights still replicated,
+resident weights come to 32.9 GB per device. The
+120B path also drops `BATCH_SIZE` to 768, because the staging buffers are sized
+`EP × BATCH_SIZE × hidden_dim` ([`src/getp/state_ext.cpp`](../src/getp/state_ext.cpp)) and so grow
+linearly with EP. At EP = 8 that is 6144 tokens in flight per replica with a per-device activation
+footprint that stays bounded; at 1536 rows per device the same buffers would be twice the size —
+~496 MB instead of the ~248 MB tabulated below, not four times, since only `BATCH_SIZE` changes.
+
+With EP fixed, the node layout follows. `n_parallel_models = n_devices / EXPERT_PARALLELISM`
+([`src/getp/run.cpp`](../src/getp/run.cpp)), so an 8-GPU node runs one 8-way replica for 120B and four
+independent 2-way replicas for 20B. Replicas never communicate; each gets its own `Barrier` and its own
+EP host threads, pinned to cores with `sched_setaffinity`. `inference` dispatches on
+`EXPERT_PARALLELISM == 8` to choose the 120B path.
+
+That dispatch is a trap on any node that is not exactly eight GPUs, and it is worth spelling out
+because the test is on EP and not on the model. The 120B branch sets `EXPERT_PARALLELISM = n_devices`,
+so on a 4-GPU node a 120B run gets EP = 4, fails the `== 8` test at
+[`src/getp/run.cpp:524`](../src/getp/run.cpp), and is handled by `Model_20b::distribute_requests` with
+the 120B `BATCH_SIZE` of 768 still in force. The two are not interchangeable:
+
+- `Model_120b::distribute_requests` loops over the request list in chunks,
+  `for (idx = 0; idx < requests_per_model; idx += EXPERT_PARALLELISM * BATCH_SIZE)`, so it accepts any
+  multiple of `EP × BATCH_SIZE` and drains it batch by batch.
+- `Model_20b::distribute_requests` has no such loop. It asserts
+  `requests_per_model == EXPERT_PARALLELISM * BATCH_SIZE` outright
+  ([`src/getp/run.cpp:268-269`](../src/getp/run.cpp)) and runs exactly one batch per replica.
+
+So a 120B run on 4 GPUs does not crash in the kernels — both paths call `getp_forward_120b`, and with
+`n_parallel_models = 1` the thread layout comes out the same — but it silently loses the chunking
+loop, and the request count stops being "any multiple of `n_devices × 768`" and becomes exactly
+`n_devices × 768`. Going the other way is worse: EP above 8 overruns `events_e_agg[MAXIMUM_GPU]` in
+`getp_forward_120b` ([`src/hip/forward.hip:3545`](../src/hip/forward.hip)), which is a fixed array of 8.
+A 16-GPU node therefore cannot run 120B at all without changing `MAXIMUM_GPU`.
+
+The request-count rule that follows is the first thing a new reader trips on, so state it directly.
+`requests_per_model` is `num_reqs / n_parallel_models`, and for 20B the assert demands it equal
+`EP × BATCH_SIZE` = 3072 exactly, with `n_parallel_models = n_devices / 2`. The total request count
+must therefore be exactly `n_devices × 1536` — **12288 on an 8-GPU node**, and nothing else. For 120B
+on eight GPUs the chunking loop relaxes this to any multiple of `8 × 768` = **6144**, enforced by the
+weaker `% (EXPERT_PARALLELISM * BATCH_SIZE) == 0` assert in `inference`; off eight GPUs, as above, it
+tightens back to exactly `n_devices × 768`. No input file in the tree satisfies any of these:
+`tests/input.txt` declares 4096 requests and the four under `tests/data/` declare 32, 256, 448 and
+3584, so pointing `-m getp` at any of them aborts at
+[`src/getp/run.cpp:268`](../src/getp/run.cpp) before a single token is generated. Build a
+correctly-sized file instead — `./run.sh mkinput 20b 8 input_20b.txt` emits the 12288 requests the
+8-GPU 20B path demands, and `mkinput 20b 2` the 3072 for a two-GPU run.
+
+## Where the collectives actually live
+
+[`src/getp/collectives.cpp`](../src/getp/collectives.cpp) looks like the answer and is not. It provides
+`cgBroadcastF32`, `cgAllReduceSumF32`, `cgReduceSumF32`, `cgAllReduceArgmaxF32I32` and
+`cgAllToAllvSlicesF32`, and `warm_up` does build a group for them — `cgCreate(g_world, devices)` — but
+nothing in the tree calls any of them. The only internal call is `cgAllReduceSumF32` tail-calling
+`cgBroadcastF32`. [`src/hip/forward.hip`](../src/hip/forward.hip) declares
+`extern CollectiveGroup g_world;` and never mentions it again. What `cgCreate` contributes to a run is
+one non-blocking stream per device, created and later destroyed with no work ever enqueued on it.
+
+The communication the model performs is written inline in `getp_forward_120b`
+([`src/hip/forward.hip`](../src/hip/forward.hip), from line 3516), which is the forward function used by
+**both** models — `getp_forward_20b` exists at line 3833 and is dead, and both `coop_getp_generate`
+bodies call the 120B entry point. So the collectives are exactly as advertised in shape — all-gather and
+reduce-scatter, built solely from `hipMemcpyPeerAsync` — but they live in the MoE section of the decoder
+loop, not behind the `cg*` API.
+
+If you are reading this page in order to modify the communication, ignore `collectives.cpp` and go to
+the MoE block of `getp_forward_120b`.
 
 ![collective communication](assets/collective-communication.png)
 
-### Ordering matters
+## Phase one: the all-gather
 
-To exploit the full-duplex capability of PCIe, the order in which each device issues its sends and
-fetches has to be considered carefully. For all-gather, the ordering below works. The key idea is that
-under ideal conditions, each device is sending to and receiving from exactly one other device at any
-moment.
+The all-gather publishes what the router decided. Every rank needs the activations and top-k decisions
+for the *entire* EP-wide batch, because any of those `EP × BATCH_SIZE` tokens may have chosen an expert
+this rank owns.
+
+The staging buffers `ext_t`, `ext_t_bf16`, `ext_topk_i/v`, `ext_e_agg` and `peer_e_agg` are all sized
+`EP × BATCH_SIZE × …` in [`src/getp/state_ext.cpp`](../src/getp/state_ext.cpp), and each rank writes
+into its own slice, indexed by `(device_index - base_device_index)`.
+
+After the FFN RMSNorm the rank records `event_rmsnorm` on the compute stream, has the memory stream wait
+on it, casts its own slice to bf16 on the memory stream, and then pushes that slice into the identical
+offset of every peer's buffer:
+
+```c
+for (int delta = 1; delta < EXPERT_PARALLELISM; ++delta) {
+  int i = (device_index + delta) % EXPERT_PARALLELISM;
+  GPUWorker *peer_worker = &workers[i];
+  int peer_device_index = peer_worker->device_index;
+  RunStateExt *peer_ext = ext_get(peer_device_index);
+  if (peer_device_index != device_index) {
+    HIP_CHECK(hipMemcpyPeerAsync(
+        peer_ext->ext_t_bf16 + (size_t)(device_index - base_device_index) * BATCH_SIZE * hidden_dim,
+        peer_device_index,
+        ext->ext_t_bf16 + (size_t)(device_index - base_device_index) * BATCH_SIZE * hidden_dim,
+        device_index,
+        sizeof(__hip_bfloat16) * (size_t)BATCH_SIZE * (size_t)hidden_dim,
+        memory_stream));
+  }
+}
+```
+
+A second loop with the same structure, gated on `event_router_topk`, pushes `ext_topk_i` and
+`ext_topk_v` — the chosen expert ids and their weights. Those are small, 4 values per token, but they
+must arrive before the receiving rank can decide which tokens are its business.
+
+The activations are sent as **bf16**, not fp32. The tensor is produced in fp32 by the RMSNorm and cast
+on the memory stream immediately before the copies, which halves the wire cost of the outbound phase at
+no accuracy cost the MoE MLPs would notice — they consume bf16 anyway.
+
+Once the gather completes, `getp_map_global_to_local_batch` filters all `EP × BATCH_SIZE` tokens down to
+the ones this rank can serve, keeping `eg >= expert_start && eg < expert_end` and rebasing the id to
+`eg - expert_start`. One bucketed MLP then runs over whatever survived.
+
+## Phase two: the reduce-scatter
+
+The return path is a **fetch**, not a push, and the asymmetry is deliberate.
+
+`moe_gather_pairs` accumulates the rank's partial expert outputs into `ext_e_agg` for all
+`EP × BATCH_SIZE` tokens (`e_agg[...] += s`). Every rank therefore holds a partial sum for every token
+in the replica — partial, because it only ran the experts it owns. The rank adds its own slice into its
+residual locally, then pulls from each peer the part of that peer's `ext_e_agg` belonging to *its own*
+slice:
+
+```c
+for (int delta = 1, j = 0; delta < EXPERT_PARALLELISM; ++delta) {
+  int i = (device_index + delta) % EXPERT_PARALLELISM;
+  GPUWorker *peer_worker = &workers[i];
+  int peer_device_index = peer_worker->device_index;
+  RunStateExt *peer_ext = ext_get(peer_device_index);
+  if (peer_device_index != device_index) {
+    HIP_CHECK(hipMemcpyPeerAsync(
+        ext->peer_e_agg + (size_t)j * BATCH_SIZE * hidden_dim, device_index,
+        peer_ext->ext_e_agg + (size_t)(device_index - base_device_index) * BATCH_SIZE * hidden_dim,
+        peer_device_index,
+        sizeof(float) * BATCH_SIZE * hidden_dim, memory_stream));
+    HIP_CHECK(hipEventRecord(events_e_agg[j], memory_stream));
+    ++j;
+  }
+}
+```
+
+Summed over ranks, scattered over token slices: reduce-scatter.
+
+The inbound partial sums stay **fp32**. They are sums of expert outputs that will be added into the
+residual, and rounding each peer's partial to bf16 before summing would accumulate error across up to
+eight contributions. The bandwidth cost is accepted instead. Per token slice the return path therefore
+moves twice the bytes of the forward path — 8.44 MiB against 4.22 MiB per peer on 120B.
+
+The adds are overlapped with the transfers rather than waiting for all of them:
+
+```c
+for (int delta = 1, j = 0; delta < EXPERT_PARALLELISM; ++delta) {
+  int i = (device_index + delta) % EXPERT_PARALLELISM;
+  GPUWorker *peer_worker = &workers[i];
+  int peer_device_index = peer_worker->device_index;
+  if (peer_device_index != device_index) {
+    HIP_CHECK(hipStreamWaitEvent(compute_stream, events_e_agg[j]));
+    getp_vecadd(dev_x,
+                ext->peer_e_agg + (size_t)j * BATCH_SIZE * hidden_dim,
+                hidden_dim, BATCH_SIZE, compute_stream);
+    ++j;
+  }
+}
+```
+
+Each fetch records its own event; the compute stream waits on event *j* immediately before the *j*-th
+`getp_vecadd`. The first peer's contribution is being added while the later transfers — in order on the
+same memory stream — are still in flight. That is why this phase does not end with a
+`hipStreamSynchronize` on the memory stream the way phase one does.
+
+## Ordering: the delta rotation
+
+All four copy loops iterate the same way:
 
 ```c
 int i; // index of the device being managed
@@ -57,9 +288,16 @@ for (int delta = 1; delta < N_DEVICES; ++delta) {
 
 ![all gather](assets/all-gather.png)
 
-Incorrect ordering prevents full utilization of the PCIe full-duplex capability. The loop below is the
-obvious way to write it, and it is the wrong one — every device targets device 0 first, then device 1,
-and so on, so the transfers serialize instead of pairing up.
+The copies of one phase are all issued on the same per-device `memory_stream`, created with
+`hipStreamNonBlocking` in [`src/getp/transformer.cpp`](../src/getp/transformer.cpp), so they execute in
+issue order. That is what makes the ordering meaningful rather than cosmetic.
+
+At step `delta`, rank *i* is pushing to rank *(i+delta) mod N* while being pushed to by rank
+*(i−delta) mod N*. One outbound and one inbound transfer per rank: a perfect matching on the peer graph
+at every step, so every link carries traffic in both directions at once. PCIe is full duplex, and this
+is the pattern that uses both halves of it.
+
+The obvious loop does not:
 
 ```c
 int i; // index of the device being managed
@@ -73,3 +311,162 @@ for (int j = 0; j < N_DEVICES; ++j) {
 ```
 
 ![incorrect all gather](assets/incorrect-all-gather.png)
+
+Here every rank targets device 0 at step 0, then device 1, and so on. One node's inbound link takes
+N−1 transfers while its own outbound link sits idle. The phase stretches to roughly N−1 serialized
+transfers instead of N−1 concurrent ones. On 120B that is the difference between 7 rounds and something
+closer to 7 × 7.
+
+The fetch loop in phase two inverts the roles — rank *i* reads *from* *(i+delta)* — and the matching
+argument is unchanged: at each step every rank is the source for exactly one peer and the destination of
+exactly one transfer.
+
+This rationale is the project's own reasoning. The source contains no A/B measurement of the two
+orderings, so read the figures as an argument about link occupancy, not as reported numbers.
+
+One indexing subtlety is worth recording, because it is easy to break. `workers[i]` is indexed with the
+*group-relative* index while `device_index` is absolute. This is only correct because `warm_up` lays
+groups out at multiples of EP, and `distribute_requests` passes the forward function the replica base
+pointer `workers + EXPERT_PARALLELISM * model_idx`, so `base_device_index` is a multiple of EP and
+`device_index ≡ local_rank (mod EP)`. For 20B, replica 1 owns devices 2 and 3, and `(2+1)%2 = 1`
+resolves to `workers[1]`, which is device 3. Break that alignment and the rotation silently targets the
+wrong peer.
+
+## What it costs
+
+Per device, per decoder layer, with `hidden_dim` = 2880 and `experts_per_token` = 4.
+
+**`gpt-oss-120b`** — EP = 8, `BATCH_SIZE` = 768, 7 peers:
+
+| Direction | Buffer | Type | Bytes per peer | Bytes per layer |
+| --- | --- | --- | ---: | ---: |
+| Out (all-gather) | `ext_t_bf16` slice | bf16 | 4,423,680 | 30,965,760 |
+| Out (all-gather) | `ext_topk_i` + `ext_topk_v` | int32 + fp32 | 24,576 | 172,032 |
+| In (reduce-scatter) | `ext_e_agg` slice | fp32 | 8,847,360 | 61,931,520 |
+| **Total** | | | | **93,069,312** |
+
+**`gpt-oss-20b`** — EP = 2, `BATCH_SIZE` = 1536, 1 peer:
+
+| Direction | Buffer | Type | Bytes per layer |
+| --- | --- | --- | ---: |
+| Out (all-gather) | `ext_t_bf16` slice | bf16 | 8,847,360 |
+| Out (all-gather) | `ext_topk_i` + `ext_topk_v` | int32 + fp32 | 49,152 |
+| In (reduce-scatter) | `ext_e_agg` slice | fp32 | 17,694,720 |
+| **Total** | | | **26,591,232** |
+
+Over a full decode step:
+
+| | `gpt-oss-20b` | `gpt-oss-120b` |
+| --- | ---: | ---: |
+| Layers | 24 | 36 |
+| P2P bytes per device per decode step | ≈ 638 MB | ≈ 3.35 GB |
+| `hipMemcpyPeerAsync` calls per device per layer, 4 × (EP−1) | 4 | 28 |
+| Global barriers per decode step, 2 per layer + 1 | 49 | 73 |
+
+Counting the whole phase, inbound is a shade under twice outbound rather than exactly twice, because the
+outbound side also carries the two top-k arrays: 61,931,520 B in against 31,137,792 B out per layer on
+120B.
+
+These numbers are the argument for both the delta rotation and the bf16 cast. 3.35 GB of P2P traffic per
+device per token step is not something to leave half-duplex.
+
+Staging memory is the other cost. Every EP buffer is sized `EP × BATCH_SIZE × hidden_dim`, so on 120B:
+
+| Buffer | Type | Size |
+| --- | --- | ---: |
+| `ext_t` | fp32 | 70.8 MB |
+| `ext_t_bf16` | bf16 | 35.4 MB |
+| `ext_e_agg` | fp32 | 70.8 MB |
+| `peer_e_agg` | fp32 | 70.8 MB |
+| **Total** | | **≈ 248 MB** |
+
+`peer_e_agg` is over-allocated: it gets EP slots and only ever uses EP−1, so about 8.8 MB of its 70.8 MB
+is never touched on 120B.
+
+## Synchronisation and completion
+
+Completion is signalled on the host, not with device-side flags. There are two barriers per layer.
+
+Phase one ends with `hipStreamSynchronize(memory_stream)` — the sender blocks until its own pushes have
+landed — followed by `sync_workers`:
+
+```c
+inline void sync_workers(hipStream_t stream, Barrier &sync_point) {
+  HIP_CHECK(hipStreamSynchronize(stream));
+  sync_point.wait();
+}
+```
+
+`Barrier` in [`include/barrier.hpp`](../include/barrier.hpp) is a two-phase atomic counter with
+`std::this_thread::yield()` in the spin loop, across the EP host threads of one replica. A second
+`sync_workers` sits between `moe_gather_pairs` and the reduce-scatter fetches, so no rank reads a peer's
+`ext_e_agg` before that peer has finished writing it. A third barrier, `sync_point.wait()` in
+`coop_getp_generate`, runs once per generate step, to agree on whether every request in the replica has
+finished.
+
+The `hipMemsetAsync` that re-zeros `ext_e_agg` for the next layer is issued on the memory stream and
+gated into the compute stream by `event_memset`. It is safe against peers still reading the previous
+layer's `ext_e_agg` only because it sits after the phase-one barrier, and every rank reaches that
+barrier only after its own `hipStreamSynchronize(memory_stream)` has drained the previous layer's
+fetches from that same memory stream. That is a real dependency chain, not a coincidence — moving the
+memset earlier would introduce a race.
+
+Four streams are created per device (`memory`, `compute`, `h2d`, `d2h`), all `hipStreamNonBlocking`.
+Only `memory` and `compute` are used by the EP path.
+
+## Sharp edges
+
+A few things in this area are worth knowing before changing it.
+
+**Peer access is never enabled.** `enable_p2p_allpairs` in
+[`src/getp/collectives.cpp`](../src/getp/collectives.cpp) is `static` and has no caller anywhere in the
+tree; `cgCreate` does not invoke it, and there is no other `hipDeviceEnablePeerAccess` or
+`hipDeviceCanAccessPeer` in the repository. Whether the P2P copies take a direct device-to-device link
+or a staged fallback is therefore left entirely to HIP. There is no probe, no fallback path and no
+comment on the matter, so nothing in this repository settles it.
+
+**The whole program is one translation unit.** This is not a stylistic detail; several things on this
+page only make sense once you know it. [`src/run.cpp`](../src/run.cpp) `#include`s *source* files, not
+just headers: line 1119 pulls in `getp/run.cpp`, which in turn includes `collectives.cpp`, `eval.cpp`,
+`state_ext.cpp`, `transformer.cpp` and finally `hip/forward.hip`. There is one compiland. That is why
+`int EXPERT_PARALLELISM = 8;` at [`include/transformer.hpp:8`](../include/transformer.hpp) links at
+all — it is a *definition* sitting in a header, which would be a duplicate-symbol error the moment a
+second `.cpp` was compiled separately and linked in. It is also what settles the `HIP_CHECK` question
+below: include order within that single unit decides which macro definition survives. Adding a real
+second translation unit to this project breaks both.
+
+**`HIP_CHECK` aborts here.** Three definitions of `HIP_CHECK` exist. The one in effect inside
+`forward.hip` is [`include/collectives.hpp`](../include/collectives.hpp)'s, which prints and calls
+`abort()`; the non-aborting `#ifndef`-guarded fallbacks in `state_ext.cpp` and `transformer.cpp` lose
+because `run.cpp` includes `collectives.cpp` first. Since `hipMemcpyPeerAsync` is asynchronous, only an
+enqueue-time error aborts at the call site — a transfer that fails in flight surfaces at the next
+synchronising `HIP_CHECK`.
+
+**Events are created per forward call and never destroyed.** `getp_forward_120b` creates `3 + EP`
+events — 11 on 120B, 5 on 20B — and there is no `hipEventDestroy` anywhere in the tree. The loop also
+creates EP events into `events_e_agg` while only EP−1 are ever used. `MAXIMUM_GPU` (8) in
+[`include/transformer.hpp`](../include/transformer.hpp) exists solely as the bound on that array, so it
+is the real ceiling on EP.
+
+**The dead code is a trap for readers.** `allreduce_tmp` is allocated at `2 × BATCH_SIZE × hidden_dim`
+floats — 17.7 MB on 120B, 35.4 MB on 20B — as scratch for `cgAllReduceSumF32`, which is never called. It
+would only be large enough for P ≤ 3 ranks in any case. Likewise the one `__global__` kernel in
+`collectives.cpp`, `add_inplace_f32` (256 threads per block), is never *reached*. Grepping for it finds
+two `hipLaunchKernelGGL` sites, at `collectives.cpp:116` and `collectives.cpp:178`, so it is not
+unlaunched in the textual sense; both sites are inside `cgAllReduceSumF32` and `cgReduceSumF32`, and
+neither of those has a caller. The real cross-device addition is `getp_vecadd` on the compute stream.
+
+## Where to look in the code
+
+| Concept | File |
+| --- | --- |
+| EP and `BATCH_SIZE` selection, replica layout, host threads | [`src/getp/run.cpp`](../src/getp/run.cpp) |
+| The all-gather, the reduce-scatter, the delta rotation, events | [`src/hip/forward.hip`](../src/hip/forward.hip) — `getp_forward_120b`, from line 3516 |
+| Global-to-local expert filtering, `moe_gather_pairs`, `getp_vecadd` | [`src/hip/forward.hip`](../src/hip/forward.hip) |
+| EP staging buffers (`ext_t`, `ext_t_bf16`, `ext_e_agg`, `peer_e_agg`) | [`src/getp/state_ext.cpp`](../src/getp/state_ext.cpp) |
+| Expert-window weight upload, stream creation | [`src/getp/transformer.cpp`](../src/getp/transformer.cpp) |
+| Host-side barrier used by `sync_workers` | [`include/barrier.hpp`](../include/barrier.hpp) |
+| `MAXIMUM_GPU`, and the `EXPERT_PARALLELISM` *definition* in a header | [`include/transformer.hpp`](../include/transformer.hpp) |
+| Single-translation-unit include chain (`.cpp` files included, not linked) | [`src/run.cpp`](../src/run.cpp) line 1119 → [`src/getp/run.cpp`](../src/getp/run.cpp) → [`src/hip/forward.hip`](../src/hip/forward.hip) |
+| Unused `cg*` collective library, aborting `HIP_CHECK` | [`src/getp/collectives.cpp`](../src/getp/collectives.cpp), [`include/collectives.hpp`](../include/collectives.hpp) |
+| Model dimensions (`hidden_size`, `num_experts`, layer counts) | [`tools/model_export/`](../tools/model_export/) |
