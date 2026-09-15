@@ -1,17 +1,22 @@
 # Use hipcc by default.
 # If hipcc isn't available, fall back to g++.
 CC := $(shell command -v hipcc 2>/dev/null || echo g++)
-CFLAGS = --std=c++17 -lm
+
+# Headers live in include/, and src/ is the root for cross-directory includes
+# such as "getp/run.cpp" and "hip/forward.hip".
+INCLUDES = -Iinclude -Isrc
+
+CFLAGS = --std=c++17 -lm $(INCLUDES)
 ifneq ($(CC),g++)
 CFLAGS += --offload-arch=gfx90a
 endif
 
-CPP_FILES = run.cpp tokenizer.cpp
+CPP_FILES = src/run.cpp src/tokenizer.cpp
 
 # Basic build that should work on most systems.
 .PHONY: run
 run: $(CPP_FILES) tokenizer-bin
-	$(CC) -g -O0 -o run $(CPP_FILES)
+	$(CC) $(INCLUDES) -g -O0 -o run $(CPP_FILES)
 
 # Debug build; suitable for tools like Valgrind. Example:
 #   valgrind --leak-check=full ./run out/model.bin -n 3
@@ -33,18 +38,18 @@ runomp: $(CPP_FILES) tokenizer-bin
 
 # Build the 'decode' utility.
 .PHONY: decode
-decode: decode.cpp tokenizer.cpp tokenizer-bin
-	$(CC) $(CFLAGS) -O3 decode.cpp tokenizer.cpp -o decode
+decode: src/decode.cpp src/tokenizer.cpp tokenizer-bin
+	$(CC) $(CFLAGS) -O3 src/decode.cpp src/tokenizer.cpp -o decode
 
 # Generate tokenizer.bin using the Python exporter.
 .PHONY: tokenizer-bin
-tokenizer-bin: export_tokenizer_bin.py
-	python3 export_tokenizer_bin.py -o tokenizer.bin
+tokenizer-bin: tools/export_tokenizer_bin.py
+	python3 tools/export_tokenizer_bin.py -o tokenizer.bin
 
 # Build the tokenizer test binary (defines TESTING).
 .PHONY: tokenizer-test
-tokenizer-test: test_tokenizer.cpp tokenizer.cpp tokenizer-bin
-	$(CC) $(CFLAGS) -DTESTING -O3 test_tokenizer.cpp tokenizer.cpp -o test_tokenizer
+tokenizer-test: tests/test_tokenizer.cpp src/tokenizer.cpp tokenizer-bin
+	$(CC) $(CFLAGS) -DTESTING -O3 tests/test_tokenizer.cpp src/tokenizer.cpp -o test_tokenizer
 
 # Remove build artifacts.
 .PHONY: clean

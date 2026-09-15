@@ -1,5 +1,5 @@
 #include "collectives.hpp"
-#include "getp_state_ext.hpp"
+#include "state_ext.hpp"
 #include <algorithm>
 #include <cstdio>
 

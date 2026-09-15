@@ -7,10 +7,10 @@
 #include <iostream>
 
 #include "collectives.hpp"
-#include "getp_barrier.hpp"
-#include "getp_state_ext.hpp"
-#include "getp_transformer.cpp"
-#include "getp_transformer.hpp"
+#include "barrier.hpp"
+#include "state_ext.hpp"
+#include "getp/transformer.cpp"
+#include "transformer.hpp"
 
 #ifndef GETP_ROUTER_TOPK_MAXK
 #define GETP_ROUTER_TOPK_MAXK 4

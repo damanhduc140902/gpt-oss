@@ -1,5 +1,5 @@
 #pragma once
-#include "getp_transformer.hpp"
+#include "transformer.hpp"
 
 #include <cassert>
 #include <hip/hip_runtime.h>
@@ -8,7 +8,7 @@
 #include <cstring>
 #include <iostream>
 
-#include "getp_eval.cpp"
+#include "eval.cpp"
 
 #ifndef HIP_CHECK
 #define HIP_CHECK(expression)                                                  \

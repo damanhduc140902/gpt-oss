@@ -4,11 +4,11 @@
 #include <vector>
 
 #include "collectives.cpp"
-#include "getp_eval.cpp"
-#include "getp_state_ext.cpp"
-#include "getp_transformer.cpp"
-#include "getp_transformer.hpp"
-#include "getp_barrier.hpp"
+#include "eval.cpp"
+#include "state_ext.cpp"
+#include "transformer.cpp"
+#include "transformer.hpp"
+#include "barrier.hpp"
 #include <cstddef>
 #include <cstdio>
 #include <cstdlib>
@@ -27,7 +27,7 @@ DeviceTransformer **dev_transformers;
 GPUWorker *workers;
 int BATCH_SIZE = 0;
 
-#include "getp_forward.cpp"
+#include "hip/forward.hip"
 
 void warm_up(Transformer *transformer, Tokenizer *tokenizer) {
   // Do not inference here

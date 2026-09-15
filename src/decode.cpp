@@ -19,7 +19,7 @@ void error_usage() {
 
 int main(int argc, char **argv) {
   int line_to_decode;
-  std::string input_path = "data/output.txt";
+  std::string input_path = "tests/data/output.txt";
   std::string tokenizer_path = "tokenizer.bin";
   const int vocab_size = 201088;
 
