@@ -14,7 +14,17 @@ Evaluate generated completions against references using **METEOR** and **BERTSco
 > python -c "import nltk; [nltk.download(x) for x in ['punkt','wordnet','omw-1.4']]"
 > ```
 
-## Quick start (SLURM)
+## Quick start
+
+From the repository root:
+
+```bash
+./run.sh eval 20b     # or: ./run.sh eval 120b
+```
+
+The rest of this page runs `eval.py` directly, from inside `tests/`.
+
+### SLURM
 
 Evaluate the **20B** model outputs on 2 GPUs:
 
@@ -43,7 +53,7 @@ srun --gres=gpu:2 python eval.py -m 120b
 
 Run `python eval.py -h` for the full help text. See the docstring in `eval.py` for details on defaults and behavior.
 
-> If `threshold.json` is present in the evaluation folder, the script reads target thresholds for METEOR and BERTScore F1 and **raises an `AssertionError`** if either metric is below its threshold.
+> If `threshold.json` is present in the `tests/` folder, the script reads target thresholds for METEOR and BERTScore F1 and **raises an `AssertionError`** if either metric is below its threshold.
 
 ## Sample output (truncated)
 
@@ -91,5 +101,7 @@ bertscore_f1    0.96955
 - **GPU vs CPU:** If logs show CPU, performance will be much slower. Verify:
 
   ```bash
-  ROCm, ensure `torch.version.hip` is not `None`.
+  python -c "import torch; print(torch.version.hip, torch.cuda.device_count())"
   ```
+
+  On ROCm, `torch.version.hip` must not be `None`.
