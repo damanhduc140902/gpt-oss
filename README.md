@@ -26,7 +26,7 @@ hipBLAS, no RCCL, no MPI. Every kernel, every collective and the tokenizer are w
 this repository. The only dependency is the HIP runtime itself.
 
 It began from [llama2.c](https://github.com/karpathy/llama2.c) and grew into a complete inference system.
-On a single node of 8 AMD MI250 GPUs it serves **33,891 tokens per second on the 20B model and 13,010 on
+On a single node of 8 AMD MI250 GPUs it serves **33,979 tokens per second on the 20B model and 13,149 on
 the 120B model**, while keeping the generated text faithful to a CPU reference.
 
 <picture>
@@ -211,18 +211,27 @@ recommended; see [`tests/README.md`](tests/README.md).
 
 <picture>
   <source media="(prefers-color-scheme: dark)" srcset="docs/assets/throughput-dark.svg">
-  <img alt="Measured throughput: 33,891 tokens per second on gpt-oss-20b and 13,010 on gpt-oss-120b, both clearing the METEOR and BERTScore gates" src="docs/assets/throughput-light.svg" width="100%">
+  <img alt="Measured throughput: 33,979 tokens per second on gpt-oss-20b and 13,149 on gpt-oss-120b, both clearing the METEOR and BERTScore gates" src="docs/assets/throughput-light.svg" width="100%">
 </picture>
 
 Measured on one node of 8× AMD MI250 in batch (`getp`) mode.
 
-| Model | Requests | Warm-up (s) | Throughput (TPS) | METEOR | BERTScore |
-| --- | ---: | ---: | ---: | ---: | ---: |
-| `gpt-oss-20b` | 12288 | 180 | **33891** | 0.53 | 0.97 |
-| `gpt-oss-120b` | 6144 | 390 | **13010** | 0.56 | 0.98 |
+| Model | Requests | Warm-up (s) | Inference (s) | Throughput (TPS) | METEOR | BERTScore |
+| --- | ---: | ---: | ---: | ---: | ---: | ---: |
+| `gpt-oss-20b` | 12288 | 111 | 360 | **33979** | 0.533 | 0.978 |
+| `gpt-oss-120b` | 6144 | 273 | 463 | **13149** | 0.567 | 0.982 |
 
-These are aggregate throughput over all eight GPUs, not single-stream latency. METEOR has to clear 0.3
-and BERTScore 0.9; both models pass with room to spare, so the speed was not bought with degraded output.
+Throughput is aggregate across all eight GPUs, not single-stream latency. The quality gates are METEOR
+0.3 and BERTScore 0.9; both models clear them several times over, so the speed was not bought with
+degraded output.
+
+Every figure in that table comes from one run each, and the completions those scores were computed
+from are committed in [`tests/submission/`](tests/submission/) — so the numbers can be checked without
+a GPU, by scoring the files in the repository. `./run.sh eval 20b` reproduces the last two columns.
+
+Repeating a run moves throughput by well under a percent. The engine is not bit-deterministic with
+respect to batch position — the same prompt at a different index takes a different path through the
+expert grouping — so completions, and therefore the quality scores, shift slightly between runs.
 
 ---
 

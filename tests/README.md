@@ -111,12 +111,12 @@ are expected -- see the note on batch-position nondeterminism below.
 ==========
 done.
 items           4096
-meteor          0.404538
-bertscore_f1    0.96955
+meteor          0.567394
+bertscore_f1    0.98164
 ```
 
-> The `120b` figures above are carried over from an earlier run and have not been re-measured, unlike
-> the `20b` ones. Treat them as indicative until someone reproduces them.
+Both models' completions in `submission/` come from runs on 8x AMD MI250, scored over the first 4096
+of 12288 (20B) and 6144 (120B) requests.
 
 **Expected runtime:** \~4 minutes for 4096 samples on 2 GPUs (your hardware and load may vary).
 
