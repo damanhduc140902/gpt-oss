@@ -1,16 +1,13 @@
 <div align="center">
 
-<picture>
-  <source media="(prefers-color-scheme: dark)" srcset="docs/assets/banner-dark.svg">
-  <img alt="gpt-oss on AMD GPUs" src="docs/assets/banner-light.svg" width="100%">
-</picture>
+<img alt="gpt-oss - pure C++ and HIP inference on AMD GPUs" src="docs/assets/banner.svg" width="100%">
 
 <p>
-  <img src="https://img.shields.io/badge/C%2B%2B-17-00599C.svg" alt="C++17">
-  <img src="https://img.shields.io/badge/HIP-ROCm-ED1C24.svg" alt="HIP / ROCm">
-  <img src="https://img.shields.io/badge/GPU-8%C3%97%20AMD%20MI250-F26722.svg" alt="8x AMD MI250">
-  <img src="https://img.shields.io/badge/dependencies-none-success.svg" alt="No external libraries">
-  <img src="https://img.shields.io/github/last-commit/damanhduc140902/gpt-oss?label=commit" alt="Last commit">
+  <img src="https://img.shields.io/badge/C%2B%2B-17-1f2328?style=flat-square&labelColor=0b0b0d" alt="C++17">
+  <img src="https://img.shields.io/badge/HIP-ROCm%206.2-1f2328?style=flat-square&labelColor=0b0b0d" alt="HIP / ROCm 6.2">
+  <img src="https://img.shields.io/badge/GPU-8%C3%97%20AMD%20MI250-1f2328?style=flat-square&labelColor=0b0b0d" alt="8x AMD MI250">
+  <img src="https://img.shields.io/badge/dependencies-none-1f2328?style=flat-square&labelColor=0b0b0d" alt="No external libraries">
+  <img src="https://img.shields.io/github/last-commit/damanhduc140902/gpt-oss?style=flat-square&label=commit&color=1f2328&labelColor=0b0b0d" alt="Last commit">
 </p>
 
 [Overview](#overview) · [Quick Start](#quick-start) · [Results](#results) · [How It Works](#how-it-works) · [Blog](#blog) · [Docs](docs/)

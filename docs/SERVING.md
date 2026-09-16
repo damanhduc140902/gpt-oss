@@ -16,11 +16,6 @@ broken: it takes a `batch_size` parameter and then sizes its KV-cache offsets fr
 [`forward.hip:3891`](../src/hip/forward.hip)), so any call with `batch_size != BATCH_SIZE` would
 read and write the wrong cache rows. Reviving it means fixing that line first.
 
-<picture>
-  <source media="(prefers-color-scheme: dark)" srcset="assets/serving-dark.svg">
-  <img alt="End-to-end path of one getp batch on eight MI250 GCDs: prompts collected into a fixed batch, per-device attention that needs no peer traffic, an all-gather into the fused expert kernel, a ring exchange and reduction of the expert output, then the fused sample-and-decode step — repeated for 24 layers on the 20B model and 36 on the 120B." src="assets/serving-light.svg" width="100%">
-</picture>
-
 ## Intake: an arena, not a queue
 
 `read_inputfile` in [`src/getp/eval.cpp`](../src/getp/eval.cpp) is part of the fixed harness and may

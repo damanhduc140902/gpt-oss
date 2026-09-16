@@ -8,11 +8,6 @@ the forward pass in [`src/hip/forward.hip`](../src/hip/forward.hip). This page c
 chosen, how the two collectives are built, what they cost in bytes, and why the order of the copies
 inside each collective is not arbitrary.
 
-<picture>
-  <source media="(prefers-color-scheme: dark)" srcset="assets/topology-dark.svg">
-  <img alt="Node topology: an 8-GPU node split into replicas, each replica holding a full attention stack and KV cache per device and a disjoint window of experts, with all-gather and reduce-scatter between the devices of a replica" src="assets/topology-light.svg" width="100%">
-</picture>
-
 ## The parallelism model
 
 ![Expert x Data parallelism](assets/expert-data.png)

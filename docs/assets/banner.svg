@@ -1,0 +1,17 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 1200 210" width="1200" height="210" role="img" aria-label="gpt-oss - pure C++ and HIP inference on AMD GPUs">
+  <rect width="1200" height="210" fill="#0B0B0D"/>
+
+  <text x="72" y="112" font-family="ui-monospace, SFMono-Regular, Menlo, Consolas, monospace"
+        font-size="62" font-weight="700" fill="#FFFFFF" letter-spacing="-2">gpt-oss</text>
+
+  <text x="72" y="150" font-family="-apple-system, BlinkMacSystemFont, Segoe UI, Helvetica, Arial, sans-serif"
+        font-size="18" fill="#8B939E">Pure C++ and HIP inference on AMD GPUs. No external libraries.</text>
+
+  <g font-family="ui-monospace, SFMono-Regular, Menlo, Consolas, monospace" font-size="13">
+    <text x="72"  y="182" fill="#5C646F">20b</text>
+    <text x="122" y="182" fill="#E6E9ED">33,979 tok/s</text>
+    <text x="288" y="182" fill="#5C646F">120b</text>
+    <text x="346" y="182" fill="#E6E9ED">13,149 tok/s</text>
+    <text x="512" y="182" fill="#5C646F">8 x AMD MI250</text>
+  </g>
+</svg>
