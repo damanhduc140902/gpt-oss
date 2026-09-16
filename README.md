@@ -29,11 +29,6 @@ It began from [llama2.c](https://github.com/karpathy/llama2.c) and grew into a c
 On a single node of 8 AMD MI250 GPUs it serves **33,979 tokens per second on the 20B model and 13,149 on
 the 120B model**, while keeping the generated text faithful to a CPU reference.
 
-<picture>
-  <source media="(prefers-color-scheme: dark)" srcset="docs/assets/hero-dark.svg">
-  <img alt="One transformer block as implemented: hand-written kernels on every layer, and the MoE layer as the only point where the GPUs communicate" src="docs/assets/hero-light.svg" width="100%">
-</picture>
-
 Two things are measured, and both have to hold:
 
 - **Throughput** — output tokens per second, as high as the hardware allows.
@@ -208,11 +203,6 @@ recommended; see [`tests/README.md`](tests/README.md).
 ---
 
 ## Results
-
-<picture>
-  <source media="(prefers-color-scheme: dark)" srcset="docs/assets/throughput-dark.svg">
-  <img alt="Measured throughput: 33,979 tokens per second on gpt-oss-20b and 13,149 on gpt-oss-120b, both clearing the METEOR and BERTScore gates" src="docs/assets/throughput-light.svg" width="100%">
-</picture>
 
 Measured on one node of 8× AMD MI250 in batch (`getp`) mode.
 
