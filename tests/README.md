@@ -5,8 +5,18 @@ Evaluate generated completions against references using **METEOR** and **BERTSco
 ## Prerequisites
 
 - Python 3.10+
-- Installed packages: `tiktoken`, `nltk`, `bert-score`, `tqdm`
-- **GPU strongly recommended**. On AMD GPUs, ensure PyTorch is installed **with ROCm**. CPU will be very slow.
+- `tiktoken` and `tqdm` come from [`requirements.txt`](../requirements.txt); the two scoring
+  libraries do not, so install them separately:
+
+  ```bash
+  pip install nltk bert-score
+  ```
+
+- **GPU strongly recommended**. On AMD GPUs, ensure PyTorch is installed **with ROCm** — check with
+  `python -c "import torch; print(torch.version.hip)"`, which must not print `None`. On CPU, BERTScore
+  runs at roughly 1.7 sentences per second, so 4096 samples take about 40 minutes.
+- `MODELS_ROOT` (optional) says where the BERTScore model is cached. It defaults to `tests/models/`,
+  and the model is downloaded to `$MODELS_ROOT/bs_model/roberta-large-mnli` on first use.
 
 > NLTK resources (`punkt`, `wordnet`, `omw-1.4`) are downloaded automatically on first run. If your machine is offline, pre-download them:
 >
@@ -45,7 +55,12 @@ srun --gres=gpu:2 python eval.py -m 120b
 - `-m, --model_type {20b,120b}`
   Selects default input paths for submission and references.
 - `-s, --submission PATH`
-  Override path to submission completions (space-separated token IDs per line).
+  Override path to submission completions (space-separated token IDs per line). It takes precedence
+  over the default `--model_type` selects, so you can score a file from anywhere:
+
+  ```bash
+  python eval.py -m 20b -s /path/to/your_output_4096.txt
+  ```
 - `-r, --references PATH`
   Override path to reference completions (space-separated token IDs per line).
 - `-e, --encoding NAME` (default: `o200k_harmony`)
@@ -71,19 +86,25 @@ ensuring nltk resources...
 aligning by index, items: 4096
 computing METEOR in parallel with 96 workers...
 100%|██████████| 4096/4096 [00:46<00:00, 88.0it/s]
-meteor  0.384259
+meteor  0.532643
 
 computing BERTScore (roberta-large-mnli)...
 BERTScore device: GPU (2 device(s))
 BERTScore: 100%|██████████| 4096/4096 [02:22<00:00, 28.7it/s]
-bertscore_f1    0.966357
+bertscore_f1    0.977838
 
 ==========
 done.
 items           4096
-meteor          0.384259
-bertscore_f1    0.966357
+meteor          0.532643
+bertscore_f1    0.977838
 ```
+
+Those two numbers come from the completions committed in `submission/`: `gpt-oss-20b` in `getp` mode
+on 8x AMD MI250, 12288 requests, scored over the first 4096. They clear both thresholds in
+`threshold.json` comfortably and agree with the [main README](../README.md) table to the digits it
+reports. They are a separate measurement from the one that produced that table, so small differences
+are expected -- see the note on batch-position nondeterminism below.
 
 ```bash
 120b
@@ -94,7 +115,29 @@ meteor          0.404538
 bertscore_f1    0.96955
 ```
 
+> The `120b` figures above are carried over from an earlier run and have not been re-measured, unlike
+> the `20b` ones. Treat them as indicative until someone reproduces them.
+
 **Expected runtime:** \~4 minutes for 4096 samples on 2 GPUs (your hardware and load may vary).
+
+## Scoring your own run
+
+`getp` accepts exactly `n_devices x BATCH_SIZE` requests -- 1536 per GPU for 20B, 768 for 120B -- while
+the reference files here hold 4096 completions. The two line up if you build the input by repeating
+`input.txt` and then score only the first 4096 outputs. On eight GPUs that is 12288 = 3 x 4096:
+
+```bash
+python3 ../tools/make_getp_input.py -m 20b -g 8 -s input.txt -o /tmp/input_12288.txt
+../run gpt-oss-20b.bin -m getp -i /tmp/input_12288.txt -o /tmp/out.txt
+head -4096 /tmp/out.txt > /tmp/submission.txt
+python eval.py -m 20b -s /tmp/submission.txt
+```
+
+Completions are written in request order, so output line *i* is the answer to prompt *i*.
+
+Note that the engine is not deterministic with respect to batch position: the same prompt placed at a
+different index takes a different numerical path through the expert grouping, so repeated copies of one
+prompt do not produce identical completions even at temperature 0. Scores move slightly between runs.
 
 ## Tips & troubleshooting
 

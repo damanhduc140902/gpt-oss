@@ -177,6 +177,11 @@ def compute_bertscore(refs: List[str], subm: List[str],
     return n, float(total_sum / max(1, total_cnt))
 
 
+# Hugging Face repo backing the BERTScore model. ensure_bs_model() caches it
+# under $MODELS_ROOT/bs_model/roberta-large-mnli.
+BS_MODEL_REPO = "FacebookAI/roberta-large-mnli"
+
+
 def ensure_bs_model(local_dir: Path) -> Path:
     local_dir = Path(local_dir)
     need_download = True
@@ -196,9 +201,13 @@ def ensure_bs_model(local_dir: Path) -> Path:
             from huggingface_hub import snapshot_download
 
             snapshot_download(
-                repo_id=local_dir,
+                repo_id=BS_MODEL_REPO,
                 local_dir=str(local_dir),
-                local_dir_use_symlinks=False,
+                allow_patterns=[
+                    "config.json", "pytorch_model.bin", "tokenizer.json",
+                    "vocab.json", "merges.txt", "tokenizer_config.json",
+                    "special_tokens_map.json"
+                ],
             )
         except Exception as e:
             raise RuntimeError(f"Failed to download {local_dir}: {e}")
@@ -216,20 +225,23 @@ def main():
     print("parsing args...", flush=True)
     args = parse_args()
 
-    # Determine submission and references paths
+    # Determine submission and references paths. An explicit path always wins
+    # over the default --model_type selects, so either side can be overridden on
+    # its own; previously --model_type silently discarded both.
+    subm_path = args.submission
+    refs_path = args.references
     if args.model_type:
-        subm_path = Path(
-            f"./submission/output_{args.model_type}_token_ids.txt")
-        refs_path = Path(
-            f"./references/output_{args.model_type}_token_ids.txt")
-    else:
-        if not args.submission or not args.references:
-            print(
-                "Error: If --model_type is not provided, you must pass both --submission and --references.",
-                flush=True)
-            exit(1)
-        subm_path = args.submission
-        refs_path = args.references
+        if subm_path is None:
+            subm_path = Path(
+                f"./submission/output_{args.model_type}_token_ids.txt")
+        if refs_path is None:
+            refs_path = Path(
+                f"./references/output_{args.model_type}_token_ids.txt")
+    if subm_path is None or refs_path is None:
+        print(
+            "Error: pass --model_type, or both --submission and --references.",
+            flush=True)
+        exit(1)
 
     print(f"loading tiktoken encoding: {args.encoding}", flush=True)
     enc = tiktoken.get_encoding(args.encoding)
@@ -243,7 +255,8 @@ def main():
     print(f"meteor\t{round(meteor, 6)}")
 
     print("computing BERTScore (roberta-large-mnli)...", flush=True)
-    models_root = os.environ.get("MODELS_ROOT")
+    models_root = os.environ.get("MODELS_ROOT") or str(
+        Path(__file__).resolve().parent / "models")
     bs_model_root = Path(models_root) / "bs_model" / "roberta-large-mnli"
     roberta_local = ensure_bs_model(bs_model_root)
     n_b, bsf1 = compute_bertscore(refs, subm, str(roberta_local))
