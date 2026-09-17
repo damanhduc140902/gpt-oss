@@ -3,11 +3,11 @@
 <img alt="gpt-oss - pure C++ and HIP inference on AMD GPUs" src="docs/assets/banner.svg" width="100%">
 
 <p>
-  <img src="https://img.shields.io/badge/C%2B%2B-17-1f2328?style=flat-square&labelColor=0b0b0d" alt="C++17">
-  <img src="https://img.shields.io/badge/HIP-ROCm%206.2-1f2328?style=flat-square&labelColor=0b0b0d" alt="HIP / ROCm 6.2">
-  <img src="https://img.shields.io/badge/GPU-8%C3%97%20AMD%20MI250-1f2328?style=flat-square&labelColor=0b0b0d" alt="8x AMD MI250">
-  <img src="https://img.shields.io/badge/dependencies-none-1f2328?style=flat-square&labelColor=0b0b0d" alt="No external libraries">
-  <img src="https://img.shields.io/github/last-commit/damanhduc140902/gpt-oss?style=flat-square&label=commit&color=1f2328&labelColor=0b0b0d" alt="Last commit">
+  <img src="https://img.shields.io/badge/C%2B%2B-17-57606a?style=flat-square&labelColor=24292f" alt="C++17">
+  <img src="https://img.shields.io/badge/HIP-ROCm%206.2-57606a?style=flat-square&labelColor=24292f" alt="HIP / ROCm 6.2">
+  <img src="https://img.shields.io/badge/GPU-8%C3%97%20AMD%20MI250-57606a?style=flat-square&labelColor=24292f" alt="8x AMD MI250">
+  <img src="https://img.shields.io/badge/dependencies-none-57606a?style=flat-square&labelColor=24292f" alt="No external libraries">
+  <img src="https://img.shields.io/github/last-commit/damanhduc140902/gpt-oss?style=flat-square&label=commit&color=57606a&labelColor=24292f" alt="Last commit">
 </p>
 
 [Overview](#overview) · [Quick Start](#quick-start) · [Results](#results) · [How It Works](#how-it-works) · [Blog](#blog) · [Docs](docs/)
@@ -23,7 +23,7 @@ hipBLAS, no RCCL, no MPI. Every kernel, every collective and the tokenizer are w
 this repository. The only dependency is the HIP runtime itself.
 
 It began from [llama2.c](https://github.com/karpathy/llama2.c) and grew into a complete inference system.
-On a single node of 8 AMD MI250 GPUs it serves **33,979 tokens per second on the 20B model and 13,149 on
+On a single node of 8 AMD MI250 GPUs it serves **56,434 tokens per second on the 20B model and 19,020 on
 the 120B model**, while keeping the generated text faithful to a CPU reference.
 
 Two things are measured, and both have to hold:
@@ -205,8 +205,20 @@ Measured on one node of 8× AMD MI250 in batch (`getp`) mode.
 
 | Model | Requests | Warm-up (s) | Inference (s) | Throughput (TPS) | METEOR | BERTScore |
 | --- | ---: | ---: | ---: | ---: | ---: | ---: |
-| `gpt-oss-20b` | 12288 | 111 | 360 | **33979** | 0.533 | 0.978 |
-| `gpt-oss-120b` | 6144 | 273 | 463 | **13149** | 0.567 | 0.982 |
+| `gpt-oss-20b` | 12288 | 26 | 216 | **56434** | 0.523 | 0.978 |
+| `gpt-oss-120b` | 6144 | 263 | 320 | **19020** | 0.560 | 0.981 |
+
+Where those numbers came from, one optimisation at a time on the 20B model:
+
+| | Throughput | Change |
+| --- | ---: | ---: |
+| Starting point | 33979 | — |
+| GEMM tile tuning and per-tile attention softmax | 42540 | +25.2% |
+| Attention rewritten on `mfma_f32_16x16x16bf16_1k` | 50464 | +18.6% |
+| LDS tiles stored k-contiguous in all five GEMMs | **56434** | +11.8% |
+
+Warm-up is dominated by reading the checkpoint off disk, so it depends on whether the file is still in
+the page cache; it is not part of what the optimisation work changed.
 
 Throughput is aggregate across all eight GPUs, not single-stream latency. The quality gates are METEOR
 0.3 and BERTScore 0.9; both models clear them several times over, so the speed was not bought with
@@ -216,9 +228,12 @@ Every figure in that table comes from one run each, and the completions those sc
 from are committed in [`tests/submission/`](tests/submission/) — so the numbers can be checked without
 a GPU, by scoring the files in the repository. `./run.sh eval 20b` reproduces the last two columns.
 
-Repeating a run moves throughput by well under a percent. The engine is not bit-deterministic with
-respect to batch position — the same prompt at a different index takes a different path through the
-expert grouping — so completions, and therefore the quality scores, shift slightly between runs.
+Repeating a run moves throughput by well under a percent, but it moves the completions a great deal.
+The engine is not bit-deterministic — the same prompt at a different batch index takes a different path
+through the expert grouping — and greedy decoding turns any difference into a different trajectory. Two
+runs of the *same binary* at 8 GPUs and 1024 steps agree on only about 68% of tokens, while the quality
+scores stay put. That is worth knowing before using token agreement to check a change: at this scale it
+cannot tell a real bug from a rounding difference, and METEOR and BERTScore are the gates that can.
 
 ---
 
