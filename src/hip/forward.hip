@@ -1454,7 +1454,9 @@ __global__ void moe_gather_pairs_kernel(float *__restrict__ e_agg,
     int pos = pair_pos[base + k];
     if (pos >= 0) s += z_partial[(size_t)pos * (size_t)H + row];
   }
-  e_agg[(size_t)b * (size_t)H + row] += s;
+  // Ghi DE, khong cong don: moi o duoc ghi dung mot lan (luoi phu tron
+  // B x H), nen khong can memset 35,4 MB truoc do nua.
+  e_agg[(size_t)b * (size_t)H + row] = s;
 }
 
 static inline void moe_gather_pairs(float *e_agg, const float *z_partial,
@@ -4272,8 +4274,15 @@ static inline void getp_matmul_logits_argmax_bf16(
   dim3 block(64 * WARPS);
   dim3 grid((N + BN - 1) / BN, (M + BM - 1) / BM);
 
-  unsigned long long* pairs = nullptr;
-  HIP_CHECK(hipMalloc(&pairs, sizeof(unsigned long long) * M));
+  // hipFree dong bo ca thiet bi, nen cap phat/giai phong moi buoc la mot lan
+  // dung hoan toan moi buoc cho mot buffer 12 KB co kich thuoc khong doi.
+  static thread_local unsigned long long *pairs = nullptr;
+  static thread_local int pairs_cap = 0;
+  if (pairs_cap < M) {
+    if (pairs) HIP_CHECK(hipFree(pairs));
+    HIP_CHECK(hipMalloc(&pairs, sizeof(unsigned long long) * M));
+    pairs_cap = M;
+  }
   dim3 gi((M + 255) / 256), bi(256);
   init_argmax_pairs<<<gi, bi, 0, stream>>>(pairs, M, N);
 
@@ -4281,7 +4290,7 @@ static inline void getp_matmul_logits_argmax_bf16(
       <<<grid, block, 0, stream>>>(x, w, M, N, K, pairs);
 
   extract_argmax_pairs<<<gi, bi, 0, stream>>>(pairs, out, M);
-  HIP_CHECK(hipFree(pairs));
+  // (pairs duoc giu lai cho buoc sau)
   
 }
 
@@ -4377,14 +4386,17 @@ int *getp_forward_120b(Transformer * /*transformer*/,
 
   HIP_CHECK(hipSetDevice(device_index));
 
-  hipEvent_t event_rmsnorm;
-  hipEvent_t event_router_topk;
-  hipEvent_t event_memset;
-  hipEvent_t events_e_agg[MAXIMUM_GPU];
-  HIP_CHECK(hipEventCreate(&event_rmsnorm));
-  HIP_CHECK(hipEventCreate(&event_router_topk));
-  HIP_CHECK(hipEventCreate(&event_memset));
-  for (int i = 0; i < EXPERT_PARALLELISM; ++i) HIP_CHECK(hipEventCreate(&events_e_agg[i]));
+  // Truoc day 5 event duoc tao MOI BUOC va khong bao gio huy. Gio tao mot lan
+  // cho moi thread (moi GPUWorker mot thread, moi thread mot thiet bi).
+  static thread_local hipEvent_t event_rmsnorm = nullptr;
+  static thread_local hipEvent_t event_router_topk = nullptr;
+  static thread_local hipEvent_t events_e_agg[MAXIMUM_GPU] = {};
+  if (!event_rmsnorm) {
+    HIP_CHECK(hipEventCreateWithFlags(&event_rmsnorm, hipEventDisableTiming));
+    HIP_CHECK(hipEventCreateWithFlags(&event_router_topk, hipEventDisableTiming));
+    for (int i = 0; i < EXPERT_PARALLELISM; ++i)
+      HIP_CHECK(hipEventCreateWithFlags(&events_e_agg[i], hipEventDisableTiming));
+  }
 
   HIP_CHECK(hipMemcpyAsync(ext->mask_on, mask_on, sizeof(int) * BATCH_SIZE, 
                            hipMemcpyHostToDevice, compute_stream));
@@ -4583,11 +4595,7 @@ int *getp_forward_120b(Transformer * /*transformer*/,
       ext->e_dev,
       total_pairs, hidden_dim, compute_stream);
   
-  HIP_CHECK(hipMemsetAsync(
-      ext->ext_e_agg, 0,
-      (size_t)EXPERT_PARALLELISM * BATCH_SIZE * hidden_dim * sizeof(float),
-      memory_stream));
-  HIP_CHECK(hipEventRecord(event_memset, memory_stream));
+  // (memset 35,4 MB da bo: moe_gather_pairs gio ghi de toan bo vung nay)
   
   __hip_bfloat16 *w1_base = dev_w->w_mlp1 + 1ll * l * experts_per_device * 2 * p->intermediate_dim * hidden_dim;
   __hip_bfloat16 *b1_base = dev_w->b_mlp1 + 1ll * l * experts_per_device * 2 * p->intermediate_dim;
@@ -4616,7 +4624,6 @@ int *getp_forward_120b(Transformer * /*transformer*/,
       ext->e_offsets, ext->blk_offsets, ext->e_dev, p->intermediate_dim,
       hidden_dim, experts_per_device, total_blocks_mlp2, compute_stream);
   
-    HIP_CHECK(hipStreamWaitEvent(compute_stream, event_memset));
     moe_gather_pairs(ext->ext_e_agg, ext->z_partial, ext->pair_pos, hidden_dim,
                      p->experts_per_token, EXPERT_PARALLELISM * BATCH_SIZE,
                      compute_stream);
