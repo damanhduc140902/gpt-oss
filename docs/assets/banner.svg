@@ -1,17 +1,18 @@
 <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 1200 210" width="1200" height="210" role="img" aria-label="gpt-oss - pure C++ and HIP inference on AMD GPUs">
-  <rect width="1200" height="210" fill="#0B0B0D"/>
+  <rect width="1200" height="210" fill="#F6F8FA"/>
+  <rect x="0.5" y="0.5" width="1199" height="209" fill="none" stroke="#D0D7DE"/>
 
   <text x="72" y="112" font-family="ui-monospace, SFMono-Regular, Menlo, Consolas, monospace"
-        font-size="62" font-weight="700" fill="#FFFFFF" letter-spacing="-2">gpt-oss</text>
+        font-size="62" font-weight="700" fill="#0B0B0D" letter-spacing="-2">gpt-oss</text>
 
   <text x="72" y="150" font-family="-apple-system, BlinkMacSystemFont, Segoe UI, Helvetica, Arial, sans-serif"
-        font-size="18" fill="#8B939E">Pure C++ and HIP inference on AMD GPUs. No external libraries.</text>
+        font-size="18" fill="#57606A">Pure C++ and HIP inference on AMD GPUs. No external libraries.</text>
 
   <g font-family="ui-monospace, SFMono-Regular, Menlo, Consolas, monospace" font-size="13">
-    <text x="72"  y="182" fill="#5C646F">20b</text>
-    <text x="122" y="182" fill="#E6E9ED">33,979 tok/s</text>
-    <text x="288" y="182" fill="#5C646F">120b</text>
-    <text x="346" y="182" fill="#E6E9ED">13,149 tok/s</text>
-    <text x="512" y="182" fill="#5C646F">8 x AMD MI250</text>
+    <text x="72"  y="182" fill="#6E7781">20b</text>
+    <text x="122" y="182" fill="#1F2328">33,979 tok/s</text>
+    <text x="288" y="182" fill="#6E7781">120b</text>
+    <text x="346" y="182" fill="#1F2328">13,149 tok/s</text>
+    <text x="512" y="182" fill="#6E7781">8 x AMD MI250</text>
   </g>
 </svg>
