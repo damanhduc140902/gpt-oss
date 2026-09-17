@@ -12,6 +12,13 @@
 #include "getp/transformer.cpp"
 #include "transformer.hpp"
 
+// Padding tren truc nhanh cua tile LDS. Voi BM=BN=128 buoc giua hai mat k la
+// 64 dword, chia het 32 bank -> moi nhom 16 lane doc/ghi trung bank. Them 4
+// phan tu lam buoc thanh 66 dword, trai deu tren cac bank.
+#ifndef GETP_LDS_PAD
+#define GETP_LDS_PAD 4
+#endif
+
 #ifndef GETP_ROUTER_TOPK_MAXK
 #define GETP_ROUTER_TOPK_MAXK 4
 #endif
@@ -349,8 +356,18 @@ moe_scatter_acts_to_expert_frombf16_kernel<<<grid, block, 0, stream>>>(
     a_in, x_bf16, tok_idx, total_pairs, H);
 }
 
+// Padding truc nhanh cua tile LDS trong hai kernel MoE. Truoc day hang so 8
+// nay duoc viet lai o CA than kernel lan launcher; lech nhau la cap phat
+// thieu shared memory va hong tile mot cach im lang.
+#ifndef MATMUL_MLP1_LDS_PAD
+#define MATMUL_MLP1_LDS_PAD 4
+#endif
+#ifndef MATMUL_MLP2_LDS_PAD
+#define MATMUL_MLP2_LDS_PAD 8
+#endif
+
 #ifndef MATMUL_MLP1_BLOCK_ROWS
-#define MATMUL_MLP1_BLOCK_ROWS 64
+#define MATMUL_MLP1_BLOCK_ROWS 128
 #endif
 #ifndef MATMUL_MLP1_BLOCK_COLS
 #define MATMUL_MLP1_BLOCK_COLS 64
@@ -359,13 +376,15 @@ moe_scatter_acts_to_expert_frombf16_kernel<<<grid, block, 0, stream>>>(
 #define MATMUL_MLP1_BLOCK_DEPTH 32
 #endif
 #ifndef MATMUL_MLP1_WARP_TILE_M
-#define MATMUL_MLP1_WARP_TILE_M 32
+#define MATMUL_MLP1_WARP_TILE_M 64
 #endif
 #ifndef MATMUL_MLP1_WARP_TILE_N
 #define MATMUL_MLP1_WARP_TILE_N 32
 #endif
 #ifndef MATMUL_MLP1_WAVES_PER_BLOCK
-#define MATMUL_MLP1_WAVES_PER_BLOCK 4
+// Suy tu tile: than kernel dung TILE_N = 64 * (BM/WM)*(BN/WN) thread.
+// Ghi de bang -D chi duoc phep neu van bang bieu thuc nay (co static_assert).
+#define MATMUL_MLP1_WAVES_PER_BLOCK (((MATMUL_MLP1_BLOCK_ROWS) / (MATMUL_MLP1_WARP_TILE_M)) * ((MATMUL_MLP1_BLOCK_COLS) / (MATMUL_MLP1_WARP_TILE_N)))
 #endif
 #ifndef NUM_CTA_MLP1
 #define NUM_CTA_MLP1 2
@@ -387,7 +406,9 @@ moe_scatter_acts_to_expert_frombf16_kernel<<<grid, block, 0, stream>>>(
 #define MATMUL_MLP2_WARP_TILE_N 32
 #endif
 #ifndef MATMUL_MLP2_WAVES_PER_BLOCK
-#define MATMUL_MLP2_WAVES_PER_BLOCK 4
+// Suy tu tile: than kernel dung TILE_N = 64 * (BM/WM)*(BN/WN) thread.
+// Ghi de bang -D chi duoc phep neu van bang bieu thuc nay (co static_assert).
+#define MATMUL_MLP2_WAVES_PER_BLOCK (((MATMUL_MLP2_BLOCK_ROWS) / (MATMUL_MLP2_WARP_TILE_M)) * ((MATMUL_MLP2_BLOCK_COLS) / (MATMUL_MLP2_WARP_TILE_N)))
 #endif
 #ifndef NUM_CTA_MLP2
 #define NUM_CTA_MLP2 4
@@ -410,7 +431,9 @@ moe_scatter_acts_to_expert_frombf16_kernel<<<grid, block, 0, stream>>>(
 #define MATMUL_ROUTER_WARP_TILE_N 16
 #endif
 #ifndef MATMUL_ROUTER_WAVES_PER_BLOCK
-#define MATMUL_ROUTER_WAVES_PER_BLOCK 4
+// Suy tu tile: than kernel dung TILE_N = 64 * (BM/WM)*(BN/WN) thread.
+// Ghi de bang -D chi duoc phep neu van bang bieu thuc nay (co static_assert).
+#define MATMUL_ROUTER_WAVES_PER_BLOCK (((MATMUL_ROUTER_BLOCK_ROWS) / (MATMUL_ROUTER_WARP_TILE_M)) * ((MATMUL_ROUTER_BLOCK_COLS) / (MATMUL_ROUTER_WARP_TILE_N)))
 #endif
 #ifndef MATMUL_ROUTER_THREADS
 #define MATMUL_ROUTER_THREADS (64 * MATMUL_ROUTER_WAVES_PER_BLOCK)
@@ -462,7 +485,7 @@ mlp1_swiglu_bf16_bucketed_kernel_outbf16_tuned(
   constexpr int strideW = TILE_N / (BK / 8);
 
   // LDS Padding optimization: Add padding to avoid bank conflicts
-  constexpr int PAD = 8;
+  constexpr int PAD = MATMUL_MLP1_LDS_PAD;
   constexpr int BM_PAD = BM + PAD;
   constexpr int BNt_PAD = BNt + PAD;
   
@@ -470,6 +493,21 @@ mlp1_swiglu_bf16_bucketed_kernel_outbf16_tuned(
   unsigned short* sx  = sm;
   unsigned short* swg = sx + (size_t)BK * BM_PAD;
   unsigned short* swu = swg + (size_t)BK * BNt_PAD;
+
+#ifdef DEBUG_LDS_POISON
+  // Kiem launch: than kernel gia dinh dung TILE_N thread.
+  if (blockDim.x != TILE_N) {
+    if (threadIdx.x == 0)
+      printf("BAD LAUNCH: blockDim=%d nhung TILE_N=%d\n", (int)blockDim.x, (int)TILE_N);
+    return;
+  }
+  // Do day LDS bang bf16 qNaN: o nao khong duoc loader ghi se thanh NaN.
+  {
+    const int lds_shorts = BK * (BM_PAD + 2 * BNt_PAD);
+    for (int idx = threadIdx.x; idx < lds_shorts; idx += blockDim.x) sm[idx] = 0x7FC0;
+  }
+  __syncthreads();
+#endif
 
   f32x4 dg_acc[BN_AGG][nIterM][nIterN];
   f32x4 du_acc[BN_AGG][nIterM][nIterN];
@@ -515,7 +553,7 @@ mlp1_swiglu_bf16_bucketed_kernel_outbf16_tuned(
     
     unsigned short* dst = &sx[(LOAD_VEC * loadX_x8) * BM_PAD + r];
     
-    if (kk + 7 < H) {
+    if (r < tcnt && kk + 7 < H) {
       const uint4* p = reinterpret_cast<const uint4*>(A_in + (size_t)pos * H + kk);
       const uint4 v = *p;
       
@@ -849,13 +887,28 @@ mlp2_partial_bf16_bucketed_splitk_kernel_inbf16_tuned(
   const int yMF = lane >> 4;
 
   // LDS Padding optimization for MLP2
-  constexpr int PAD = 8;
+  constexpr int PAD = MATMUL_MLP2_LDS_PAD;
   constexpr int BM_PAD = BM + PAD;
   constexpr int BNt_PAD = BNt + PAD;
 
   extern __shared__ unsigned short sm[];
   unsigned short* sx = sm;
   unsigned short* sw = sx + (size_t)BK * BM_PAD;
+
+#ifdef DEBUG_LDS_POISON
+  // Kiem launch: than kernel gia dinh dung TILE_N thread.
+  if (blockDim.x != TILE_N) {
+    if (threadIdx.x == 0)
+      printf("BAD LAUNCH: blockDim=%d nhung TILE_N=%d\n", (int)blockDim.x, (int)TILE_N);
+    return;
+  }
+  // Do day LDS bang bf16 qNaN: o nao khong duoc loader ghi se thanh NaN.
+  {
+    const int lds_shorts = BK * (BM_PAD + BNt_PAD);
+    for (int idx = threadIdx.x; idx < lds_shorts; idx += blockDim.x) sm[idx] = 0x7FC0;
+  }
+  __syncthreads();
+#endif
 
   f32x4 d_acc[BN_AGG][nIterM][nIterN];
   #pragma unroll
@@ -921,7 +974,7 @@ mlp2_partial_bf16_bucketed_splitk_kernel_inbf16_tuned(
     
     unsigned short* dst = &sx[(LOAD_VEC * loadX_x8) * BM_PAD + r];
     
-    if (kk + 7 < kEnd) {
+    if (r < tcnt && kk + 7 < kEnd) {
       const __hip_bfloat16* src = gate_up_bf16 + (size_t)pos * (size_t)I + kk;
       const uint4* p = reinterpret_cast<const uint4*>(src);
       const uint4 v = *p;
@@ -1181,8 +1234,11 @@ static inline void launch_mlp1_swiglu_bf16_bucketed_outbf16(
   constexpr int WARPS = MATMUL_MLP1_WAVES_PER_BLOCK;
   constexpr int CTA = NUM_CTA_MLP1;
   constexpr int THREADS = 64 * WARPS;
+  static_assert(WARPS == (BM / WM) * (BN / WN),
+                "WAVES_PER_BLOCK phai bang (BM/WM)*(BN/WN): than kernel cap"
+                " TILE_N = 64*(BM/WM)*(BN/WN) thread, launcher cap 64*WARPS.");
   constexpr int BNt = BN * 2;
-  constexpr int PAD = 8;
+  constexpr int PAD = MATMUL_MLP1_LDS_PAD;
   constexpr int BM_PAD = BM + PAD;
   constexpr int BNt_PAD = BNt + PAD;
   dim3 block(THREADS);
@@ -1208,6 +1264,9 @@ static inline void launch_mlp2_partial_bf16_bucketed_frombf16(
   constexpr int WN = MATMUL_MLP2_WARP_TILE_N;
   constexpr int WARPS = MATMUL_MLP2_WAVES_PER_BLOCK;
   constexpr int THREADS = 64 * WARPS;
+  static_assert(WARPS == (BM / WM) * (BN / WN),
+                "WAVES_PER_BLOCK phai bang (BM/WM)*(BN/WN): than kernel cap"
+                " TILE_N = 64*(BM/WM)*(BN/WN) thread, launcher cap 64*WARPS.");
   constexpr int BNt = BN * 3;
 
   int dev = 0, cu = 104;
@@ -1230,7 +1289,7 @@ static inline void launch_mlp2_partial_bf16_bucketed_frombf16(
     HIP_CHECK(hipMemsetAsync(z_partial, 0, (size_t)total_pairs * (size_t)H * sizeof(float), stream));
   }
 
-  constexpr int PAD = 8;
+  constexpr int PAD = MATMUL_MLP2_LDS_PAD;
   constexpr int BM_PAD = BM + PAD;
   constexpr int BNt_PAD = BNt + PAD;
   dim3 block(THREADS);
@@ -1330,8 +1389,8 @@ new_matmul_qkv_fused_kernel(
 
   assert(blockDim.x == BLOCK_SIZE);
 
-  __shared__ unsigned short xs[BK][BM];
-  __shared__ unsigned short ws[BK][BN];
+  __shared__ unsigned short xs[BK][BM + GETP_LDS_PAD];
+  __shared__ unsigned short ws[BK][BN + GETP_LDS_PAD];
 
   Afloat x_local;
   Bfloat w_local;
@@ -2304,8 +2363,8 @@ flash_attn_decode_even_layer_bf16_matrix_core_kernel(
   const int t_start = MAX(0, pos - sliding_window + 1);
   const int n_steps = pos + 1 - t_start;
 
-  __shared__ unsigned short ks[TILE_T][HEAD_DIM];
-  __shared__ __hip_bfloat16 vs[TILE_T][HEAD_DIM];
+  __shared__ __align__(16) unsigned short ks[TILE_T][HEAD_DIM];
+  __shared__ __align__(16) __hip_bfloat16 vs[TILE_T][HEAD_DIM];
 
   float out_values[MFMA_M] = {0.f};
   float m_values[MFMA_M] = {-INFINITY};
@@ -2317,8 +2376,12 @@ flash_attn_decode_even_layer_bf16_matrix_core_kernel(
   Afloat q_values[HEAD_DIM / (MFMA_BLOCK * MFMA_K)];
   for (int i = 0; i < HEAD_DIM / (MFMA_BLOCK * MFMA_K); ++i) {
     for (int j = 0; j < MFMA_K; ++j) {
+      // inv_sqrt_d gap vao day thay vi nhan vao tung diem so sau __shfl,
+      // noi gia tri dong nhat ca wave nen 63/64 lane bi phi. Bit-exact vi
+      // head_dim == 64 -> inv_sqrt_d = 2^-3.
       q_values[i][j] = 
         f32_to_bf16bits(
+          inv_sqrt_d *
           qptr[(Ai + MFMA_M * waveIdx + kv_h * kv_mul) * head_dim + 
                   i * (MFMA_BLOCK * MFMA_K) + 
                   Ablock * MFMA_K + j]);
@@ -2341,42 +2404,16 @@ flash_attn_decode_even_layer_bf16_matrix_core_kernel(
       uint4 tmp_k = *reinterpret_cast<const uint4 *>(kptr);
       uint4 tmp_v = *reinterpret_cast<const uint4 *>(vptr);
 
-      ks[loadKVIdx_y + offset][loadKVIdx_x * 8 + 0] = (unsigned short)(tmp_k.x & 0xFFFF);
-      ks[loadKVIdx_y + offset][loadKVIdx_x * 8 + 1] = (unsigned short)(tmp_k.x >> 16);
-      ks[loadKVIdx_y + offset][loadKVIdx_x * 8 + 2] = (unsigned short)(tmp_k.y & 0xFFFF);
-      ks[loadKVIdx_y + offset][loadKVIdx_x * 8 + 3] = (unsigned short)(tmp_k.y >> 16);
-      ks[loadKVIdx_y + offset][loadKVIdx_x * 8 + 4] = (unsigned short)(tmp_k.z & 0xFFFF);
-      ks[loadKVIdx_y + offset][loadKVIdx_x * 8 + 5] = (unsigned short)(tmp_k.z >> 16);
-      ks[loadKVIdx_y + offset][loadKVIdx_x * 8 + 6] = (unsigned short)(tmp_k.w & 0xFFFF);
-      ks[loadKVIdx_y + offset][loadKVIdx_x * 8 + 7] = (unsigned short)(tmp_k.w >> 16);
+      // Mot ghi LDS 128-bit thay cho 8 ghi 16-bit: 8 short nay lien nhau tren
+      // truc thu hai va cot bat dau luon chia het 16 byte.
+      *reinterpret_cast<uint4 *>(&ks[loadKVIdx_y + offset][loadKVIdx_x * 8]) = tmp_k;
 
-      vs[loadKVIdx_y + offset][loadKVIdx_x * 8 + 0] = bf16bits_to_bf16((unsigned short)(tmp_v.x & 0xFFFF));
-      vs[loadKVIdx_y + offset][loadKVIdx_x * 8 + 1] = bf16bits_to_bf16((unsigned short)(tmp_v.x >> 16));
-      vs[loadKVIdx_y + offset][loadKVIdx_x * 8 + 2] = bf16bits_to_bf16((unsigned short)(tmp_v.y & 0xFFFF));
-      vs[loadKVIdx_y + offset][loadKVIdx_x * 8 + 3] = bf16bits_to_bf16((unsigned short)(tmp_v.y >> 16));
-      vs[loadKVIdx_y + offset][loadKVIdx_x * 8 + 4] = bf16bits_to_bf16((unsigned short)(tmp_v.z & 0xFFFF));
-      vs[loadKVIdx_y + offset][loadKVIdx_x * 8 + 5] = bf16bits_to_bf16((unsigned short)(tmp_v.z >> 16));
-      vs[loadKVIdx_y + offset][loadKVIdx_x * 8 + 6] = bf16bits_to_bf16((unsigned short)(tmp_v.w & 0xFFFF));
-      vs[loadKVIdx_y + offset][loadKVIdx_x * 8 + 7] = bf16bits_to_bf16((unsigned short)(tmp_v.w >> 16));
+      *reinterpret_cast<uint4 *>(&vs[loadKVIdx_y + offset][loadKVIdx_x * 8]) = tmp_v;
     }
     else {
-      ks[loadKVIdx_y + offset][loadKVIdx_x * 8 + 0] = 0;
-      ks[loadKVIdx_y + offset][loadKVIdx_x * 8 + 1] = 0;
-      ks[loadKVIdx_y + offset][loadKVIdx_x * 8 + 2] = 0;
-      ks[loadKVIdx_y + offset][loadKVIdx_x * 8 + 3] = 0;
-      ks[loadKVIdx_y + offset][loadKVIdx_x * 8 + 4] = 0;
-      ks[loadKVIdx_y + offset][loadKVIdx_x * 8 + 5] = 0;
-      ks[loadKVIdx_y + offset][loadKVIdx_x * 8 + 6] = 0;
-      ks[loadKVIdx_y + offset][loadKVIdx_x * 8 + 7] = 0;
+      *reinterpret_cast<uint4 *>(&ks[loadKVIdx_y + offset][loadKVIdx_x * 8]) = make_uint4(0, 0, 0, 0);
 
-      vs[loadKVIdx_y + offset][loadKVIdx_x * 8 + 0] = 0;
-      vs[loadKVIdx_y + offset][loadKVIdx_x * 8 + 1] = 0;
-      vs[loadKVIdx_y + offset][loadKVIdx_x * 8 + 2] = 0;
-      vs[loadKVIdx_y + offset][loadKVIdx_x * 8 + 3] = 0;
-      vs[loadKVIdx_y + offset][loadKVIdx_x * 8 + 4] = 0;
-      vs[loadKVIdx_y + offset][loadKVIdx_x * 8 + 5] = 0;
-      vs[loadKVIdx_y + offset][loadKVIdx_x * 8 + 6] = 0;
-      vs[loadKVIdx_y + offset][loadKVIdx_x * 8 + 7] = 0;
+      *reinterpret_cast<uint4 *>(&vs[loadKVIdx_y + offset][loadKVIdx_x * 8]) = make_uint4(0, 0, 0, 0);
     }
   }
   __syncthreads();
@@ -2428,18 +2465,38 @@ flash_attn_decode_even_layer_bf16_matrix_core_kernel(
         }
       }
 
-      for (int i = 0; i < MFMA_M; ++i) {
-        for (int j = 0; j < MFMA_N; ++j) {
-          if (btIdx + t + j >= t_start + n_steps) break;
-          float attn_score = __shfl(acc[i], j);
-          attn_score *= inv_sqrt_d;
-          float m_new = fmaxf(m_values[i], attn_score);
-          float alpha = __expf(m_values[i] - m_new);
-          float e = __expf(attn_score - m_new);
-          l_values[i] = l_values[i] * alpha + e;
-          m_values[i] = m_new;
+      // Softmax truc tuyen theo TILE thay vi theo tung key. Voi moi i: mot lan
+      // rescale accumulator va 1 + MFMA_N lan exp, thay cho 4 rescale va 8 exp.
+      int nvalid = 0;
+      #pragma unroll
+      for (int j = 0; j < MFMA_N; ++j)
+        if (btIdx + t + j < t_start + n_steps) ++nvalid;
 
-          out_values[i] = alpha * out_values[i] + e * __bfloat162float(vs[t + j][laneIdx]);
+      if (nvalid > 0) {
+        #pragma unroll
+        for (int i = 0; i < MFMA_M; ++i) {
+          float s[MFMA_N];
+          float m_tile = -INFINITY;
+          #pragma unroll
+          for (int j = 0; j < MFMA_N; ++j) {
+            // Hang ks ngoai pham vi bi zero-pad nen cho diem 0, ma exp(0) = 1
+            // se lam hong tong -> phai ep ve -INFINITY.
+            s[j] = (j < nvalid) ? (__shfl(acc[i], j)) : -INFINITY;
+            m_tile = fmaxf(m_tile, s[j]);
+          }
+          const float m_new = fmaxf(m_values[i], m_tile);
+          const float alpha = __expf(m_values[i] - m_new);
+          float lsum = 0.f;
+          float osum = 0.f;
+          #pragma unroll
+          for (int j = 0; j < MFMA_N; ++j) {
+            const float e = __expf(s[j] - m_new);   // = 0 khi s[j] = -INF
+            lsum += e;
+            osum += e * __bfloat162float(vs[t + j][laneIdx]);
+          }
+          l_values[i] = l_values[i] * alpha + lsum;
+          m_values[i] = m_new;
+          out_values[i] = alpha * out_values[i] + osum;
         }
       }
     }
@@ -2455,23 +2512,11 @@ flash_attn_decode_even_layer_bf16_matrix_core_kernel(
         uint4 tmp_k = regK[i];
         uint4 tmp_v = regV[i];
 
-        ks[loadKVIdx_y + offset][loadKVIdx_x * 8 + 0] = (unsigned short)(tmp_k.x & 0xFFFF);
-        ks[loadKVIdx_y + offset][loadKVIdx_x * 8 + 1] = (unsigned short)(tmp_k.x >> 16);
-        ks[loadKVIdx_y + offset][loadKVIdx_x * 8 + 2] = (unsigned short)(tmp_k.y & 0xFFFF);
-        ks[loadKVIdx_y + offset][loadKVIdx_x * 8 + 3] = (unsigned short)(tmp_k.y >> 16);
-        ks[loadKVIdx_y + offset][loadKVIdx_x * 8 + 4] = (unsigned short)(tmp_k.z & 0xFFFF);
-        ks[loadKVIdx_y + offset][loadKVIdx_x * 8 + 5] = (unsigned short)(tmp_k.z >> 16);
-        ks[loadKVIdx_y + offset][loadKVIdx_x * 8 + 6] = (unsigned short)(tmp_k.w & 0xFFFF);
-        ks[loadKVIdx_y + offset][loadKVIdx_x * 8 + 7] = (unsigned short)(tmp_k.w >> 16);
+        // Mot ghi LDS 128-bit thay cho 8 ghi 16-bit: 8 short nay lien nhau tren
+        // truc thu hai va cot bat dau luon chia het 16 byte.
+        *reinterpret_cast<uint4 *>(&ks[loadKVIdx_y + offset][loadKVIdx_x * 8]) = tmp_k;
 
-        vs[loadKVIdx_y + offset][loadKVIdx_x * 8 + 0] = bf16bits_to_bf16((unsigned short)(tmp_v.x & 0xFFFF));
-        vs[loadKVIdx_y + offset][loadKVIdx_x * 8 + 1] = bf16bits_to_bf16((unsigned short)(tmp_v.x >> 16));
-        vs[loadKVIdx_y + offset][loadKVIdx_x * 8 + 2] = bf16bits_to_bf16((unsigned short)(tmp_v.y & 0xFFFF));
-        vs[loadKVIdx_y + offset][loadKVIdx_x * 8 + 3] = bf16bits_to_bf16((unsigned short)(tmp_v.y >> 16));
-        vs[loadKVIdx_y + offset][loadKVIdx_x * 8 + 4] = bf16bits_to_bf16((unsigned short)(tmp_v.z & 0xFFFF));
-        vs[loadKVIdx_y + offset][loadKVIdx_x * 8 + 5] = bf16bits_to_bf16((unsigned short)(tmp_v.z >> 16));
-        vs[loadKVIdx_y + offset][loadKVIdx_x * 8 + 6] = bf16bits_to_bf16((unsigned short)(tmp_v.w & 0xFFFF));
-        vs[loadKVIdx_y + offset][loadKVIdx_x * 8 + 7] = bf16bits_to_bf16((unsigned short)(tmp_v.w >> 16));
+        *reinterpret_cast<uint4 *>(&vs[loadKVIdx_y + offset][loadKVIdx_x * 8]) = tmp_v;
       }
     }
     __syncthreads();
@@ -2559,8 +2604,8 @@ flash_attn_decode_odd_layer_bf16_matrix_core_kernel(
   const int t_start = MAX(0, pos + 1 - cache_tcap);
   const int n_steps = pos + 1 - t_start;
 
-  __shared__ unsigned short ks[TILE_T][HEAD_DIM];
-  __shared__ __hip_bfloat16 vs[TILE_T][HEAD_DIM];
+  __shared__ __align__(16) unsigned short ks[TILE_T][HEAD_DIM];
+  __shared__ __align__(16) __hip_bfloat16 vs[TILE_T][HEAD_DIM];
 
   float out_values[MFMA_M] = {0.f};
   float m_values[MFMA_M] = {-INFINITY};
@@ -2572,8 +2617,12 @@ flash_attn_decode_odd_layer_bf16_matrix_core_kernel(
   Afloat q_values[HEAD_DIM / (MFMA_BLOCK * MFMA_K)];
   for (int i = 0; i < HEAD_DIM / (MFMA_BLOCK * MFMA_K); ++i) {
     for (int j = 0; j < MFMA_K; ++j) {
+      // inv_sqrt_d gap vao day thay vi nhan vao tung diem so sau __shfl,
+      // noi gia tri dong nhat ca wave nen 63/64 lane bi phi. Bit-exact vi
+      // head_dim == 64 -> inv_sqrt_d = 2^-3.
       q_values[i][j] = 
         f32_to_bf16bits(
+          inv_sqrt_d *
           qptr[(Ai + MFMA_M * waveIdx + kv_h * kv_mul) * head_dim + 
                   i * (MFMA_BLOCK * MFMA_K) + 
                   Ablock * MFMA_K + j]);
@@ -2596,42 +2645,16 @@ flash_attn_decode_odd_layer_bf16_matrix_core_kernel(
       uint4 tmp_k = *reinterpret_cast<const uint4 *>(kptr);
       uint4 tmp_v = *reinterpret_cast<const uint4 *>(vptr);
 
-      ks[loadKVIdx_y + offset][loadKVIdx_x * 8 + 0] = (unsigned short)(tmp_k.x & 0xFFFF);
-      ks[loadKVIdx_y + offset][loadKVIdx_x * 8 + 1] = (unsigned short)(tmp_k.x >> 16);
-      ks[loadKVIdx_y + offset][loadKVIdx_x * 8 + 2] = (unsigned short)(tmp_k.y & 0xFFFF);
-      ks[loadKVIdx_y + offset][loadKVIdx_x * 8 + 3] = (unsigned short)(tmp_k.y >> 16);
-      ks[loadKVIdx_y + offset][loadKVIdx_x * 8 + 4] = (unsigned short)(tmp_k.z & 0xFFFF);
-      ks[loadKVIdx_y + offset][loadKVIdx_x * 8 + 5] = (unsigned short)(tmp_k.z >> 16);
-      ks[loadKVIdx_y + offset][loadKVIdx_x * 8 + 6] = (unsigned short)(tmp_k.w & 0xFFFF);
-      ks[loadKVIdx_y + offset][loadKVIdx_x * 8 + 7] = (unsigned short)(tmp_k.w >> 16);
+      // Mot ghi LDS 128-bit thay cho 8 ghi 16-bit: 8 short nay lien nhau tren
+      // truc thu hai va cot bat dau luon chia het 16 byte.
+      *reinterpret_cast<uint4 *>(&ks[loadKVIdx_y + offset][loadKVIdx_x * 8]) = tmp_k;
 
-      vs[loadKVIdx_y + offset][loadKVIdx_x * 8 + 0] = bf16bits_to_bf16((unsigned short)(tmp_v.x & 0xFFFF));
-      vs[loadKVIdx_y + offset][loadKVIdx_x * 8 + 1] = bf16bits_to_bf16((unsigned short)(tmp_v.x >> 16));
-      vs[loadKVIdx_y + offset][loadKVIdx_x * 8 + 2] = bf16bits_to_bf16((unsigned short)(tmp_v.y & 0xFFFF));
-      vs[loadKVIdx_y + offset][loadKVIdx_x * 8 + 3] = bf16bits_to_bf16((unsigned short)(tmp_v.y >> 16));
-      vs[loadKVIdx_y + offset][loadKVIdx_x * 8 + 4] = bf16bits_to_bf16((unsigned short)(tmp_v.z & 0xFFFF));
-      vs[loadKVIdx_y + offset][loadKVIdx_x * 8 + 5] = bf16bits_to_bf16((unsigned short)(tmp_v.z >> 16));
-      vs[loadKVIdx_y + offset][loadKVIdx_x * 8 + 6] = bf16bits_to_bf16((unsigned short)(tmp_v.w & 0xFFFF));
-      vs[loadKVIdx_y + offset][loadKVIdx_x * 8 + 7] = bf16bits_to_bf16((unsigned short)(tmp_v.w >> 16));
+      *reinterpret_cast<uint4 *>(&vs[loadKVIdx_y + offset][loadKVIdx_x * 8]) = tmp_v;
     }
     else {
-      ks[loadKVIdx_y + offset][loadKVIdx_x * 8 + 0] = 0;
-      ks[loadKVIdx_y + offset][loadKVIdx_x * 8 + 1] = 0;
-      ks[loadKVIdx_y + offset][loadKVIdx_x * 8 + 2] = 0;
-      ks[loadKVIdx_y + offset][loadKVIdx_x * 8 + 3] = 0;
-      ks[loadKVIdx_y + offset][loadKVIdx_x * 8 + 4] = 0;
-      ks[loadKVIdx_y + offset][loadKVIdx_x * 8 + 5] = 0;
-      ks[loadKVIdx_y + offset][loadKVIdx_x * 8 + 6] = 0;
-      ks[loadKVIdx_y + offset][loadKVIdx_x * 8 + 7] = 0;
+      *reinterpret_cast<uint4 *>(&ks[loadKVIdx_y + offset][loadKVIdx_x * 8]) = make_uint4(0, 0, 0, 0);
 
-      vs[loadKVIdx_y + offset][loadKVIdx_x * 8 + 0] = 0;
-      vs[loadKVIdx_y + offset][loadKVIdx_x * 8 + 1] = 0;
-      vs[loadKVIdx_y + offset][loadKVIdx_x * 8 + 2] = 0;
-      vs[loadKVIdx_y + offset][loadKVIdx_x * 8 + 3] = 0;
-      vs[loadKVIdx_y + offset][loadKVIdx_x * 8 + 4] = 0;
-      vs[loadKVIdx_y + offset][loadKVIdx_x * 8 + 5] = 0;
-      vs[loadKVIdx_y + offset][loadKVIdx_x * 8 + 6] = 0;
-      vs[loadKVIdx_y + offset][loadKVIdx_x * 8 + 7] = 0;
+      *reinterpret_cast<uint4 *>(&vs[loadKVIdx_y + offset][loadKVIdx_x * 8]) = make_uint4(0, 0, 0, 0);
     }
   }
   __syncthreads();
@@ -2683,18 +2706,38 @@ flash_attn_decode_odd_layer_bf16_matrix_core_kernel(
         }
       }
 
-      for (int i = 0; i < MFMA_M; ++i) {
-        for (int j = 0; j < MFMA_N; ++j) {
-          if (btIdx + t + j >= t_start + n_steps) break;
-          float attn_score = __shfl(acc[i], j);
-          attn_score *= inv_sqrt_d;
-          float m_new = fmaxf(m_values[i], attn_score);
-          float alpha = __expf(m_values[i] - m_new);
-          float e = __expf(attn_score - m_new);
-          l_values[i] = l_values[i] * alpha + e;
-          m_values[i] = m_new;
+      // Softmax truc tuyen theo TILE thay vi theo tung key. Voi moi i: mot lan
+      // rescale accumulator va 1 + MFMA_N lan exp, thay cho 4 rescale va 8 exp.
+      int nvalid = 0;
+      #pragma unroll
+      for (int j = 0; j < MFMA_N; ++j)
+        if (btIdx + t + j < t_start + n_steps) ++nvalid;
 
-          out_values[i] = alpha * out_values[i] + e * __bfloat162float(vs[t + j][laneIdx]);
+      if (nvalid > 0) {
+        #pragma unroll
+        for (int i = 0; i < MFMA_M; ++i) {
+          float s[MFMA_N];
+          float m_tile = -INFINITY;
+          #pragma unroll
+          for (int j = 0; j < MFMA_N; ++j) {
+            // Hang ks ngoai pham vi bi zero-pad nen cho diem 0, ma exp(0) = 1
+            // se lam hong tong -> phai ep ve -INFINITY.
+            s[j] = (j < nvalid) ? (__shfl(acc[i], j)) : -INFINITY;
+            m_tile = fmaxf(m_tile, s[j]);
+          }
+          const float m_new = fmaxf(m_values[i], m_tile);
+          const float alpha = __expf(m_values[i] - m_new);
+          float lsum = 0.f;
+          float osum = 0.f;
+          #pragma unroll
+          for (int j = 0; j < MFMA_N; ++j) {
+            const float e = __expf(s[j] - m_new);   // = 0 khi s[j] = -INF
+            lsum += e;
+            osum += e * __bfloat162float(vs[t + j][laneIdx]);
+          }
+          l_values[i] = l_values[i] * alpha + lsum;
+          m_values[i] = m_new;
+          out_values[i] = alpha * out_values[i] + osum;
         }
       }
     }
@@ -2710,23 +2753,11 @@ flash_attn_decode_odd_layer_bf16_matrix_core_kernel(
         uint4 tmp_k = regK[i];
         uint4 tmp_v = regV[i];
 
-        ks[loadKVIdx_y + offset][loadKVIdx_x * 8 + 0] = (unsigned short)(tmp_k.x & 0xFFFF);
-        ks[loadKVIdx_y + offset][loadKVIdx_x * 8 + 1] = (unsigned short)(tmp_k.x >> 16);
-        ks[loadKVIdx_y + offset][loadKVIdx_x * 8 + 2] = (unsigned short)(tmp_k.y & 0xFFFF);
-        ks[loadKVIdx_y + offset][loadKVIdx_x * 8 + 3] = (unsigned short)(tmp_k.y >> 16);
-        ks[loadKVIdx_y + offset][loadKVIdx_x * 8 + 4] = (unsigned short)(tmp_k.z & 0xFFFF);
-        ks[loadKVIdx_y + offset][loadKVIdx_x * 8 + 5] = (unsigned short)(tmp_k.z >> 16);
-        ks[loadKVIdx_y + offset][loadKVIdx_x * 8 + 6] = (unsigned short)(tmp_k.w & 0xFFFF);
-        ks[loadKVIdx_y + offset][loadKVIdx_x * 8 + 7] = (unsigned short)(tmp_k.w >> 16);
+        // Mot ghi LDS 128-bit thay cho 8 ghi 16-bit: 8 short nay lien nhau tren
+        // truc thu hai va cot bat dau luon chia het 16 byte.
+        *reinterpret_cast<uint4 *>(&ks[loadKVIdx_y + offset][loadKVIdx_x * 8]) = tmp_k;
 
-        vs[loadKVIdx_y + offset][loadKVIdx_x * 8 + 0] = bf16bits_to_bf16((unsigned short)(tmp_v.x & 0xFFFF));
-        vs[loadKVIdx_y + offset][loadKVIdx_x * 8 + 1] = bf16bits_to_bf16((unsigned short)(tmp_v.x >> 16));
-        vs[loadKVIdx_y + offset][loadKVIdx_x * 8 + 2] = bf16bits_to_bf16((unsigned short)(tmp_v.y & 0xFFFF));
-        vs[loadKVIdx_y + offset][loadKVIdx_x * 8 + 3] = bf16bits_to_bf16((unsigned short)(tmp_v.y >> 16));
-        vs[loadKVIdx_y + offset][loadKVIdx_x * 8 + 4] = bf16bits_to_bf16((unsigned short)(tmp_v.z & 0xFFFF));
-        vs[loadKVIdx_y + offset][loadKVIdx_x * 8 + 5] = bf16bits_to_bf16((unsigned short)(tmp_v.z >> 16));
-        vs[loadKVIdx_y + offset][loadKVIdx_x * 8 + 6] = bf16bits_to_bf16((unsigned short)(tmp_v.w & 0xFFFF));
-        vs[loadKVIdx_y + offset][loadKVIdx_x * 8 + 7] = bf16bits_to_bf16((unsigned short)(tmp_v.w >> 16));
+        *reinterpret_cast<uint4 *>(&vs[loadKVIdx_y + offset][loadKVIdx_x * 8]) = tmp_v;
       }
     }
     __syncthreads();
@@ -2886,7 +2917,7 @@ static inline void getp_matmul_router_bf16(float *xout, float *x, __hip_bfloat16
 #define MATMUL_ATTN_O_BLOCK_COLS 128
 #endif
 #ifndef MATMUL_ATTN_O_BLOCK_DEPTH
-#define MATMUL_ATTN_O_BLOCK_DEPTH 16
+#define MATMUL_ATTN_O_BLOCK_DEPTH 32
 #endif
 #ifndef MATMUL_ATTN_O_WARP_TILE_M
 #define MATMUL_ATTN_O_WARP_TILE_M 64
@@ -2895,7 +2926,9 @@ static inline void getp_matmul_router_bf16(float *xout, float *x, __hip_bfloat16
 #define MATMUL_ATTN_O_WARP_TILE_N 64
 #endif
 #ifndef MATMUL_ATTN_O_WAVES_PER_BLOCK
-#define MATMUL_ATTN_O_WAVES_PER_BLOCK 4
+// Suy tu tile: than kernel dung TILE_N = 64 * (BM/WM)*(BN/WN) thread.
+// Ghi de bang -D chi duoc phep neu van bang bieu thuc nay (co static_assert).
+#define MATMUL_ATTN_O_WAVES_PER_BLOCK (((MATMUL_ATTN_O_BLOCK_ROWS) / (MATMUL_ATTN_O_WARP_TILE_M)) * ((MATMUL_ATTN_O_BLOCK_COLS) / (MATMUL_ATTN_O_WARP_TILE_N)))
 #endif
 
 template<
@@ -2945,8 +2978,8 @@ matmul_attn_o_bf16_kernel_tuned(
   constexpr int strideX = THREADS / (BK / 4);
   constexpr int strideW = THREADS / (BK / 8);
 
-  __shared__ unsigned short xs[BK][BM];
-  __shared__ unsigned short ws[BK][BN];
+  __shared__ unsigned short xs[BK][BM + GETP_LDS_PAD];
+  __shared__ unsigned short ws[BK][BN + GETP_LDS_PAD];
 
   Afloat x_local;
   Bfloat w_local;
@@ -3216,7 +3249,7 @@ __global__ void extract_argmax_pairs(const unsigned long long* pairs, int* out, 
 #define MATMUL_LOGITS_BLOCK_COLS 128
 #endif
 #ifndef MATMUL_LOGITS_BLOCK_DEPTH
-#define MATMUL_LOGITS_BLOCK_DEPTH 16
+#define MATMUL_LOGITS_BLOCK_DEPTH 32
 #endif
 #ifndef MATMUL_LOGITS_WARP_TILE_M
 #define MATMUL_LOGITS_WARP_TILE_M 64
@@ -3225,7 +3258,9 @@ __global__ void extract_argmax_pairs(const unsigned long long* pairs, int* out, 
 #define MATMUL_LOGITS_WARP_TILE_N 64
 #endif
 #ifndef MATMUL_LOGITS_WAVES_PER_BLOCK
-#define MATMUL_LOGITS_WAVES_PER_BLOCK 4
+// Suy tu tile: than kernel dung TILE_N = 64 * (BM/WM)*(BN/WN) thread.
+// Ghi de bang -D chi duoc phep neu van bang bieu thuc nay (co static_assert).
+#define MATMUL_LOGITS_WAVES_PER_BLOCK (((MATMUL_LOGITS_BLOCK_ROWS) / (MATMUL_LOGITS_WARP_TILE_M)) * ((MATMUL_LOGITS_BLOCK_COLS) / (MATMUL_LOGITS_WARP_TILE_N)))
 #endif
 
 template<
@@ -3275,8 +3310,8 @@ matmul_logits_argmax_bf16_kernel_tuned(
   constexpr int strideX = THREADS / (BK / 4);
   constexpr int strideW = THREADS / (BK / 8);
 
-  __shared__ unsigned short xs[BK][BM];
-  __shared__ unsigned short ws[BK][BN];
+  __shared__ unsigned short xs[BK][BM + GETP_LDS_PAD];
+  __shared__ unsigned short ws[BK][BN + GETP_LDS_PAD];
   __shared__ float smax[BM];
   __shared__ int sidx[BM];
 
@@ -3735,10 +3770,7 @@ int *getp_forward_120b(Transformer * /*transformer*/,
                              sizeof(int), hipMemcpyDeviceToHost,
                              compute_stream));
 
-    // int total_blocks_mlp1 = build_moe_block_schedule(
-    //   ext->e_offsets, experts_per_device, MATMUL_MLP1_BLOCK_ROWS,
-    //   ext->blk_counts, ext->blk_offsets, compute_stream);
-    int total_blocks_mlp = build_moe_block_schedule(
+    int total_blocks_mlp1 = build_moe_block_schedule(
       ext->e_offsets, experts_per_device, MATMUL_MLP1_BLOCK_ROWS,
       ext->blk_counts, ext->blk_offsets, compute_stream);
   
@@ -3760,19 +3792,26 @@ int *getp_forward_120b(Transformer * /*transformer*/,
   launch_mlp1_swiglu_bf16_bucketed_outbf16(
       ext->gate_up_bf16, ext->a_in, w1_base, b1_base, ext->e_offsets,
       ext->blk_offsets, hidden_dim, p->intermediate_dim, experts_per_device,
-      total_blocks_mlp, p->swiglu_limit, compute_stream);
+      total_blocks_mlp1, p->swiglu_limit, compute_stream);
   
   __hip_bfloat16 *w2_base = dev_w->w_mlp2 + 1ll * l * experts_per_device * hidden_dim * p->intermediate_dim;
   __hip_bfloat16 *b2_base = dev_w->b_mlp2 + 1ll * l * experts_per_device * hidden_dim;
   
-  // int total_blocks_mlp2 = build_moe_block_schedule(
-  //     ext->e_offsets, experts_per_device, MATMUL_MLP2_BLOCK_ROWS,
-  //     ext->blk_counts, ext->blk_offsets, compute_stream);
+#if MATMUL_MLP2_BLOCK_ROWS != MATMUL_MLP1_BLOCK_ROWS
+  // mlp2 giai ma blk_offsets bang BM cua rieng no, nen khi hai BM khac nhau thi
+  // phai co lich rieng. Ghi de cung buffer la an toan: moi thu tren compute_stream,
+  // nen kernel nay khong the chay truoc khi mlp1 doc xong.
+  int total_blocks_mlp2 = build_moe_block_schedule(
+      ext->e_offsets, experts_per_device, MATMUL_MLP2_BLOCK_ROWS,
+      ext->blk_counts, ext->blk_offsets, compute_stream);
+#else
+  const int total_blocks_mlp2 = total_blocks_mlp1;
+#endif
   
   launch_mlp2_partial_bf16_bucketed_frombf16(
       ext->z_partial, ext->gate_up_bf16, w2_base, b2_base, ext->w_dev,
       ext->e_offsets, ext->blk_offsets, ext->e_dev, p->intermediate_dim,
-      hidden_dim, experts_per_device, total_blocks_mlp, compute_stream);
+      hidden_dim, experts_per_device, total_blocks_mlp2, compute_stream);
   
     HIP_CHECK(hipStreamWaitEvent(compute_stream, event_memset));
     moe_gather_pairs(ext->ext_e_agg, ext->z_partial, ext->pair_pos, hidden_dim,
