@@ -18,6 +18,17 @@
 #ifndef GETP_LDS_PAD
 #define GETP_LDS_PAD 4
 #endif
+// GETP_LDS_PAD o tren van la pad theo TRUC HANG cua bo cuc [BK][BM+PAD] va van
+// dung NGUYEN cho matmul_attn_o_bf16_kernel_tuned va
+// matmul_logits_argmax_bf16_kernel_tuned. Kernel QKV doi sang bo cuc o (slot)
+// [k/4][hang][4]: pad cua no dem theo O 8 byte chu khong theo short, va dieu
+// kien hop le phu thuoc BK qua NKC = BK/8 - moi kernel mot khac. Vi vay QKV co
+// macro RIENG; dung lai mot macro cho hai DON VI khac nhau la cach chac chan
+// nhat de cap phat sai tile mot cach im lang.
+//   -1 = tu suy ra gia tri nho nhat khong xung dot bank (xem GetpQkvLdsTile).
+#ifndef GETP_QKV_LDS_PAD_SLOTS
+#define GETP_QKV_LDS_PAD_SLOTS (-1)
+#endif
 
 #ifndef GETP_ROUTER_TOPK_MAXK
 #define GETP_ROUTER_TOPK_MAXK 4
@@ -362,8 +373,22 @@ moe_scatter_acts_to_expert_frombf16_kernel<<<grid, block, 0, stream>>>(
 #ifndef MATMUL_MLP1_LDS_PAD
 #define MATMUL_MLP1_LDS_PAD 4
 #endif
-#ifndef MATMUL_MLP2_LDS_PAD
-#define MATMUL_MLP2_LDS_PAD 8
+// mlp1 chuyen sang bo cuc LDS [k/4][hang][4]: pad dem theo O (4 short = 8 byte),
+// khong theo short. 2 o = 16 byte moi plane k0; xem Mlp1LdsPlan.
+#ifndef MATMUL_MLP1_LDS_PAD_SLOTS
+#define MATMUL_MLP1_LDS_PAD_SLOTS 2
+#endif
+// mlp2 da chuyen sang bo cuc LDS [k/4][hang][4]: pad dem theo O (4 short =
+// 8 byte), khong theo short nua, nen no can macro RIENG. MATMUL_MLP2_LDS_PAD
+// cu khong con y nghia; bao loi ngay neu con ai truyen -D cu, thay vi de no
+// thanh no-op im lang roi bi doc nham thanh nhieu do.
+// (GETP_LDS_PAD cua qkv/attn_o/logits va MATMUL_MLP1_LDS_PAD KHONG doi.)
+#ifdef MATMUL_MLP2_LDS_PAD
+#error "MATMUL_MLP2_LDS_PAD het tac dung: dung MATMUL_MLP2_LDS_PAD_SLOTS (xem Mlp2LdsPlan) va sua dong sweep dang truyen no (run3.sh:33)."
+#endif
+// -1 = tu suy ra pad nho nhat sach bank tu (BM, BNt, BK). BK=32 -> 2, BK=64 -> 1.
+#ifndef MATMUL_MLP2_LDS_PAD_SLOTS
+#define MATMUL_MLP2_LDS_PAD_SLOTS (-1)
 #endif
 
 #ifndef MATMUL_MLP1_BLOCK_ROWS
@@ -439,10 +464,80 @@ moe_scatter_acts_to_expert_frombf16_kernel<<<grid, block, 0, stream>>>(
 #define MATMUL_ROUTER_THREADS (64 * MATMUL_ROUTER_WAVES_PER_BLOCK)
 #endif
 
+// ===========================================================================
+// Bo cuc LDS cua mlp1: KPack = 4  ->  tile[k/4][hang][4]
+//
+// Mot o 4 short = 8 byte chinh la 4 phan tu k LIEN TIEP ma mot lane can cho
+// v_mfma_f32_16x16x16bf16_1k (A[i][k]: lane L thanh ghi r -> i = L%16,
+// k = 4*(L/16)+r; B[k][j] doi xung). Nen:
+//   doc : 1 x ds_read_b64   thay cho 4 x ds_read_u16
+//   ghi : 2 x ds_write_b64  thay cho 8 x ds_write_b16 (mot uint4 tu HBM)
+//
+// Bank (32 bank x 4 byte = 128 byte/chu ky):
+//   DOC  16 lane cua mot pha co cung k0 va hang lien tiep:
+//        byte = C + 8*(L%16) -> 128 byte lien tuc = phu kin 32 bank dung mot
+//        lan. Dung voi MOI gia tri pad.
+//   GHI  16 lane cua mot pha co a = lane%NKC (chunk k, truc nhanh cua loader)
+//        va b = lane/NKC (hang): dword offset = 4*S*a + 2*b, S = so o tren mot
+//        plane k0. Pad phai lam 16 lane phu kin 16 bank chan - ham duoi kiem.
+//        S = BM + 2 = 130: 4*130 = 520 == 8 (mod 32) -> bank = 8a + 2b voi
+//        a in [0,4), b in [0,4) -> {0,2,...,30}, moi bank dung mot lan.
+//        S = BM + 0 = 128: 4*128 = 512 == 0 (mod 32) -> bank = 2b -> xung dot 4 chieu.
+// ===========================================================================
+constexpr bool mlp1_lds_write_conflict_free(int S, int NKC) {
+  if (NKC <= 0 || NKC > 16 || 16 % NKC != 0) return false;
+  int seen = 0;
+  for (int l = 0; l < 16; ++l) {
+    const int a = l % NKC;
+    const int b = l / NKC;
+    int bank = (4 * S * a + 2 * b) % 32;
+    if (bank < 0) bank += 32;
+    if (bank & 1) return false;            // o phai can le 8 byte
+    const int bit = 1 << (bank >> 1);
+    if (seen & bit) return false;          // hai lane cung bank
+    seen |= bit;
+  }
+  return seen == 0xFFFF;                   // phu kin 16 bank chan
+}
+
+// Ke hoach LDS dung CHUNG cho than kernel va launcher: chi con MOT ban so hoc
+// padding nen hai ben khong the lech nhau (loi im lang kieu cu).
+template <int BM_, int BNt_, int BK_, int PADS_>
+struct Mlp1LdsPlan {
+  static constexpr int KP   = 4;                 // short / o = 8 byte = 1 ds_read_b64
+  static constexpr int KSL  = BK_ / KP;          // so plane k0
+  static constexpr int PADS = PADS_;             // pad dem theo O
+  static constexpr int SM   = BM_  + PADS;       // o tren mot plane, tile A
+  static constexpr int SN   = BNt_ + PADS;       // o tren mot plane, tile W
+  static constexpr size_t bytes =
+      (size_t)KSL * ((size_t)SM + 2 * (size_t)SN) * KP * sizeof(unsigned short);
+
+  static_assert(BK_ % KP == 0, "BK phai chia het cho KPack = 4");
+  static_assert(BK_ % 8 == 0,  "loader nap uint4 = 8 short theo truc k");
+  static_assert(mlp1_lds_write_conflict_free(SM, BK_ / 8),
+                "MATMUL_MLP1_LDS_PAD_SLOTS sai: ds_write_b64 tile A xung dot bank");
+  static_assert(mlp1_lds_write_conflict_free(SN, BK_ / 8),
+                "MATMUL_MLP1_LDS_PAD_SLOTS sai: ds_write_b64 tile W xung dot bank");
+  static_assert(((size_t)KSL * SM * KP * sizeof(unsigned short)) % 16 == 0,
+                "goc tile gate phai can le 16 byte");
+  static_assert(((size_t)KSL * SN * KP * sizeof(unsigned short)) % 16 == 0,
+                "goc tile up phai can le 16 byte");
+};
+
+// Gop hai dword thanh mot o 4 x bf16. Thuan tuy doi kieu: hai VGPR da o dung
+// cho, khong sinh lenh VALU nao (khac han 4 lenh trich nua-word cua ban cu).
+__device__ __forceinline__ bf16x4 mlp1_pack2(unsigned int lo, unsigned int hi) {
+  struct Pair { unsigned int a, b; };
+  union { Pair p; bf16x4 h; } cvt;
+  cvt.p.a = lo;
+  cvt.p.b = hi;
+  return cvt.h;
+}
+
 template<
   int BM, int BN, int BK,
   int WM, int WN,
-  int BN_AGG, int CTA, 
+  int BN_AGG, int CTA,
   int TILE_N = 64 * ((BM/WM)*(BN/WN)),
   int WARPS_PER_BLOCK = (BM/WM)*(BN/WN)
 >
@@ -484,15 +579,17 @@ mlp1_swiglu_bf16_bucketed_kernel_outbf16_tuned(
   constexpr int strideX = TILE_N / (BK / 4);
   constexpr int strideW = TILE_N / (BK / 8);
 
-  // LDS Padding optimization: Add padding to avoid bank conflicts
-  constexpr int PAD = MATMUL_MLP1_LDS_PAD;
-  constexpr int BM_PAD = BM + PAD;
-  constexpr int BNt_PAD = BNt + PAD;
-  
+  // Bo cuc LDS [k/4][hang][4] - xem Mlp1LdsPlan.
+  using LdsPlan = Mlp1LdsPlan<BM, BNt, BK, MATMUL_MLP1_LDS_PAD_SLOTS>;
+  constexpr int KP  = LdsPlan::KP;    // 4 short / o
+  constexpr int KSL = LdsPlan::KSL;   // so plane k0 = BK/4
+  constexpr int SM  = LdsPlan::SM;    // o / plane, tile A
+  constexpr int SN  = LdsPlan::SN;    // o / plane, tile W
+
   extern __shared__ unsigned short sm[];
-  unsigned short* sx  = sm;
-  unsigned short* swg = sx + (size_t)BK * BM_PAD;
-  unsigned short* swu = swg + (size_t)BK * BNt_PAD;
+  bf16x4* const sxs  = reinterpret_cast<bf16x4*>(sm);
+  bf16x4* const swgs = sxs  + (size_t)KSL * SM;
+  bf16x4* const swus = swgs + (size_t)KSL * SN;
 
 #ifdef DEBUG_LDS_POISON
   // Kiem launch: than kernel gia dinh dung TILE_N thread.
@@ -503,7 +600,7 @@ mlp1_swiglu_bf16_bucketed_kernel_outbf16_tuned(
   }
   // Do day LDS bang bf16 qNaN: o nao khong duoc loader ghi se thanh NaN.
   {
-    const int lds_shorts = BK * (BM_PAD + 2 * BNt_PAD);
+    const int lds_shorts = KSL * (SM + 2 * SN) * KP;
     for (int idx = threadIdx.x; idx < lds_shorts; idx += blockDim.x) sm[idx] = 0x7FC0;
   }
   __syncthreads();
@@ -551,25 +648,18 @@ mlp1_swiglu_bf16_bucketed_kernel_outbf16_tuned(
     const int r = loadX_y8 + off;
     const int pos = base + r;
     
-    unsigned short* dst = &sx[(LOAD_VEC * loadX_x8) * BM_PAD + r];
-    
+    // 8 short lien tiep theo k cua mot hang = 2 o ke nhau theo truc plane k0.
+    bf16x4* dst = &sxs[(size_t)((LOAD_VEC * loadX_x8) / KP) * SM + r];
+
     if (r < tcnt && kk + 7 < H) {
       const uint4* p = reinterpret_cast<const uint4*>(A_in + (size_t)pos * H + kk);
       const uint4 v = *p;
-      
-      dst[0 * BM_PAD] = (unsigned short)(v.x & 0xFFFF);
-      dst[1 * BM_PAD] = (unsigned short)(v.x >> 16);
-      dst[2 * BM_PAD] = (unsigned short)(v.y & 0xFFFF);
-      dst[3 * BM_PAD] = (unsigned short)(v.y >> 16);
-      dst[4 * BM_PAD] = (unsigned short)(v.z & 0xFFFF);
-      dst[5 * BM_PAD] = (unsigned short)(v.z >> 16);
-      dst[6 * BM_PAD] = (unsigned short)(v.w & 0xFFFF);
-      dst[7 * BM_PAD] = (unsigned short)(v.w >> 16);
+
+      dst[0]  = mlp1_pack2(v.x, v.y);   // k+0 .. k+3
+      dst[SM] = mlp1_pack2(v.z, v.w);   // k+4 .. k+7
     } else {
-      #pragma unroll
-      for (int j = 0; j < LOAD_VEC; ++j) {
-        dst[j * BM_PAD] = 0;
-      }
+      dst[0]  = mlp1_pack2(0u, 0u);
+      dst[SM] = mlp1_pack2(0u, 0u);
     }
   }
   
@@ -581,25 +671,18 @@ mlp1_swiglu_bf16_bucketed_kernel_outbf16_tuned(
     const int r = loadX_y8 + off;
     const int pos = base + r;
     
-    unsigned short* dst = &sx[(LOAD_VEC * loadX_x8) * BM_PAD + r];
-    
+    // 8 short lien tiep theo k cua mot hang = 2 o ke nhau theo truc plane k0.
+    bf16x4* dst = &sxs[(size_t)((LOAD_VEC * loadX_x8) / KP) * SM + r];
+
     if (r < tcnt && kk + 7 < H) {
       const uint4* p = reinterpret_cast<const uint4*>(A_in + (size_t)pos * H + kk);
       const uint4 v = *p;
-      
-      dst[0 * BM_PAD] = (unsigned short)(v.x & 0xFFFF);
-      dst[1 * BM_PAD] = (unsigned short)(v.x >> 16);
-      dst[2 * BM_PAD] = (unsigned short)(v.y & 0xFFFF);
-      dst[3 * BM_PAD] = (unsigned short)(v.y >> 16);
-      dst[4 * BM_PAD] = (unsigned short)(v.z & 0xFFFF);
-      dst[5 * BM_PAD] = (unsigned short)(v.z >> 16);
-      dst[6 * BM_PAD] = (unsigned short)(v.w & 0xFFFF);
-      dst[7 * BM_PAD] = (unsigned short)(v.w >> 16);
+
+      dst[0]  = mlp1_pack2(v.x, v.y);   // k+0 .. k+3
+      dst[SM] = mlp1_pack2(v.z, v.w);   // k+4 .. k+7
     } else {
-      #pragma unroll
-      for (int j = 0; j < LOAD_VEC; ++j) {
-        dst[j * BM_PAD] = 0;
-      }
+      dst[0]  = mlp1_pack2(0u, 0u);
+      dst[SM] = mlp1_pack2(0u, 0u);
     }
   }
 
@@ -608,9 +691,10 @@ mlp1_swiglu_bf16_bucketed_kernel_outbf16_tuned(
     const int kk = 0 + 8 * loadW_x;
     const int col = colBase + loadW_y + off;
 
-    unsigned short* dg = swg + (size_t)(8 * loadW_x) * BNt_PAD + (loadW_y + off);
-    unsigned short* du = swu + (size_t)(8 * loadW_x) * BNt_PAD + (loadW_y + off);
-    
+    static_assert(LOAD_VEC == 2 * KP, "mot uint4 tu HBM phai phu dung 2 o KPack");
+    bf16x4* dg = &swgs[(size_t)((8 * loadW_x) / KP) * SN + (loadW_y + off)];
+    bf16x4* du = &swus[(size_t)((8 * loadW_x) / KP) * SN + (loadW_y + off)];
+
     if (col < I && kk + 7 < H) {
       const size_t w1_gate_off = w1_e + (size_t)(2 * col + 0) * H + kk;
       const size_t w1_up_off = w1_e + (size_t)(2 * col + 1) * H + kk;
@@ -618,30 +702,16 @@ mlp1_swiglu_bf16_bucketed_kernel_outbf16_tuned(
       const uint4* pu = reinterpret_cast<const uint4*>(W1 + w1_up_off);
       const uint4 wg = *pg;
       const uint4 wu = *pu;
-      
-      dg[0 * BNt_PAD] = (unsigned short)(wg.x & 0xFFFF);
-      dg[1 * BNt_PAD] = (unsigned short)(wg.x >> 16);
-      dg[2 * BNt_PAD] = (unsigned short)(wg.y & 0xFFFF);
-      dg[3 * BNt_PAD] = (unsigned short)(wg.y >> 16);
-      dg[4 * BNt_PAD] = (unsigned short)(wg.z & 0xFFFF);
-      dg[5 * BNt_PAD] = (unsigned short)(wg.z >> 16);
-      dg[6 * BNt_PAD] = (unsigned short)(wg.w & 0xFFFF);
-      dg[7 * BNt_PAD] = (unsigned short)(wg.w >> 16);
-      
-      du[0 * BNt_PAD] = (unsigned short)(wu.x & 0xFFFF);
-      du[1 * BNt_PAD] = (unsigned short)(wu.x >> 16);
-      du[2 * BNt_PAD] = (unsigned short)(wu.y & 0xFFFF);
-      du[3 * BNt_PAD] = (unsigned short)(wu.y >> 16);
-      du[4 * BNt_PAD] = (unsigned short)(wu.z & 0xFFFF);
-      du[5 * BNt_PAD] = (unsigned short)(wu.z >> 16);
-      du[6 * BNt_PAD] = (unsigned short)(wu.w & 0xFFFF);
-      du[7 * BNt_PAD] = (unsigned short)(wu.w >> 16);
+
+      dg[0]  = mlp1_pack2(wg.x, wg.y);
+      dg[SN] = mlp1_pack2(wg.z, wg.w);
+      du[0]  = mlp1_pack2(wu.x, wu.y);
+      du[SN] = mlp1_pack2(wu.z, wu.w);
     } else {
-      #pragma unroll
-      for (int i = 0; i < 8; ++i) {
-        dg[i * BNt_PAD] = 0;
-        du[i * BNt_PAD] = 0;
-      }
+      dg[0]  = mlp1_pack2(0u, 0u);
+      dg[SN] = mlp1_pack2(0u, 0u);
+      du[0]  = mlp1_pack2(0u, 0u);
+      du[SN] = mlp1_pack2(0u, 0u);
     }
   }
   __syncthreads();
@@ -673,9 +743,6 @@ mlp1_swiglu_bf16_bucketed_kernel_outbf16_tuned(
         const int kk = bk + BK + 8 * loadW_x;
         const int col = colBase + loadW_y + off;
   
-        unsigned short* dg = swg + (size_t)(8 * loadW_x) * BNt + (loadW_y + off);
-        unsigned short* du = swu + (size_t)(8 * loadW_x) * BNt + (loadW_y + off);
-        
         if (col < I && kk + 7 < H) {
           const size_t w1_gate_off = w1_e + (size_t)(2 * col + 0) * H + kk;
           const size_t w1_up_off = w1_e + (size_t)(2 * col + 1) * H + kk;
@@ -695,36 +762,34 @@ mlp1_swiglu_bf16_bucketed_kernel_outbf16_tuned(
     // MFMA ILP optimization: Pre-load all vectors to improve instruction-level parallelism
     #pragma unroll
     for (int k = 0; k < BK; k += 16) {
-      const int basek = k + yMF * 4;
-      
+      // basek = k + 4*yMF luon chia het 4 -> plane k0 = basek/4 = (k>>2) + yMF.
+      const int kslot = (k >> 2) + yMF;
+
       // Pre-load all activation vectors
       bf16x4 av_array[nIterM];
       #pragma unroll
       for (int im = 0; im < nIterM; ++im) {
         const int row = yTile * WM + im * 16 + xMF;
-        const unsigned short* sx_row = &sx[basek * BM_PAD + row];
-        av_array[im] = {sx_row[0], sx_row[BM_PAD], sx_row[2*BM_PAD], sx_row[3*BM_PAD]};
+        av_array[im] = sxs[(size_t)kslot * SM + row];            // 1 x ds_read_b64
       }
-      
+
       // Compute with better ILP
       #pragma unroll
       for (int im = 0; im < nIterM; ++im) {
         const bf16x4 av = av_array[im];
-        
+
         #pragma unroll
         for (int g = 0; g < BN_AGG; ++g) {
           const int col_base = xTile * WN + xMF + g * BN;
-          
+
           // Pre-load all weight vectors for this aggregation group
           bf16x4 gv_array[nIterN];
           bf16x4 uv_array[nIterN];
           #pragma unroll
           for (int in = 0; in < nIterN; ++in) {
             const int c = col_base + in * 16;
-            const unsigned short* swg_ptr = &swg[basek * BNt_PAD + c];
-            const unsigned short* swu_ptr = &swu[basek * BNt_PAD + c];
-            gv_array[in] = {swg_ptr[0], swg_ptr[BNt_PAD], swg_ptr[2*BNt_PAD], swg_ptr[3*BNt_PAD]};
-            uv_array[in] = {swu_ptr[0], swu_ptr[BNt_PAD], swu_ptr[2*BNt_PAD], swu_ptr[3*BNt_PAD]};
+            gv_array[in] = swgs[(size_t)kslot * SN + c];         // 1 x ds_read_b64
+            uv_array[in] = swus[(size_t)kslot * SN + c];         // 1 x ds_read_b64
           }
           
           // Execute MFMAs with all data in registers
@@ -744,50 +809,29 @@ mlp1_swiglu_bf16_bucketed_kernel_outbf16_tuned(
       for (int i = 0; i < nbLoadsX; ++i) {
         int off = i * strideX8;
         const int r = loadX_y8 + off;
-        const int pos = base + r;
-        
-        unsigned short* dst = &sx[(LOAD_VEC * loadX_x8) * BM_PAD + r];
-        
+
+        bf16x4* dst = &sxs[(size_t)((LOAD_VEC * loadX_x8) / KP) * SM + r];
+
         const uint4 v = regX[i];
-        
-        dst[0 * BM_PAD] = (unsigned short)(v.x & 0xFFFF);
-        dst[1 * BM_PAD] = (unsigned short)(v.x >> 16);
-        dst[2 * BM_PAD] = (unsigned short)(v.y & 0xFFFF);
-        dst[3 * BM_PAD] = (unsigned short)(v.y >> 16);
-        dst[4 * BM_PAD] = (unsigned short)(v.z & 0xFFFF);
-        dst[5 * BM_PAD] = (unsigned short)(v.z >> 16);
-        dst[6 * BM_PAD] = (unsigned short)(v.w & 0xFFFF);
-        dst[7 * BM_PAD] = (unsigned short)(v.w >> 16);
+
+        dst[0]  = mlp1_pack2(v.x, v.y);
+        dst[SM] = mlp1_pack2(v.z, v.w);
       }
 
       #pragma unroll
       for (int i = 0; i < nbLoadsW; ++i) {
         int off = i * strideW;
-        const int col = colBase + loadW_y + off;
 
-        unsigned short* dg = swg + (size_t)(8 * loadW_x) * BNt_PAD + (loadW_y + off);
-        unsigned short* du = swu + (size_t)(8 * loadW_x) * BNt_PAD + (loadW_y + off);
-        
+        bf16x4* dg = &swgs[(size_t)((8 * loadW_x) / KP) * SN + (loadW_y + off)];
+        bf16x4* du = &swus[(size_t)((8 * loadW_x) / KP) * SN + (loadW_y + off)];
+
         const uint4 wg = regWG[i];
         const uint4 wu = regWU[i];
-        
-        dg[0 * BNt_PAD] = (unsigned short)(wg.x & 0xFFFF);
-        dg[1 * BNt_PAD] = (unsigned short)(wg.x >> 16);
-        dg[2 * BNt_PAD] = (unsigned short)(wg.y & 0xFFFF);
-        dg[3 * BNt_PAD] = (unsigned short)(wg.y >> 16);
-        dg[4 * BNt_PAD] = (unsigned short)(wg.z & 0xFFFF);
-        dg[5 * BNt_PAD] = (unsigned short)(wg.z >> 16);
-        dg[6 * BNt_PAD] = (unsigned short)(wg.w & 0xFFFF);
-        dg[7 * BNt_PAD] = (unsigned short)(wg.w >> 16);
-        
-        du[0 * BNt_PAD] = (unsigned short)(wu.x & 0xFFFF);
-        du[1 * BNt_PAD] = (unsigned short)(wu.x >> 16);
-        du[2 * BNt_PAD] = (unsigned short)(wu.y & 0xFFFF);
-        du[3 * BNt_PAD] = (unsigned short)(wu.y >> 16);
-        du[4 * BNt_PAD] = (unsigned short)(wu.z & 0xFFFF);
-        du[5 * BNt_PAD] = (unsigned short)(wu.z >> 16);
-        du[6 * BNt_PAD] = (unsigned short)(wu.w & 0xFFFF);
-        du[7 * BNt_PAD] = (unsigned short)(wu.w >> 16);
+
+        dg[0]  = mlp1_pack2(wg.x, wg.y);
+        dg[SN] = mlp1_pack2(wg.z, wg.w);
+        du[0]  = mlp1_pack2(wu.x, wu.y);
+        du[SN] = mlp1_pack2(wu.z, wu.w);
       }
     }
 
@@ -849,6 +893,109 @@ mlp1_swiglu_bf16_bucketed_kernel_outbf16_tuned(
   }
 }
 
+// ===========================================================================
+// Bo cuc LDS cua mlp2: KPack = 4  ->  tile[k/4][hang][4]   (cu: tile[k][hang])
+//
+// Mot o 4 short = 8 byte chinh la 4 phan tu k LIEN TIEP ma mot lane can cho
+// v_mfma_f32_16x16x16bf16_1k (A[i][k]: lane L thanh ghi r -> i = L%16,
+// k = 4*(L/16)+r; B[k][j] doi xung). Nen:
+//   doc : 1 x ds_read_b64   thay cho 4 x ds_read_u16
+//   ghi : 2 x ds_write_b64  thay cho 8 x ds_write_b16 (mot uint4 tu HBM)
+//
+// Bank (32 bank x 4 byte = 128 byte/chu ky), so cua cau hinh mlp2 mac dinh
+// BM=64, BN=64, BN_AGG=3 -> BNt=192, BK=32, WM=WN=32, 256 thread:
+//
+//   DOC  mot pha ds_read_b64 = 16 lane cung yMF (nen CUNG plane k0), xMF=0..15
+//        chay tren 16 HANG lien tiep:  byte(L) = C + 8*L  ->  128 byte lien
+//        tuc = 32 bank, moi bank dung mot lan  => SACH VOI MOI PAD.
+//        (Ban cu: 16 lane doc 16 short lien tiep = 8 dword -> 8 bank; hai lane
+//         chung mot dword la broadcast nen "khong xung dot", nhung moi chu ky
+//         chi chuyen 64 byte co ich = mot nua bang thong, va ton 4 lan so lenh.)
+//
+//   GHI  loader giu NGUYEN anh xa thread -> (hang, chunk k):
+//          a = tid % NKC (chunk 8 short theo k), b = tid / NKC (hang), NKC=BK/8.
+//        Mot uint4 = 8 short theo k = 2 o KE NHAU theo truc plane k0:
+//          dword(a,b) = 4*S*a + 2*b   (S = so o tren mot plane k0)
+//        S = BM  + 2 =  66 : 4*66  = 264 == 8 (mod 32) -> bank = 8a + 2b voi
+//                           a in [0,4), b in [0,4) -> {0,2,...,30}, moi bank
+//                           dung dung mot lan  => GHI SACH.
+//        S = BNt + 2 = 194 : 4*194 = 776 == 8 (mod 32) -> y het tren => SACH.
+//        Ban cu (PAD=8): buoc chunk 8*BM_PAD/2 = 8*72/2 = 288 dword == 0 (mod
+//        32), va 8*BNt_PAD/2 = 800 == 0 (mod 32) -> CA BON chunk roi vao cung
+//        nhom bank: ds_write_b16 xung dot 4 CHIEU tren ca hai tile.
+//
+// Vi sao khong dung bo cuc phang [hang][k] (KPAD = BK + 4 short): o do doc chi
+// sach khi (BK+PAD)/4 le, con GHI van 2 chieu voi MOI pad; bo cuc o nay ghi
+// SACH that. No cung ton it LDS hon: 16640 B, so voi 18432 B cua [hang][k] va
+// 17408 B cua ban hien tai.
+// ===========================================================================
+constexpr bool mlp2_lds_write_conflict_free(int S, int NKC) {
+  if (NKC <= 0 || NKC > 16 || 16 % NKC != 0) return false;
+  int seen = 0;
+  for (int l = 0; l < 16; ++l) {         // mot pha ds_write_b64 = 16 lane
+    const int a = l % NKC;               // chunk k (truc nhanh cua loader)
+    const int b = l / NKC;               // hang
+    int bank = (4 * S * a + 2 * b) % 32;
+    if (bank < 0) bank += 32;
+    if (bank & 1) return false;          // o 8 byte can le -> bank phai chan
+    const int bit = 1 << (bank >> 1);
+    if (seen & bit) return false;        // hai lane cung bank
+    seen |= bit;
+  }
+  return seen == 0xFFFF;                 // phu kin 16 bank chan
+}
+
+// Pad nho nhat hop le cho CA hai tile, suy tu (BM, BNt, BK) thay vi hang so
+// cung: BK=32 -> 2 (2, 6, 10 deu duoc); BK=64 -> 1 (1,3,5,7); BK=16 -> 4.
+// Nho vay moi dong sweep mlp2 dang co (bm128 / bn128 / 128x128 / bk64) van
+// bien dich duoc ma khong phai suy lai pad bang tay.
+constexpr int mlp2_lds_pad_slots_auto(int BM_, int BNt_, int NKC) {
+  for (int p = 0; p <= 16; ++p)
+    if (mlp2_lds_write_conflict_free(BM_ + p, NKC) &&
+        mlp2_lds_write_conflict_free(BNt_ + p, NKC))
+      return p;
+  return -1;
+}
+
+// Ke hoach LDS dung CHUNG cho than kernel va launcher: chi con MOT ban so hoc
+// padding nen hai ben khong the lech nhau (loi im lang kieu cu: launcher cap
+// thieu dynamic LDS thi tile hong ma khong ai bao).
+template <int BM_, int BNt_, int BK_, int PADS_REQ_>
+struct Mlp2LdsPlan {
+  static constexpr int KP   = 4;                 // short / o = 8 byte = 1 ds_read_b64
+  static constexpr int KSL  = BK_ / KP;          // so plane k0
+  static constexpr int NKC  = BK_ / 8;           // so chunk 8-short tren mot hang
+  static constexpr int PADS = (PADS_REQ_ >= 0)
+                                ? PADS_REQ_
+                                : mlp2_lds_pad_slots_auto(BM_, BNt_, NKC);
+  static constexpr int SM   = BM_  + PADS;       // o tren mot plane, tile A
+  static constexpr int SN   = BNt_ + PADS;       // o tren mot plane, tile W
+  static constexpr size_t bytes =
+      (size_t)KSL * ((size_t)SM + (size_t)SN) * KP * sizeof(unsigned short);
+
+  static_assert(BK_ % KP == 0, "BK phai chia het cho KPack = 4");
+  static_assert(BK_ % 8 == 0,  "loader nap uint4 = 8 short theo truc k");
+  static_assert(PADS >= 0,
+                "khong tim duoc pad sach bank cho (BM,BNt,BK) nay - xem mlp2_lds_pad_slots_auto");
+  static_assert(mlp2_lds_write_conflict_free(SM, NKC),
+                "MATMUL_MLP2_LDS_PAD_SLOTS sai: ds_write_b64 tile A xung dot bank"
+                " (BK=32 dung 2, BK=64 dung 1, BK=16 dung 4)");
+  static_assert(mlp2_lds_write_conflict_free(SN, NKC),
+                "MATMUL_MLP2_LDS_PAD_SLOTS sai: ds_write_b64 tile W xung dot bank"
+                " (BK=32 dung 2, BK=64 dung 1, BK=16 dung 4)");
+  static_assert(((size_t)KSL * SM * KP * sizeof(unsigned short)) % 16 == 0,
+                "goc tile W phai can le 16 byte");
+  static_assert(bytes <= 64u * 1024u, "tile LDS mlp2 vuot 64 KB/CU");
+};
+
+// Gop hai dword thanh mot o 4 x bf16. Thuan tuy doi kieu: hai VGPR da nam dung
+// cho nen khong sinh lenh VALU nao (khac 4 lenh trich nua-word cua ban cu).
+// __builtin_bit_cast la cach viet chuan, khong phai punning qua union.
+__device__ __forceinline__ bf16x4 mlp2_pack2(unsigned int lo, unsigned int hi) {
+  struct Pair { unsigned int a, b; };
+  return __builtin_bit_cast(bf16x4, Pair{lo, hi});
+}
+
 template<
   int BM, int BN, int BK,
   int WM, int WN,
@@ -886,14 +1033,20 @@ mlp2_partial_bf16_bucketed_splitk_kernel_inbf16_tuned(
   const int xMF = lane & 15;
   const int yMF = lane >> 4;
 
-  // LDS Padding optimization for MLP2
-  constexpr int PAD = MATMUL_MLP2_LDS_PAD;
-  constexpr int BM_PAD = BM + PAD;
-  constexpr int BNt_PAD = BNt + PAD;
+  // Bo cuc LDS [k/4][hang][4] - xem Mlp2LdsPlan. Hinh hoc tinh MOT lan o
+  // day, va launcher dung lai dung ke hoach nay.
+  using LdsPlan = Mlp2LdsPlan<BM, BNt, BK, MATMUL_MLP2_LDS_PAD_SLOTS>;
+  constexpr int KP  = LdsPlan::KP;    // 4 short / o
+  constexpr int KSL = LdsPlan::KSL;   // so plane k0 = BK/4
+  constexpr int SM  = LdsPlan::SM;    // o / plane, tile A
+  constexpr int SN  = LdsPlan::SN;    // o / plane, tile W
 
-  extern __shared__ unsigned short sm[];
-  unsigned short* sx = sm;
-  unsigned short* sw = sx + (size_t)BK * BM_PAD;
+  // __align__(16): goc vung LDS dong duoc BAO DAM can le 16 byte, nen ep
+  // kieu sang bf16x4 (can le 8) la dung theo kieu, khong phai tinh co dung.
+  // Ten rieng mlp2_sm de thuoc tinh align khong va voi `sm` cua kernel khac.
+  extern __shared__ __align__(16) unsigned short mlp2_sm[];
+  bf16x4* const sxs = reinterpret_cast<bf16x4*>(mlp2_sm);
+  bf16x4* const sws = sxs + KSL * SM;
 
 #ifdef DEBUG_LDS_POISON
   // Kiem launch: than kernel gia dinh dung TILE_N thread.
@@ -904,8 +1057,8 @@ mlp2_partial_bf16_bucketed_splitk_kernel_inbf16_tuned(
   }
   // Do day LDS bang bf16 qNaN: o nao khong duoc loader ghi se thanh NaN.
   {
-    const int lds_shorts = BK * (BM_PAD + BNt_PAD);
-    for (int idx = threadIdx.x; idx < lds_shorts; idx += blockDim.x) sm[idx] = 0x7FC0;
+    const int lds_shorts = KSL * (SM + SN) * KP;
+    for (int idx = threadIdx.x; idx < lds_shorts; idx += blockDim.x) mlp2_sm[idx] = 0x7FC0;
   }
   __syncthreads();
 #endif
@@ -972,24 +1125,19 @@ mlp2_partial_bf16_bucketed_splitk_kernel_inbf16_tuned(
     const int r = loadX_y8 + off;
     const int pos = base + r;
     
-    unsigned short* dst = &sx[(LOAD_VEC * loadX_x8) * BM_PAD + r];
+    // 8 short lien tiep theo k cua MOT hang = 2 o ke nhau theo truc plane k0.
+    bf16x4* dst = &sxs[((LOAD_VEC * loadX_x8) / KP) * SM + r];
     
     if (r < tcnt && kk + 7 < kEnd) {
       const __hip_bfloat16* src = gate_up_bf16 + (size_t)pos * (size_t)I + kk;
       const uint4* p = reinterpret_cast<const uint4*>(src);
       const uint4 v = *p;
       
-      dst[0 * BM_PAD] = (unsigned short)(v.x & 0xFFFF);
-      dst[1 * BM_PAD] = (unsigned short)(v.x >> 16);
-      dst[2 * BM_PAD] = (unsigned short)(v.y & 0xFFFF);
-      dst[3 * BM_PAD] = (unsigned short)(v.y >> 16);
-      dst[4 * BM_PAD] = (unsigned short)(v.z & 0xFFFF);
-      dst[5 * BM_PAD] = (unsigned short)(v.z >> 16);
-      dst[6 * BM_PAD] = (unsigned short)(v.w & 0xFFFF);
-      dst[7 * BM_PAD] = (unsigned short)(v.w >> 16);
+      dst[0]  = mlp2_pack2(v.x, v.y);   // k+0 .. k+3   ds_write_b64
+      dst[SM] = mlp2_pack2(v.z, v.w);   // k+4 .. k+7   ds_write_b64
     } else {
-      #pragma unroll
-      for (int j = 0; j < LOAD_VEC; ++j) { dst[j * BM_PAD] = 0; }
+      dst[0]  = mlp2_pack2(0u, 0u);
+      dst[SM] = mlp2_pack2(0u, 0u);
     }
   }
   
@@ -1001,24 +1149,19 @@ mlp2_partial_bf16_bucketed_splitk_kernel_inbf16_tuned(
     const int r = loadX_y8 + off;
     const int pos = base + r;
     
-    unsigned short* dst = &sx[(LOAD_VEC * loadX_x8) * BM_PAD + r];
+    // 8 short lien tiep theo k cua MOT hang = 2 o ke nhau theo truc plane k0.
+    bf16x4* dst = &sxs[((LOAD_VEC * loadX_x8) / KP) * SM + r];
     
     if (r < tcnt && kk + 7 < kEnd) {
       const __hip_bfloat16* src = gate_up_bf16 + (size_t)pos * (size_t)I + kk;
       const uint4* p = reinterpret_cast<const uint4*>(src);
       const uint4 v = *p;
       
-      dst[0 * BM_PAD] = (unsigned short)(v.x & 0xFFFF);
-      dst[1 * BM_PAD] = (unsigned short)(v.x >> 16);
-      dst[2 * BM_PAD] = (unsigned short)(v.y & 0xFFFF);
-      dst[3 * BM_PAD] = (unsigned short)(v.y >> 16);
-      dst[4 * BM_PAD] = (unsigned short)(v.z & 0xFFFF);
-      dst[5 * BM_PAD] = (unsigned short)(v.z >> 16);
-      dst[6 * BM_PAD] = (unsigned short)(v.w & 0xFFFF);
-      dst[7 * BM_PAD] = (unsigned short)(v.w >> 16);
+      dst[0]  = mlp2_pack2(v.x, v.y);   // k+0 .. k+3   ds_write_b64
+      dst[SM] = mlp2_pack2(v.z, v.w);   // k+4 .. k+7   ds_write_b64
     } else {
-      #pragma unroll
-      for (int j = 0; j < LOAD_VEC; ++j) { dst[j * BM_PAD] = 0; }
+      dst[0]  = mlp2_pack2(0u, 0u);
+      dst[SM] = mlp2_pack2(0u, 0u);
     }
   }
 
@@ -1028,24 +1171,19 @@ mlp2_partial_bf16_bucketed_splitk_kernel_inbf16_tuned(
     const int kk = kBeg + 8 * loadW_x;
     const int col = colBase + loadW_y + off;
     
-    unsigned short* dst = sw + (size_t)(8 * loadW_x) * BNt_PAD + (loadW_y + off);
+    static_assert(LOAD_VEC == 2 * KP, "mot uint4 tu HBM phai phu dung 2 o KPack");
+    bf16x4* dst = &sws[((8 * loadW_x) / KP) * SN + (loadW_y + off)];
     
     if (col < H && kk + 7 < kEnd) {
       const size_t w2_off = w2_e + (size_t)col * (size_t)I + kk;
       const uint4* pw = reinterpret_cast<const uint4*>(W2 + w2_off);
       const uint4 wb = *pw;
       
-      dst[0 * BNt_PAD] = (unsigned short)(wb.x & 0xFFFF);
-      dst[1 * BNt_PAD] = (unsigned short)(wb.x >> 16);
-      dst[2 * BNt_PAD] = (unsigned short)(wb.y & 0xFFFF);
-      dst[3 * BNt_PAD] = (unsigned short)(wb.y >> 16);
-      dst[4 * BNt_PAD] = (unsigned short)(wb.z & 0xFFFF);
-      dst[5 * BNt_PAD] = (unsigned short)(wb.z >> 16);
-      dst[6 * BNt_PAD] = (unsigned short)(wb.w & 0xFFFF);
-      dst[7 * BNt_PAD] = (unsigned short)(wb.w >> 16);
+      dst[0]  = mlp2_pack2(wb.x, wb.y);   // k+0 .. k+3   ds_write_b64
+      dst[SN] = mlp2_pack2(wb.z, wb.w);   // k+4 .. k+7   ds_write_b64
     } else {
-      #pragma unroll
-      for (int i = 0; i < 8; ++i) dst[i * BNt_PAD] = 0;
+      dst[0]  = mlp2_pack2(0u, 0u);
+      dst[SN] = mlp2_pack2(0u, 0u);
     }
   }
 
@@ -1096,15 +1234,16 @@ mlp2_partial_bf16_bucketed_splitk_kernel_inbf16_tuned(
     // MFMA ILP optimization for MLP2: Pre-load all vectors
     #pragma unroll
     for (int k = 0; k < BK; k += 16) {
-      const int basek = k + yMF * 4;
+      // basek = k + 4*yMF luon chia het 4 -> plane k0 = basek/4 = (k>>2) + yMF;
+      // 4 phan tu mot lane can (k..k+3 cua CUNG mot hang) nam gon trong mot o.
+      const int kslot = (k >> 2) + yMF;
       
       // Pre-load all activation vectors
       bf16x4 av_array[nIterM];
       #pragma unroll
       for (int im = 0; im < nIterM; ++im) {
         const int row = yTile * WM + im * 16 + xMF;
-        const unsigned short* sx_row = &sx[basek * BM_PAD + row];
-        av_array[im] = {sx_row[0], sx_row[BM_PAD], sx_row[2*BM_PAD], sx_row[3*BM_PAD]};
+        av_array[im] = sxs[kslot * SM + row];              // 1 x ds_read_b64
       }
       
       // Compute with improved ILP
@@ -1121,8 +1260,7 @@ mlp2_partial_bf16_bucketed_splitk_kernel_inbf16_tuned(
           #pragma unroll
           for (int in = 0; in < nIterN; ++in) {
             const int c = col_base + in * 16;
-            const unsigned short* sw_ptr = &sw[basek * BNt_PAD + c];
-            bv_array[in] = {sw_ptr[0], sw_ptr[BNt_PAD], sw_ptr[2*BNt_PAD], sw_ptr[3*BNt_PAD]};
+            bv_array[in] = sws[kslot * SN + c];                // 1 x ds_read_b64
           }
           
           // Execute MFMAs with all data in registers
@@ -1143,18 +1281,13 @@ mlp2_partial_bf16_bucketed_splitk_kernel_inbf16_tuned(
         const int r = loadX_y8 + off;
         const int pos = base + r;
         
-        unsigned short* dst = &sx[(LOAD_VEC * loadX_x8) * BM_PAD + r];
+        // 8 short lien tiep theo k cua MOT hang = 2 o ke nhau theo truc plane k0.
+        bf16x4* dst = &sxs[((LOAD_VEC * loadX_x8) / KP) * SM + r];
         
         const uint4 v = regX[i];
         
-        dst[0 * BM_PAD] = (unsigned short)(v.x & 0xFFFF);
-        dst[1 * BM_PAD] = (unsigned short)(v.x >> 16);
-        dst[2 * BM_PAD] = (unsigned short)(v.y & 0xFFFF);
-        dst[3 * BM_PAD] = (unsigned short)(v.y >> 16);
-        dst[4 * BM_PAD] = (unsigned short)(v.z & 0xFFFF);
-        dst[5 * BM_PAD] = (unsigned short)(v.z >> 16);
-        dst[6 * BM_PAD] = (unsigned short)(v.w & 0xFFFF);
-        dst[7 * BM_PAD] = (unsigned short)(v.w >> 16);
+        dst[0]  = mlp2_pack2(v.x, v.y);   // k+0 .. k+3   ds_write_b64
+        dst[SM] = mlp2_pack2(v.z, v.w);   // k+4 .. k+7   ds_write_b64
       }
 
       // Store weight with padding
@@ -1163,18 +1296,13 @@ mlp2_partial_bf16_bucketed_splitk_kernel_inbf16_tuned(
         int off = i * strideW;
         const int col = colBase + loadW_y + off;
         
-        unsigned short* dst = sw + (size_t)(8 * loadW_x) * BNt_PAD + (loadW_y + off);
+        static_assert(LOAD_VEC == 2 * KP, "mot uint4 tu HBM phai phu dung 2 o KPack");
+        bf16x4* dst = &sws[((8 * loadW_x) / KP) * SN + (loadW_y + off)];
         
         const uint4 wb = regW[i];
         
-        dst[0 * BNt_PAD] = (unsigned short)(wb.x & 0xFFFF);
-        dst[1 * BNt_PAD] = (unsigned short)(wb.x >> 16);
-        dst[2 * BNt_PAD] = (unsigned short)(wb.y & 0xFFFF);
-        dst[3 * BNt_PAD] = (unsigned short)(wb.y >> 16);
-        dst[4 * BNt_PAD] = (unsigned short)(wb.z & 0xFFFF);
-        dst[5 * BNt_PAD] = (unsigned short)(wb.z >> 16);
-        dst[6 * BNt_PAD] = (unsigned short)(wb.w & 0xFFFF);
-        dst[7 * BNt_PAD] = (unsigned short)(wb.w >> 16);
+        dst[0]  = mlp2_pack2(wb.x, wb.y);   // k+0 .. k+3   ds_write_b64
+        dst[SN] = mlp2_pack2(wb.z, wb.w);   // k+4 .. k+7   ds_write_b64
       }
     }
 
@@ -1237,15 +1365,16 @@ static inline void launch_mlp1_swiglu_bf16_bucketed_outbf16(
   static_assert(WARPS == (BM / WM) * (BN / WN),
                 "WAVES_PER_BLOCK phai bang (BM/WM)*(BN/WN): than kernel cap"
                 " TILE_N = 64*(BM/WM)*(BN/WN) thread, launcher cap 64*WARPS.");
-  constexpr int BNt = BN * 2;
-  constexpr int PAD = MATMUL_MLP1_LDS_PAD;
-  constexpr int BM_PAD = BM + PAD;
-  constexpr int BNt_PAD = BNt + PAD;
+  // BN_AGG la MOT hang so duy nhat cho ca BNt lan tham so mau cua kernel: truoc
+  // day so 2 duoc viet lai o hai cho, lech nhau la cap phat thieu LDS im lang.
+  constexpr int BN_AGG = 2;
+  constexpr int BNt = BN * BN_AGG;
+  using LdsPlan = Mlp1LdsPlan<BM, BNt, BK, MATMUL_MLP1_LDS_PAD_SLOTS>;
   dim3 block(THREADS);
   dim3 grid((I + BNt - 1) / BNt, total_blocks);
-  // Updated shared memory size with LDS padding
-  size_t shmem = (size_t)BK * ((size_t)BM_PAD + (size_t)BNt_PAD + (size_t)BNt_PAD) * sizeof(unsigned short);
-  mlp1_swiglu_bf16_bucketed_kernel_outbf16_tuned<BM,BN,BK,WM,WN,2,CTA>
+  // MOT nguon su that cho kich thuoc LDS - dung ke hoach ma than kernel dung.
+  size_t shmem = LdsPlan::bytes;
+  mlp1_swiglu_bf16_bucketed_kernel_outbf16_tuned<BM,BN,BK,WM,WN,BN_AGG,CTA>
     <<<grid, block, shmem, stream>>>(gate_up_bf16, a_in, w1_layer, b1_layer, offsets, blk_offs, H, I, E, swiglu_limit);
     
 }
@@ -1267,7 +1396,10 @@ static inline void launch_mlp2_partial_bf16_bucketed_frombf16(
   static_assert(WARPS == (BM / WM) * (BN / WN),
                 "WAVES_PER_BLOCK phai bang (BM/WM)*(BN/WN): than kernel cap"
                 " TILE_N = 64*(BM/WM)*(BN/WN) thread, launcher cap 64*WARPS.");
-  constexpr int BNt = BN * 3;
+  // BN_AGG la MOT hang so duy nhat cho ca BNt lan tham so mau cua kernel:
+  // truoc day so 3 duoc viet lai o hai cho, lech nhau la hong tile im lang.
+  constexpr int BN_AGG = 3;
+  constexpr int BNt = BN * BN_AGG;
 
   int dev = 0, cu = 104;
   HIP_CHECK(hipGetDevice(&dev));
@@ -1289,15 +1421,20 @@ static inline void launch_mlp2_partial_bf16_bucketed_frombf16(
     HIP_CHECK(hipMemsetAsync(z_partial, 0, (size_t)total_pairs * (size_t)H * sizeof(float), stream));
   }
 
-  constexpr int PAD = MATMUL_MLP2_LDS_PAD;
-  constexpr int BM_PAD = BM + PAD;
-  constexpr int BNt_PAD = BNt + PAD;
+  // MOT nguon su that cho hinh hoc LDS: dung chinh ke hoach cua than kernel.
+  using LdsPlan = Mlp2LdsPlan<BM, BNt, BK, MATMUL_MLP2_LDS_PAD_SLOTS>;
   dim3 block(THREADS);
   dim3 grid(max(1, gx), max(1, gy), splits);
-  // Updated shared memory size with LDS padding
-  size_t shmem = (size_t)BK * ((size_t)BM_PAD + (size_t)BNt_PAD) * sizeof(unsigned short);
+  // __launch_bounds__(TILE_N, NUM_CTA_MLP2): doi so thu hai cua HIP la SO
+  // WAVE TOI THIEU TREN MOI SIMD, khong phai so block tren CU. Voi 256
+  // thread (4 wave/block) va NUM_CTA_MLP2 = 4 thi so block 'hua' la
+  // 4*CTA/WARPS = 4, can 4*16640 = 66560 B > 64 KB, nen LDS van chan o
+  // 3 block/CU (3*16640 = 49920 B) - dung nhu ban cu (3*17408 = 52224 B).
+  // Occupancy KHONG doi, chi du them 2304 B. Ghi ro de lan sau doi tile
+  // khong ai tuong doi so CTA la so block tren CU.
+  size_t shmem = LdsPlan::bytes;
 
-  mlp2_partial_bf16_bucketed_splitk_kernel_inbf16_tuned<BM,BN,BK,WM,WN,3,NUM_CTA_MLP2>
+  mlp2_partial_bf16_bucketed_splitk_kernel_inbf16_tuned<BM,BN,BK,WM,WN,BN_AGG,NUM_CTA_MLP2>
     <<<grid, block, shmem, stream>>>(z_partial, gate_up_bf16, w2_layer, b2_layer, w_by_bucket,
                                      offsets, blk_offs, tok_idx, I, H, E, splits);
   
@@ -1328,6 +1465,111 @@ static inline void moe_gather_pairs(float *e_agg, const float *z_partial,
   moe_gather_pairs_kernel<<<grd, blk, 0, stream>>>(e_agg, z_partial, pair_pos,
                                                    H, K, B);
   
+}
+
+// ===========================================================================
+// Bo cuc LDS cua new_matmul_qkv_fused_kernel: KPack = 4 -> tile[k/4][hang][4]
+//
+// Mot O = 4 short = 8 byte = DUNG 4 phan tu k lien tiep ma mot lane can cho
+// v_mfma_f32_16x16x16bf16_1k (A[i][k]: lane L thanh ghi r -> i = L%16,
+// k = 4*(L/16)+r; B[k][j] doi xung). Nen:
+//   doc : 1 x ds_read_b64   thay cho 4 x ds_read_u16
+//   ghi : 2 x ds_write_b64  thay cho 8 x ds_write_b16 (mot uint4 tu HBM)
+//
+// Bank (32 bank x 4 byte = 128 byte/chu ky):
+//   DOC  16 lane cua mot pha co CUNG plane k0 (Ak = 4*(lane>>4) khong doi) va
+//        hang = row0 + (lane&15) chay lien tiep:
+//          byte = C + 8*(lane&15) -> 128 byte lien tuc -> phu kin 32 bank dung
+//          mot lan. Khong xung dot VOI MOI gia tri pad.
+//   GHI  loader: a = threadIdx.x % (BK/8) la chunk k, b = threadIdx.x / (BK/8)
+//        la hang. Trong mot pha 16 lane: a in [0,NKC), b in [0,16/NKC).
+//        O ghi thu nhat co chi so o = (2a)*S + b, S = so o tren mot plane k0
+//          -> byte = 16*S*a + 8*b  -> dword = 4*S*a + 2*b.
+//        S = 128 + 2 = 130: 4*130 = 520 == 8 (mod 32) -> bank = 8a + 2b,
+//          a in [0,4), b in [0,4) -> {0,2,...,30}: moi bank dung mot lan.
+//          O thu hai lech them 2*S = 260 == 4 (mod 32) -> van la hoan vi.
+//          => KHONG xung dot ca doc lan ghi.
+//        S = 128 + 0 = 128: 4*128 = 512 == 0 (mod 32) -> bank = 2b: 4 chieu.
+//        S = 128 + 4 = 132: 4*132 = 528 == 16 (mod 32) -> {0,16,0,16}: 2 chieu.
+//        (Bo cuc [hang][k] "phang" cung lam doc sach, nhung ghi thi con 2 chieu
+//         voi MOI pad; bo cuc o nay khong mat gi ma het xung dot ca hai chieu.)
+//
+// Can le: o 8 byte, goc tile can le 16 byte -> moi dia chi ds_read_b64 /
+// ds_write_b64 deu can le 8 byte. b128 KHONG dung duoc o day (hai o cua mot
+// uint4 cach nhau S o, khong ke nhau) - day la lua chon co y: b64 khong xung
+// dot hon la b128 xung dot.
+// ===========================================================================
+constexpr bool getp_qkv_lds_write_conflict_free(int S, int NKC) {
+  if (NKC <= 0 || NKC > 16 || 16 % NKC != 0) return false;
+  int seen = 0;
+  for (int l = 0; l < 16; ++l) {
+    const int a = l % NKC;                 // chunk k (truc nhanh cua loader)
+    const int b = l / NKC;                 // hang trong pha 16 lane
+    int bank = (4 * S * a + 2 * b) % 32;
+    if (bank < 0) bank += 32;
+    if (bank & 1) return false;            // o phai can le 8 byte
+    const int bit = 1 << (bank >> 1);
+    if (seen & bit) return false;          // hai lane trung bank
+    seen |= bit;
+  }
+  return seen == 0xFFFF;                   // phu kin 16 bank chan
+}
+
+// Pad tu suy ra: lay gia tri nho nhat hop le nen khong bao gio tra thua LDS.
+// (hang=128, NKC=4) -> 2 ; (hang=128, NKC=2, tuc BK=16) -> 4. Nho vay bo cuc
+// nay tong quat theo BK thay vi khoa cung mot hang so.
+constexpr int getp_qkv_pick_pad_slots(int rows, int NKC) {
+  for (int p = 0; p < 16; ++p)
+    if (getp_qkv_lds_write_conflict_free(rows + p, NKC)) return p;
+  return -1;
+}
+
+// Ke hoach LDS dung CHUNG cho than kernel va launcher.
+template <int ROWS, int BK_, int PADS_>
+struct GetpQkvLdsTile {
+  static constexpr int KP   = 4;                  // short / o = 8 byte
+  static constexpr int KSL  = BK_ / KP;           // so plane k0
+  static constexpr int NKC  = BK_ / 8;            // so chunk k cua loader
+  static constexpr int PADS =
+      (PADS_ >= 0) ? PADS_ : getp_qkv_pick_pad_slots(ROWS, NKC);
+  static constexpr int S     = ROWS + PADS;       // o tren mot plane k0
+  static constexpr int slots = KSL * S;           // o cua ca tile
+  static constexpr size_t bytes =
+      (size_t)slots * KP * sizeof(unsigned short);
+
+  static_assert(BK_ % 8 == 0, "loader nap uint4 = 8 short theo truc k");
+  static_assert(BK_ % KP == 0, "BK phai chia het cho KPack = 4");
+  static_assert(PADS >= 0,
+                "khong pad nao lam ds_write_b64 het xung dot: phai doi loader");
+  static_assert(getp_qkv_lds_write_conflict_free(S, NKC),
+                "GETP_QKV_LDS_PAD_SLOTS sai: ds_write_b64 xung dot bank "
+                "(ROWS=128: BK=32 -> dung 2, BK=16 -> dung 4)");
+};
+
+// Hinh khoi cua QKV: MOT ban duy nhat cho ca than kernel lan launcher. Truoc
+// day launcher giu ban sao rieng va DA lech - "const int BK = 16;" o launcher
+// trong khi than kernel dung BK = 32. Bien do chet (chi BM/BN vao grid) nen vo
+// hai, nhung dung la lop loi "hang so cu song sot qua mot lan sua".
+struct GetpQkvTile {
+  static constexpr int BM = 128;
+  static constexpr int BN = 128;
+  static constexpr int BK = 32;
+  static constexpr int WM = 64;
+  static constexpr int WN = 64;
+  static constexpr int THREADS = 256;
+};
+
+// Gop hai dword thanh mot o 4 x bf16. Thuan tuy doi kieu: hai VGPR da nam dung
+// cho nen khong sinh lenh VALU nao (khac 8 lenh trich nua-word cua ban cu).
+// __builtin_bit_cast la cach viet chuan, khong phai union punning.
+__device__ __forceinline__ bf16x4 getp_qkv_pack2(unsigned int lo,
+                                                 unsigned int hi) {
+  struct Pair { unsigned int a, b; };
+  static_assert(sizeof(Pair) == sizeof(bf16x4), "o phai la 8 byte");
+  Pair p;
+  p.a = lo;
+  p.b = hi;
+  return __builtin_bit_cast(bf16x4, p);
 }
 
 __global__ void __launch_bounds__(256)
@@ -1389,8 +1631,48 @@ new_matmul_qkv_fused_kernel(
 
   assert(blockDim.x == BLOCK_SIZE);
 
-  __shared__ unsigned short xs[BK][BM + GETP_LDS_PAD];
-  __shared__ unsigned short ws[BK][BN + GETP_LDS_PAD];
+  // Hinh khoi phai khop GetpQkvTile - nguon su that dung chung voi launcher.
+  static_assert(BM == GetpQkvTile::BM && BN == GetpQkvTile::BN &&
+                    BK == GetpQkvTile::BK && WM == GetpQkvTile::WM &&
+                    WN == GetpQkvTile::WN &&
+                    BLOCK_SIZE == GetpQkvTile::THREADS,
+                "than kernel va GetpQkvTile lech nhau");
+
+  // Bo cuc LDS [k/4][hang][4] - xem GetpQkvLdsTile. Ten xs/ws bi XOA co y: moi
+  // cho chua chuyen doi se la loi bien dich chu khong phai dia chi sai im lang.
+  using LdsX = GetpQkvLdsTile<BM, BK, GETP_QKV_LDS_PAD_SLOTS>;
+  using LdsW = GetpQkvLdsTile<BN, BK, GETP_QKV_LDS_PAD_SLOTS>;
+  constexpr int KP = LdsX::KP;    // 4 short / o
+  constexpr int SX = LdsX::S;     // o tren mot plane k0, tile A
+  constexpr int SW = LdsW::S;     // o tren mot plane k0, tile B
+  static_assert(LdsX::KSL == LdsW::KSL, "hai tile phai cung so plane k0");
+  static_assert(LdsX::bytes + LdsW::bytes <= 64 * 1024, "vuot 64 KB LDS / CU");
+
+  // Afloat/Bfloat va bf16x4 deu la vector 4 x unsigned short (8 byte) nen gan
+  // thang duoc; neu mot ngay nao do lech kieu thi day thanh loi bien dich.
+  static_assert(sizeof(bf16x4) == sizeof(Afloat) &&
+                    sizeof(bf16x4) == sizeof(Bfloat),
+                "toan hang A/B cua MFMA phai la vector 8 byte");
+
+  // __align__(16) la bao hiem: bf16x4 chi can 8 byte, nhung goc tile can le 16
+  // byte lam MOI dia chi o chac chan can le 8 byte duoi mat LLVM, thay vi chi
+  // "tinh ra la dung". Do la dieu kien de sinh ds_read_b64 / ds_write_b64.
+  __shared__ __align__(16) bf16x4 xss[LdsX::slots];
+  __shared__ __align__(16) bf16x4 wss[LdsW::slots];
+
+#ifdef DEBUG_LDS_POISON
+  // Do day LDS bang bf16 qNaN: o nao loader khong ghi se thanh NaN. Dung de
+  // chia doi loi khi token agreement khong ra dung 100.00 %.
+  {
+    unsigned short *raw_x = reinterpret_cast<unsigned short *>(xss);
+    unsigned short *raw_w = reinterpret_cast<unsigned short *>(wss);
+    for (int i = threadIdx.x; i < LdsX::slots * KP; i += blockDim.x)
+      raw_x[i] = 0x7FC0;
+    for (int i = threadIdx.x; i < LdsW::slots * KP; i += blockDim.x)
+      raw_w[i] = 0x7FC0;
+  }
+  __syncthreads();
+#endif
 
   Afloat x_local;
   Bfloat w_local;
@@ -1405,14 +1687,12 @@ new_matmul_qkv_fused_kernel(
     int index_y = BM * blockIdx.y + loadXIdx_y + offset;
     uint4 tmp = index_x < K && index_y < M ?
       *reinterpret_cast<const uint4 *>(&x[index_y * K + index_x]) : make_uint4(0, 0, 0, 0);
-    xs[8 * loadXIdx_x + 0][loadXIdx_y + offset] = (unsigned short)(tmp.x & 0xFFFF);
-    xs[8 * loadXIdx_x + 1][loadXIdx_y + offset] = (unsigned short)(tmp.x >> 16);
-    xs[8 * loadXIdx_x + 2][loadXIdx_y + offset] = (unsigned short)(tmp.y & 0xFFFF);
-    xs[8 * loadXIdx_x + 3][loadXIdx_y + offset] = (unsigned short)(tmp.y >> 16);
-    xs[8 * loadXIdx_x + 4][loadXIdx_y + offset] = (unsigned short)(tmp.z & 0xFFFF);
-    xs[8 * loadXIdx_x + 5][loadXIdx_y + offset] = (unsigned short)(tmp.z >> 16);
-    xs[8 * loadXIdx_x + 6][loadXIdx_y + offset] = (unsigned short)(tmp.w & 0xFFFF);
-    xs[8 * loadXIdx_x + 7][loadXIdx_y + offset] = (unsigned short)(tmp.w >> 16);
+    // 8 short lien tiep theo k cua MOT hang = 2 o ke nhau theo truc plane k0.
+    // Thu tu nua-word giu y nguyen (tmp.x thap = k+0, tmp.x cao = k+1, ...)
+    // nen day la phep doi dia chi thuan tuy: bit-exact.
+    bf16x4 *dst = &xss[((8 * loadXIdx_x) / KP) * SX + (loadXIdx_y + offset)];
+    dst[0]  = getp_qkv_pack2(tmp.x, tmp.y);   // k+0 .. k+3
+    dst[SX] = getp_qkv_pack2(tmp.z, tmp.w);   // k+4 .. k+7
   }
   #pragma unroll
   for (int i = 0; i < nbLoadsW; ++i) {
@@ -1421,14 +1701,9 @@ new_matmul_qkv_fused_kernel(
     int index_y = BN * blockIdx.x + loadWIdx_y + offset;
     uint4 tmp = index_x < K && index_y < N ?
       *reinterpret_cast<const uint4 *>(&w[index_y * K + index_x]) : uint4(0, 0, 0, 0);
-    ws[8 * loadWIdx_x + 0][loadWIdx_y + offset] = (unsigned short)(tmp.x & 0xFFFF);
-    ws[8 * loadWIdx_x + 1][loadWIdx_y + offset] = (unsigned short)(tmp.x >> 16);
-    ws[8 * loadWIdx_x + 2][loadWIdx_y + offset] = (unsigned short)(tmp.y & 0xFFFF);
-    ws[8 * loadWIdx_x + 3][loadWIdx_y + offset] = (unsigned short)(tmp.y >> 16);
-    ws[8 * loadWIdx_x + 4][loadWIdx_y + offset] = (unsigned short)(tmp.z & 0xFFFF);
-    ws[8 * loadWIdx_x + 5][loadWIdx_y + offset] = (unsigned short)(tmp.z >> 16);
-    ws[8 * loadWIdx_x + 6][loadWIdx_y + offset] = (unsigned short)(tmp.w & 0xFFFF);
-    ws[8 * loadWIdx_x + 7][loadWIdx_y + offset] = (unsigned short)(tmp.w >> 16);
+    bf16x4 *dst = &wss[((8 * loadWIdx_x) / KP) * SW + (loadWIdx_y + offset)];
+    dst[0]  = getp_qkv_pack2(tmp.x, tmp.y);   // k+0 .. k+3
+    dst[SW] = getp_qkv_pack2(tmp.z, tmp.w);   // k+4 .. k+7
   }
   __syncthreads();
   
@@ -1463,11 +1738,13 @@ new_matmul_qkv_fused_kernel(
       for (int iterWaveM = 0; iterWaveM < nIterWaveM; ++iterWaveM) {
         #pragma unroll
         for (int iterWaveN = 0; iterWaveN < nIterWaveN; ++iterWaveN) {
-          #pragma unroll
-          for (int i = 0; i < 4; ++i) {
-            x_local[i] = xs[k + Ak + i][yInBlockTile * WM + MFMA_M * iterWaveM + Ai];
-            w_local[i] = ws[k + Bk + i][xInBlockTile * WN + MFMA_N * iterWaveN + Bj];
-          }
+          // basek = k + 4*(lane>>4) luon chia het cho 4, nen 4 phan tu k cua
+          // mot hang nam gon trong MOT o -> 1 x ds_read_b64 thay cho 4 x
+          // ds_read_u16. Giu Ak/Bk de anh xa lane cua MFMA van hien ro.
+          x_local = xss[((k + Ak) / KP) * SX +
+                        (yInBlockTile * WM + MFMA_M * iterWaveM + Ai)];
+          w_local = wss[((k + Bk) / KP) * SW +
+                        (xInBlockTile * WN + MFMA_N * iterWaveN + Bj)];
 
           CDfloat y_local = acc_local[iterWaveM * nIterWaveN + iterWaveN]; 
           y_local  = __builtin_amdgcn_mfma_f32_16x16x16bf16_1k(x_local, w_local, y_local, 0, 0, 0);
@@ -1480,26 +1757,16 @@ new_matmul_qkv_fused_kernel(
       #pragma unroll
       for (int i = 0; i < nbLoadsX; ++i) {
         int offset = i * strideX;
-        xs[8 * loadXIdx_x + 0][loadXIdx_y + offset] = (unsigned short)(regX[i].x & 0xFFFF);
-        xs[8 * loadXIdx_x + 1][loadXIdx_y + offset] = (unsigned short)(regX[i].x >> 16);
-        xs[8 * loadXIdx_x + 2][loadXIdx_y + offset] = (unsigned short)(regX[i].y & 0xFFFF);
-        xs[8 * loadXIdx_x + 3][loadXIdx_y + offset] = (unsigned short)(regX[i].y >> 16);
-        xs[8 * loadXIdx_x + 4][loadXIdx_y + offset] = (unsigned short)(regX[i].z & 0xFFFF);
-        xs[8 * loadXIdx_x + 5][loadXIdx_y + offset] = (unsigned short)(regX[i].z >> 16);
-        xs[8 * loadXIdx_x + 6][loadXIdx_y + offset] = (unsigned short)(regX[i].w & 0xFFFF);
-        xs[8 * loadXIdx_x + 7][loadXIdx_y + offset] = (unsigned short)(regX[i].w >> 16);
+        bf16x4 *dst = &xss[((8 * loadXIdx_x) / KP) * SX + (loadXIdx_y + offset)];
+        dst[0]  = getp_qkv_pack2(regX[i].x, regX[i].y);
+        dst[SX] = getp_qkv_pack2(regX[i].z, regX[i].w);
       }
       #pragma unroll
       for (int i = 0; i < nbLoadsW; ++i) {
         int offset = i * strideW;
-        ws[8 * loadWIdx_x + 0][loadWIdx_y + offset] = (unsigned short)(regW[i].x & 0xFFFF);
-        ws[8 * loadWIdx_x + 1][loadWIdx_y + offset] = (unsigned short)(regW[i].x >> 16);
-        ws[8 * loadWIdx_x + 2][loadWIdx_y + offset] = (unsigned short)(regW[i].y & 0xFFFF);
-        ws[8 * loadWIdx_x + 3][loadWIdx_y + offset] = (unsigned short)(regW[i].y >> 16);
-        ws[8 * loadWIdx_x + 4][loadWIdx_y + offset] = (unsigned short)(regW[i].z & 0xFFFF);
-        ws[8 * loadWIdx_x + 5][loadWIdx_y + offset] = (unsigned short)(regW[i].z >> 16);
-        ws[8 * loadWIdx_x + 6][loadWIdx_y + offset] = (unsigned short)(regW[i].w & 0xFFFF);
-        ws[8 * loadWIdx_x + 7][loadWIdx_y + offset] = (unsigned short)(regW[i].w >> 16);
+        bf16x4 *dst = &wss[((8 * loadWIdx_x) / KP) * SW + (loadWIdx_y + offset)];
+        dst[0]  = getp_qkv_pack2(regW[i].x, regW[i].y);
+        dst[SW] = getp_qkv_pack2(regW[i].z, regW[i].w);
       }
     }
     __syncthreads();
@@ -1554,11 +1821,14 @@ static inline void getp_matmul_qkv_fused_bf16(
   const int N = q_len + k_len + v_len;
   const int K = n;
 
-  const int BN = 128;
-  const int BM = 128;
-  const int BK = 16;
+  // MOT nguon su that cho hinh khoi: lay tu chinh hang so than kernel dung.
+  // Ban cu o day co "const int BK = 16;" trong khi than kernel dung BK = 32 -
+  // bien chet nen vo hai, nhung static_assert trong than kernel gio khoa cap
+  // BM/BN/BK/WM/WN/THREADS lai voi nhau.
+  const int BN = GetpQkvTile::BN;
+  const int BM = GetpQkvTile::BM;
 
-  dim3 block(256);
+  dim3 block(GetpQkvTile::THREADS);
   dim3 grid((N + BN - 1) / BN, (M + BM - 1) / BM);
 
   new_matmul_qkv_fused_kernel<<<grid, block, 0, stream>>>(
@@ -3274,6 +3544,91 @@ static inline void getp_matmul_router_bf16(float *xout, float *x, __hip_bfloat16
 #define MATMUL_ATTN_O_WAVES_PER_BLOCK (((MATMUL_ATTN_O_BLOCK_ROWS) / (MATMUL_ATTN_O_WARP_TILE_M)) * ((MATMUL_ATTN_O_BLOCK_COLS) / (MATMUL_ATTN_O_WARP_TILE_N)))
 #endif
 
+// ===========================================================================
+// LDS cua attn_o: tu k-major [BK][BM+GETP_LDS_PAD] sang layout O (slot) 8 byte.
+//
+//   O (k0, row) chua 4 short k = 4*k0 .. 4*k0+3 cua CUNG mot hang.
+//   * Mot manh MFMA (A[i][k] hoac B[k][j]) = dung 4 short k lien tiep cua mot
+//     hang  ->  MOT ds_read_b64 thay cho BON ds_read_u16.
+//   * Mot uint4 nap tu HBM = 8 short k lien tiep = hai o  ->  HAI ds_write_b64
+//     thay cho TAM ds_write_b16.
+//
+// Bank (32 bank x 4 byte = 128 byte/chu ky; b64 phuc vu theo pha 16 lane, moi
+// lane chiem MOT cap bank chan/le, khong xung dot <=> 16 lane phu kin 16 cap):
+//
+//   DOC   16 lane cua mot pha co cung k0 (k0 chi phu thuoc lane>>4) va 16 hang
+//         lien tiep (Ai = Bj = lane&15):
+//             byte = C + 8*(lane&15)  ->  128 byte lien tuc  ->  32 bank, moi
+//         bank dung mot lan. DUNG VOI MOI PADS - doc khong rang buoc pad.
+//
+//   GHI   16 lane cua mot pha co a = lane % NKC (chunk k, truc nhanh loader) va
+//         b = lane / NKC (hang), NKC = BK/8. O dich la k0 = 2a (va 2a+1), nen
+//             dword = 2*(k0*S + row),  S = BM + PADS (hoac BN + PADS)
+//             bank  = (4*S*a + 2*b) mod 32.
+//         Pad phai lam 16 lane phu kin 16 bank chan:
+//             BK=16 (NKC=2): 4S == 16 (mod 32) -> S == 4 (mod 8) -> PADS 4, 12
+//             BK=32 (NKC=4): 4S == 8 hay 24    -> S == 2 hay 6   -> PADS 2, 6, 10, 14
+//             BK=64 (NKC=8): 4S == 4,12,20,28  -> S le           -> PADS 1, 3, 5, 7
+//         KHONG co hang so dung cho moi BK, nen PADS phai TU SUY theo BK
+//         (mac dinh cua kernel nay la BK=16, co thang la BK=32, sweep co BK=64).
+//
+// Kich thuoc LDS KHONG tang: BK*(BM+BN+2*PADS)*2 byte, bang hoac nho hon ban cu
+// BK*(BM+BN+2*GETP_LDS_PAD)*2 vi PADS <= 4.
+//     BK=16 PADS=4:  8448 B  (cu  8448 B)
+//     BK=32 PADS=2: 16640 B  (cu 16896 B)
+//     BK=64 PADS=1: 33024 B  (cu 33792 B)
+// ===========================================================================
+constexpr bool attn_o_lds_write_conflict_free(int S, int NKC) {
+  if (NKC <= 0 || NKC > 16 || 16 % NKC != 0) return false;
+  int seen = 0;
+  for (int l = 0; l < 16; ++l) {
+    const int a = l % NKC;                 // chunk k cua loader
+    const int b = l / NKC;                 // hang trong pha
+    int bank = (4 * S * a + 2 * b) % 32;
+    if (bank < 0) bank += 32;
+    if (bank & 1) return false;            // o phai can le 8 byte
+    const int bit = 1 << (bank >> 1);
+    if (seen & bit) return false;          // hai lane cung cap bank
+    seen |= bit;
+  }
+  return seen == 0xFFFF;                   // phu kin 16 cap bank
+}
+
+// PADS nho nhat hop le cho CA HAI tile (X dung S = BM+PADS, W dung S = BN+PADS).
+constexpr int attn_o_lds_pad_slots(int BM_, int BN_, int NKC) {
+  for (int p = 0; p < 16; ++p)
+    if (attn_o_lds_write_conflict_free(BM_ + p, NKC) &&
+        attn_o_lds_write_conflict_free(BN_ + p, NKC))
+      return p;
+  return -1;
+}
+
+// Pad RIENG cua attn_o - KHONG dung chung GETP_LDS_PAD (macro do van thuoc ve
+// qkv:1392-1393 va logits:3656-3657). Hai macro dem hai thu khac nhau:
+//   GETP_LDS_PAD                : so SHORT dem tren truc HANG cua mot mat k;
+//                                 nhan gia tri tuy y, chi doi hieu nang
+//                                 (autotune.sh:38-40 va run2.sh:35-37 quet
+//                                 2 / 8 / 16).
+//   MATMUL_ATTN_O_LDS_PAD_SLOTS : so O 8-BYTE dem tren truc hang cua mot mat o;
+//                                 co rang buoc CUNG theo BK (bang tren). Dua
+//                                 2 / 8 / 16 vao day se hoac loi bien dich hoac
+//                                 thanh xung dot ghi 2 chieu bi do nham la nhieu.
+// -1 = tu suy theo (BM, BN, BK). Chi dat tay khi muon quet 6/10/14 o BK=32.
+#ifndef MATMUL_ATTN_O_LDS_PAD_SLOTS
+#define MATMUL_ATTN_O_LDS_PAD_SLOTS (-1)
+#endif
+
+// Gop hai dword lien tiep cua uint4 thanh mot o 4 x bf16. Thuan tuy doi kieu:
+// hai VGPR da nam dung cho (ket qua global_load_dwordx4) nen KHONG sinh lenh
+// VALU nao - khac han 4 lenh trich nua-word (& 0xFFFF / >> 16) cua ban cu.
+// __builtin_bit_cast thay cho union punning: cung codegen, dung chuan.
+__device__ __forceinline__ bf16x4 attn_o_pack2(unsigned int lo, unsigned int hi) {
+  struct Pair { unsigned int a, b; };
+  static_assert(sizeof(Pair) == sizeof(bf16x4), "pack2: kich thuoc lech");
+  Pair p; p.a = lo; p.b = hi;
+  return __builtin_bit_cast(bf16x4, p);
+}
+
 template<
   int BM, int BN, int BK,
   int WM, int WN,
@@ -3301,8 +3656,16 @@ matmul_attn_o_bf16_kernel_tuned(
 
   const int waveIdx = threadIdx.x >> 6;
   const int laneIdx = threadIdx.x & 63;
-  const int xInBlockTile = waveIdx % (BM / WM);
-  const int yInBlockTile = waveIdx / (BM / WM);
+  // SUA LOI TIEM AN (cung lop voi forward.hip:1371-1372 cua qkv): xInBlockTile
+  // chay tren truc N nen phai chia theo BN/WN; yInBlockTile chay tren truc M nen
+  // la thuong cua cung mau so do. Ban cu dung (BM/WM) cho ca hai - vo hai khi
+  // BM/WM == BN/WN (moi cau hinh dang chay, ke ca -DMATMUL_ATTN_O_BLOCK_DEPTH=32)
+  // nhung SAI voi attno_cfg.txt dong 5 (bm256) va dong 8 (bk32_bm256): BM/WM=4,
+  // BN/WN=2 -> xInBlockTile toi 3 -> col = 3*64+63 = 255 >= BN=128, doc ngoai
+  // tile W va ghi sai cot, dong thoi chi mot nua so hang duoc tinh. Hai dong nay
+  // sinh MA Y HET ban cu o moi cau hinh co BM/WM == BN/WN.
+  const int xInBlockTile = waveIdx % (BN / WN);
+  const int yInBlockTile = waveIdx / (BN / WN);
 
   const int Ai = laneIdx & 15;
   const int Ak = 4 * (laneIdx >> 4);
@@ -3312,28 +3675,61 @@ matmul_attn_o_bf16_kernel_tuned(
   constexpr int nIterWaveM = WM / MFMA_M;
   constexpr int nIterWaveN = WN / MFMA_N;
 
-  constexpr int nbLoadsX = BM * (BK / 4) / THREADS;
   constexpr int nbLoadsW = BN * (BK / 8) / THREADS;
-  const int loadXIdx_y = threadIdx.x / (BK / 4);
-  const int loadXIdx_x = threadIdx.x % (BK / 4);
   const int loadWIdx_y = threadIdx.x / (BK / 8);
   const int loadWIdx_x = threadIdx.x % (BK / 8);
-  constexpr int strideX = THREADS / (BK / 4);
+  const int loadW_k0   = 2 * loadWIdx_x;      // o dau cua uint4 trong tile W
   constexpr int strideW = THREADS / (BK / 8);
+  // Da xoa nbLoadsX / loadXIdx_x / loadXIdx_y / strideX: chung KHONG BAO GIO
+  // duoc dung (duong nap X di qua bo bien *_x8 ben duoi). Giu lai chung dung la
+  // lop "stride cu song sot qua mot lan sua".
 
-  __shared__ unsigned short xs[BK][BM + GETP_LDS_PAD];
-  __shared__ unsigned short ws[BK][BN + GETP_LDS_PAD];
+  constexpr int KP   = 4;             // short / o = 8 byte = 1 ds_read_b64
+  constexpr int KSL  = BK / KP;       // so mat o (k0)
+  constexpr int NKC  = BK / 8;        // so chunk k cua loader (uint4 = 8 short)
+  constexpr int PADS = (MATMUL_ATTN_O_LDS_PAD_SLOTS >= 0)
+                         ? MATMUL_ATTN_O_LDS_PAD_SLOTS
+                         : attn_o_lds_pad_slots(BM, BN, NKC);
+  static_assert(BK % 8 == 0, "loader nap uint4 = 8 short theo truc k");
+  static_assert(BK % KP == 0, "BK phai chia het cho KP = 4");
+  static_assert(PADS >= 0,
+                "khong tim duoc PADS nao lam ds_write_b64 het xung dot bank; "
+                "xem attn_o_lds_pad_slots()");
+  static_assert(attn_o_lds_write_conflict_free(BM + PADS, NKC),
+                "MATMUL_ATTN_O_LDS_PAD_SLOTS sai: ds_write_b64 tile X xung dot "
+                "bank (BK=16 -> 4, BK=32 -> 2, BK=64 -> 1)");
+  static_assert(attn_o_lds_write_conflict_free(BN + PADS, NKC),
+                "MATMUL_ATTN_O_LDS_PAD_SLOTS sai: ds_write_b64 tile W xung dot "
+                "bank (BK=16 -> 4, BK=32 -> 2, BK=64 -> 1)");
+  static_assert(sizeof(bf16x4) == 8 && sizeof(Afloat) == 8 &&
+                sizeof(Bfloat) == 8, "manh MFMA phai la 8 byte");
 
-  Afloat x_local;
-  Bfloat w_local;
+  // Ten moi (xsT/wsT) co chu dich: moi vi tri xs[..][..] chua doi se la LOI BIEN
+  // DICH chu khong phai mot dia chi sai im lang.
+  // Kieu phan tu la bf16x4 (alignment 8) nen MOI truy cap la mot ds_read_b64 /
+  // ds_write_b64 - khong can reinterpret_cast o bat ky cho nao. __align__(16)
+  // bao dam goc mang: mang __shared__ kieu unsigned short chi duoc canh 2 byte.
+  __shared__ __align__(16) bf16x4 xsT[KSL][BM + PADS];
+  __shared__ __align__(16) bf16x4 wsT[KSL][BN + PADS];
+  static_assert(sizeof(xsT) + sizeof(wsT) <= 64 * 1024, "LDS > 64 KB moi CU");
+
   CDfloat acc_local[nIterWaveM * nIterWaveN] = {0};
 
   // AGGRESSIVE X load: uint4 for 8 bf16 elements (16 bytes)
   constexpr int X_LOAD_VEC = 8;
   const int loadX_x8 = threadIdx.x % (BK / X_LOAD_VEC);
   const int loadX_y8 = threadIdx.x / (BK / X_LOAD_VEC);
+  const int loadX_k0 = 2 * loadX_x8;          // o dau cua uint4 trong tile X
   constexpr int strideX8 = THREADS / (BK / X_LOAD_VEC);
   constexpr int nbLoadsX8 = BM * (BK / X_LOAD_VEC) / THREADS;
+  // Loader phai phu kin tile. Khong co hai assert nay thi wm32/wn32 o BK=16 cho
+  // nbLoadsX8 = 128*2/512 = 0, va bm256 o BK=16 cho nbLoadsW = 128*2/512 = 0:
+  // tile khong duoc nap va ket qua sai IM LANG (va nhanh hon). Ba dong cau hinh
+  // do trong attno_cfg.txt phai di kem -DMATMUL_ATTN_O_BLOCK_DEPTH=32 tro len.
+  static_assert(nbLoadsX8 >= 1 && (BM * (BK / X_LOAD_VEC)) % THREADS == 0,
+                "loader X khong phu kin tile: BM*(BK/8) phai chia het THREADS");
+  static_assert(nbLoadsW >= 1 && (BN * (BK / 8)) % THREADS == 0,
+                "loader W khong phu kin tile: BN*(BK/8) phai chia het THREADS");
   
   #pragma unroll
   for (int i = 0; i < nbLoadsX8; ++i) {
@@ -3347,18 +3743,16 @@ matmul_attn_o_bf16_kernel_tuned(
       // Fast path: uint4 load (8 bf16 = 16 bytes)
       const uint4* p = reinterpret_cast<const uint4*>(x + (size_t)rg * K + kk);
       const uint4 v = *p;
-      
-      xs[X_LOAD_VEC * loadX_x8 + 0][row_tile] = (unsigned short)(v.x & 0xFFFF);
-      xs[X_LOAD_VEC * loadX_x8 + 1][row_tile] = (unsigned short)(v.x >> 16);
-      xs[X_LOAD_VEC * loadX_x8 + 2][row_tile] = (unsigned short)(v.y & 0xFFFF);
-      xs[X_LOAD_VEC * loadX_x8 + 3][row_tile] = (unsigned short)(v.y >> 16);
-      xs[X_LOAD_VEC * loadX_x8 + 4][row_tile] = (unsigned short)(v.z & 0xFFFF);
-      xs[X_LOAD_VEC * loadX_x8 + 5][row_tile] = (unsigned short)(v.z >> 16);
-      xs[X_LOAD_VEC * loadX_x8 + 6][row_tile] = (unsigned short)(v.w & 0xFFFF);
-      xs[X_LOAD_VEC * loadX_x8 + 7][row_tile] = (unsigned short)(v.w >> 16);
+
+      // 8 short k lien tiep = hai o -> hai ds_write_b64 (truoc: 8 ds_write_b16).
+      // Thu tu nua-word giu NGUYEN: v.x thap = k+0, v.x cao = k+1, v.y thap =
+      // k+2, ... -> cung anh byte -> bit-exact.
+      xsT[loadX_k0 + 0][row_tile] = attn_o_pack2(v.x, v.y);
+      xsT[loadX_k0 + 1][row_tile] = attn_o_pack2(v.z, v.w);
     } else {
-      #pragma unroll
-      for (int j = 0; j < X_LOAD_VEC; ++j) xs[X_LOAD_VEC * loadX_x8 + j][row_tile] = 0;
+      const bf16x4 zero4 = attn_o_pack2(0u, 0u);
+      xsT[loadX_k0 + 0][row_tile] = zero4;
+      xsT[loadX_k0 + 1][row_tile] = zero4;
     }
   }
   // AGGRESSIVE W load: optimized uint4 load with full unroll
@@ -3372,18 +3766,13 @@ matmul_attn_o_bf16_kernel_tuned(
       // Fast path: vectorized uint4 load
       const uint4* p = reinterpret_cast<const uint4*>(&w[(size_t)cy * K + kk]);
       const uint4 tmp = *p;
-      
-      ws[8 * loadWIdx_x + 0][loadWIdx_y + off] = (unsigned short)(tmp.x & 0xFFFF);
-      ws[8 * loadWIdx_x + 1][loadWIdx_y + off] = (unsigned short)(tmp.x >> 16);
-      ws[8 * loadWIdx_x + 2][loadWIdx_y + off] = (unsigned short)(tmp.y & 0xFFFF);
-      ws[8 * loadWIdx_x + 3][loadWIdx_y + off] = (unsigned short)(tmp.y >> 16);
-      ws[8 * loadWIdx_x + 4][loadWIdx_y + off] = (unsigned short)(tmp.z & 0xFFFF);
-      ws[8 * loadWIdx_x + 5][loadWIdx_y + off] = (unsigned short)(tmp.z >> 16);
-      ws[8 * loadWIdx_x + 6][loadWIdx_y + off] = (unsigned short)(tmp.w & 0xFFFF);
-      ws[8 * loadWIdx_x + 7][loadWIdx_y + off] = (unsigned short)(tmp.w >> 16);
+
+      wsT[loadW_k0 + 0][loadWIdx_y + off] = attn_o_pack2(tmp.x, tmp.y);
+      wsT[loadW_k0 + 1][loadWIdx_y + off] = attn_o_pack2(tmp.z, tmp.w);
     } else {
-      #pragma unroll
-      for (int j = 0; j < 8; ++j) ws[8 * loadWIdx_x + j][loadWIdx_y + off] = 0;
+      const bf16x4 zero4 = attn_o_pack2(0u, 0u);
+      wsT[loadW_k0 + 0][loadWIdx_y + off] = zero4;
+      wsT[loadW_k0 + 1][loadWIdx_y + off] = zero4;
     }
   }
   __syncthreads();
@@ -3429,30 +3818,25 @@ matmul_attn_o_bf16_kernel_tuned(
     // MFMA compute loop - fully unrolled for maximum ILP
     #pragma unroll
     for (int k = 0; k < BK; k += MFMA_K) {
-      const int base_k = k + Ak;
-      
+      // base_k = k + Ak la boi cua 4 (k boi cua 16, Ak = 4*(lane>>4)) nen ca 4
+      // short k nam GON trong mot o -> chi so o = base_k >> 2. Chi so giu 32-bit:
+      // dia chi LDS la 32-bit, khong dua (size_t) vao vong nong.
+      const int ak0 = (k + Ak) >> 2;
+      const int bk0 = (k + Bk) >> 2;
+
       #pragma unroll
       for (int im = 0; im < nIterWaveM; ++im) {
         const int row = yInBlockTile * WM + MFMA_M * im + Ai;
-        // Pre-load activation vector once per im iteration
-        Afloat av;
-        av[0] = xs[base_k + 0][row];
-        av[1] = xs[base_k + 1][row];
-        av[2] = xs[base_k + 2][row];
-        av[3] = xs[base_k + 3][row];
-        
+        // MOT ds_read_b64 (truoc: 4 ds_read_u16 buoc BM+GETP_LDS_PAD).
+        const Afloat av = xsT[ak0][row];
+
         #pragma unroll
         for (int in = 0; in < nIterWaveN; ++in) {
           const int col = xInBlockTile * WN + MFMA_N * in + Bj;
-          const int base_bk = k + Bk;
-          
-          // Load weight vector
-          Bfloat bv;
-          bv[0] = ws[base_bk + 0][col];
-          bv[1] = ws[base_bk + 1][col];
-          bv[2] = ws[base_bk + 2][col];
-          bv[3] = ws[base_bk + 3][col];
-          
+
+          // MOT ds_read_b64 (truoc: 4 ds_read_u16 buoc BN+GETP_LDS_PAD).
+          const Bfloat bv = wsT[bk0][col];
+
           const int idx = im * nIterWaveN + in;
           acc_local[idx] = __builtin_amdgcn_mfma_f32_16x16x16bf16_1k(av, bv, acc_local[idx], 0, 0, 0);
         }
@@ -3469,28 +3853,16 @@ matmul_attn_o_bf16_kernel_tuned(
         if (row_tile >= BM) break;
         
         const uint4 v = regX8[i];
-        xs[X_LOAD_VEC * loadX_x8 + 0][row_tile] = (unsigned short)(v.x & 0xFFFF);
-        xs[X_LOAD_VEC * loadX_x8 + 1][row_tile] = (unsigned short)(v.x >> 16);
-        xs[X_LOAD_VEC * loadX_x8 + 2][row_tile] = (unsigned short)(v.y & 0xFFFF);
-        xs[X_LOAD_VEC * loadX_x8 + 3][row_tile] = (unsigned short)(v.y >> 16);
-        xs[X_LOAD_VEC * loadX_x8 + 4][row_tile] = (unsigned short)(v.z & 0xFFFF);
-        xs[X_LOAD_VEC * loadX_x8 + 5][row_tile] = (unsigned short)(v.z >> 16);
-        xs[X_LOAD_VEC * loadX_x8 + 6][row_tile] = (unsigned short)(v.w & 0xFFFF);
-        xs[X_LOAD_VEC * loadX_x8 + 7][row_tile] = (unsigned short)(v.w >> 16);
+        xsT[loadX_k0 + 0][row_tile] = attn_o_pack2(v.x, v.y);
+        xsT[loadX_k0 + 1][row_tile] = attn_o_pack2(v.z, v.w);
       }
       
       #pragma unroll
       for (int i = 0; i < nbLoadsW; ++i) {
         const int off = i * strideW;
         const uint4 w_val = regW[i];
-        ws[8 * loadWIdx_x + 0][loadWIdx_y + off] = (unsigned short)(w_val.x & 0xFFFF);
-        ws[8 * loadWIdx_x + 1][loadWIdx_y + off] = (unsigned short)(w_val.x >> 16);
-        ws[8 * loadWIdx_x + 2][loadWIdx_y + off] = (unsigned short)(w_val.y & 0xFFFF);
-        ws[8 * loadWIdx_x + 3][loadWIdx_y + off] = (unsigned short)(w_val.y >> 16);
-        ws[8 * loadWIdx_x + 4][loadWIdx_y + off] = (unsigned short)(w_val.z & 0xFFFF);
-        ws[8 * loadWIdx_x + 5][loadWIdx_y + off] = (unsigned short)(w_val.z >> 16);
-        ws[8 * loadWIdx_x + 6][loadWIdx_y + off] = (unsigned short)(w_val.w & 0xFFFF);
-        ws[8 * loadWIdx_x + 7][loadWIdx_y + off] = (unsigned short)(w_val.w >> 16);
+        wsT[loadW_k0 + 0][loadWIdx_y + off] = attn_o_pack2(w_val.x, w_val.y);
+        wsT[loadW_k0 + 1][loadWIdx_y + off] = attn_o_pack2(w_val.z, w_val.w);
       }
     }
     __syncthreads();
@@ -3534,6 +3906,10 @@ static inline void getp_matmul_attn_o_bf16(
   constexpr int WN = MATMUL_ATTN_O_WARP_TILE_N;
   constexpr int WARPS = MATMUL_ATTN_O_WAVES_PER_BLOCK;
 
+  // Ghi chu __launch_bounds__: doi so THU HAI cua HIP la SO WAVE TOI THIEU MOI
+  // SIMD, khong phai so block moi CU. Kernel nay chi truyen mot doi so (THREADS)
+  // nen khong bi anh huong; neu ai do them doi so thu hai thi so workgroup duoc
+  // hua la 4*CTA/WARPS chu khong phai CTA.
   dim3 block(64 * WARPS);
   dim3 grid((N + BN - 1) / BN, (M + BM - 1) / BM);
 
@@ -3606,12 +3982,72 @@ __global__ void extract_argmax_pairs(const unsigned long long* pairs, int* out, 
 #define MATMUL_LOGITS_WAVES_PER_BLOCK (((MATMUL_LOGITS_BLOCK_ROWS) / (MATMUL_LOGITS_WARP_TILE_M)) * ((MATMUL_LOGITS_BLOCK_COLS) / (MATMUL_LOGITS_WARP_TILE_N)))
 #endif
 
+// ---------------------------------------------------------------------------
+// Hinh hoc LDS cua kernel logits (LM head).
+//
+// Tile duoc xep theo [row][k] - k LIEN TIEP trong mot hang - nen "padding" o
+// day la pad cua MOT HANG k, KHONG phai pad cua mot mat k nhu GETP_LDS_PAD.
+// Hai dai luong nay cung ten nhung khac nghia, khac dieu kien hop le va khac
+// don vi, nen kernel nay phai co macro pad RIENG. GETP_LDS_PAD giu nguyen
+// nghia cu va van phuc vu hai kernel con lai o bo [k][row]: qkv (:1392-1393)
+// va attn_o (:3324-3325).
+//
+//   Buoc mot hang  = (BK+PAD) short = 2*(BK+PAD) byte = (BK+PAD)/2 bank.
+//   Mot fragment MFMA = 4 short = 8 byte = 2 bank = 1 "double-bank".
+//   16 lane cua mot phase ds_read_b64 chuyen 16*8 = 128 byte = dung 32 bank.
+//   Trong mot phase, L/16 la HANG SO nen basek co dinh va row = row0 + (L&15)
+//   chay tren 16 hang lien tiep, tuc db(i) = (S*i + c) mod 16 voi S = (BK+PAD)/4.
+//   Trai het 32 bank <=> gcd(S,16) = 1 <=> S LE.
+//   BK boi 16 (static_assert san co) => BK/4 chan => S = BK/4 + PAD/4 le <=>
+//   PAD/4 le. Vay PAD = 4 dung cho MOI BK hop le (BK=16 -> S=5; 32 -> S=9;
+//   64 -> S=17) va la gia tri RE NHAT; 12/20/28 cung hop le nhung chi ton them
+//   LDS ma khong bot duoc mot xung dot nao.
+//
+// Vi du BK=32 (co trong co build dang thang): KPAD = 36 short = 72 byte
+// = 18 bank = 9 double-bank. Bank DAU cua 16 lane trong mot phase (row0=0,
+// basek=0) la 18*i mod 32 = 18,4,22,8,26,12,30,16,2,20,6,24,10,28,14,0 - doi
+// mot khac nhau, moi lane chiem cap bank {b, b+1} -> phu dung 32 bank mot lan,
+// KHONG xung dot. Duong GHI van con xung dot 2-way va khong pad nao chua duoc:
+// ghi X can {0,S} + {0..7} phu Z16 => S = 8 (mod 16) => S CHAN; ghi W can
+// {0,S,2S,3S} = {a,a+8,b,b+8} => 2S = 8 (mod 16) => S CHAN; ca hai deu mau
+// thuan voi dieu kien DOC (S le). Da quet can PAD 0..64.
+#ifndef MATMUL_LOGITS_LDS_KPAD
+#define MATMUL_LOGITS_LDS_KPAD 4
+#endif
+
+// Mot nguon su that duy nhat cho hinh hoc tile logits.
+constexpr int logits_lds_kpad(int BK, int PAD) { return BK + PAD; }
+constexpr size_t logits_lds_shorts(int BM, int BN, int BK, int PAD) {
+  // xsT[BM][KPAD] + wsT[BN][KPAD]
+  return (size_t)(BM + BN) * (size_t)logits_lds_kpad(BK, PAD);
+}
+
+// 8 bf16 lien tiep theo k (mot uint4 tu HBM) -> 2 x ds_write_b64.
+// Sao chep NGUYEN dword: trong mot dword, nua thap la k+0 va nua cao la k+1,
+// dung y het ban cu, nen ket qua bit-exact VA khong ton mot lenh VALU nao
+// (khong con & 0xFFFF / >> 16). Cung khuon mau voi put16 cua flash attn (:2418).
+__device__ __forceinline__ void logits_lds_store8(unsigned short* dst, const uint4 v) {
+  *reinterpret_cast<uint2*>(dst + 0) = make_uint2(v.x, v.y);
+  *reinterpret_cast<uint2*>(dst + 4) = make_uint2(v.z, v.w);
+}
+
+// 4 float -> 4 bf16 lien tiep theo k -> 1 x ds_write_b64. f32_to_bf16bits duoc
+// goi tren dung nhung gia tri cu, theo dung thu tu cu; chi dia chi LDS doi.
+__device__ __forceinline__ void logits_lds_store4(unsigned short* dst, const float4 v) {
+  const bf16x4 p = { f32_to_bf16bits(v.x), f32_to_bf16bits(v.y),
+                     f32_to_bf16bits(v.z), f32_to_bf16bits(v.w) };
+  *reinterpret_cast<bf16x4*>(dst) = p;
+}
+
 template<
   int BM, int BN, int BK,
   int WM, int WN,
   int WARPS_PER_BLOCK,
   int THREADS = 64 * WARPS_PER_BLOCK
 >
+// __launch_bounds__ chi truyen MOT doi so o day. Neu sau nay them doi so thu
+// hai thi luu y: trong HIP do la so wave TOI THIEU tren moi SIMD, khong phai
+// so block tren moi CU; so workgroup/CU tuong ung la 4*CTA/WARPS_PER_BLOCK.
 __global__ void __launch_bounds__(THREADS)
 matmul_logits_argmax_bf16_kernel_tuned(
     const float* __restrict__ x,
@@ -3633,8 +4069,14 @@ matmul_logits_argmax_bf16_kernel_tuned(
 
   const int waveIdx = threadIdx.x >> 6;
   const int laneIdx = threadIdx.x & 63;
-  const int xInBlockTile = waveIdx % (BM / WM);
-  const int yInBlockTile = waveIdx / (BM / WM);
+  // Wave -> (tile COT, tile HANG). xInBlockTile danh chi so cot nen mau so phai
+  // la BN/WN. Ban cu chia BM/WM: bang nhau o cau hinh dang ship (2 == 2) nen
+  // thay doi nay BIT-EXACT, nhung sai im lang - va doc ngoai tile LDS - voi cac
+  // dong sweep bm256 / bn256 / wm32 / wn32 / bk32_wn32 trong logits_cfg.txt.
+  // Cung LOP LOI voi :1371-1372 cua qkv.
+  constexpr int splitN = BN / WN;
+  const int xInBlockTile = waveIdx % splitN;
+  const int yInBlockTile = waveIdx / splitN;
 
   const int Ai = laneIdx & 15;
   const int Ak = 4 * (laneIdx >> 4);
@@ -3653,10 +4095,42 @@ matmul_logits_argmax_bf16_kernel_tuned(
   constexpr int strideX = THREADS / (BK / 4);
   constexpr int strideW = THREADS / (BK / 8);
 
-  __shared__ unsigned short xs[BK][BM + GETP_LDS_PAD];
-  __shared__ unsigned short ws[BK][BN + GETP_LDS_PAD];
+  // Tile LDS theo [row][k]: 4 phan tu k ma MOT lane can cho mfma nam lien tiep
+  // -> mot ds_read_b64 thay vi 4 ds_read_u16, va 8 short nap tu HBM thanh
+  // 2 ds_write_b64 thay vi 8 ds_write_b16. Doi ten xs/ws -> xsT/wsT co chu dich:
+  // moi cho con doc theo bo cu [k][row] se la LOI BIEN DICH, khong phai mot dia
+  // chi sai im lang. Chi so trong vong lap giu 32-bit (dia chi LDS la 32-bit).
+  constexpr int PAD  = MATMUL_LOGITS_LDS_KPAD;
+  constexpr int KPAD = logits_lds_kpad(BK, PAD);
+  static_assert(KPAD % 4 == 0,
+                "KPAD phai boi 4 short: ds_read_b64/ds_write_b64 can align 8 byte.");
+  static_assert((KPAD / 4) % 2 == 1,
+                "(BK+PAD)/4 phai LE thi 16 lane cua mot phase b64 moi trai het 32 bank.");
+  static_assert(logits_lds_shorts(BM, BN, BK, PAD) * sizeof(unsigned short)
+                    + sizeof(float) * BM + sizeof(int) * BM <= 64 * 1024,
+                "Tile LDS + smax/sidx vuot 64 KB LDS moi CU.");
+
+  __shared__ __align__(16) unsigned short xsT[BM][KPAD];
+  __shared__ __align__(16) unsigned short wsT[BN][KPAD];
   __shared__ float smax[BM];
   __shared__ int sidx[BM];
+
+#ifdef DEBUG_LDS_POISON
+  // Kiem launch: than kernel gia dinh dung THREADS thread.
+  if (blockDim.x != THREADS) {
+    if (threadIdx.x == 0)
+      printf("BAD LAUNCH: blockDim=%d nhung THREADS=%d\n", (int)blockDim.x, (int)THREADS);
+    return;
+  }
+  // Do day tile bang bf16 qNaN: o nao loader khong ghi se thanh NaN.
+  {
+    unsigned short* raw = &xsT[0][0];
+    for (int i = threadIdx.x; i < BM * KPAD; i += blockDim.x) raw[i] = 0x7FC0;
+    raw = &wsT[0][0];
+    for (int i = threadIdx.x; i < BN * KPAD; i += blockDim.x) raw[i] = 0x7FC0;
+  }
+  __syncthreads();
+#endif
 
   for (int i = threadIdx.x; i < BM; i += blockDim.x) {
     smax[i] = -INFINITY;
@@ -3675,24 +4149,16 @@ matmul_logits_argmax_bf16_kernel_tuned(
     const int rg = BM * blockIdx.y + ry;
     const int kk = 4 * loadXIdx_x;
     float4 tmp = (kk < K && rg < M) ? *reinterpret_cast<const float4 *>(&x[(size_t)rg * K + kk]) : make_float4(0,0,0,0);
-    xs[4 * loadXIdx_x + 0][ry] = f32_to_bf16bits(tmp.x);
-    xs[4 * loadXIdx_x + 1][ry] = f32_to_bf16bits(tmp.y);
-    xs[4 * loadXIdx_x + 2][ry] = f32_to_bf16bits(tmp.z);
-    xs[4 * loadXIdx_x + 3][ry] = f32_to_bf16bits(tmp.w);
+    // dia chi = 2*(ry*KPAD + 4*loadXIdx_x) byte: KPAD boi 4 va chunk boi 4
+    // => boi 8 => hop le cho ds_write_b64.
+    logits_lds_store4(&xsT[ry][4 * loadXIdx_x], tmp);
   }
   for (int i = 0; i < nbLoadsW; ++i) {
     int off = i * strideW;
     int kk = 0 + 8 * loadWIdx_x;
     int cy = BN * blockIdx.x + loadWIdx_y + off;
     uint4 t = (kk < K && cy < N) ? *reinterpret_cast<const uint4 *>(&w[(size_t)cy * K + kk]) : make_uint4(0,0,0,0);
-    ws[8 * loadWIdx_x + 0][loadWIdx_y + off] = (unsigned short)(t.x & 0xFFFF);
-    ws[8 * loadWIdx_x + 1][loadWIdx_y + off] = (unsigned short)(t.x >> 16);
-    ws[8 * loadWIdx_x + 2][loadWIdx_y + off] = (unsigned short)(t.y & 0xFFFF);
-    ws[8 * loadWIdx_x + 3][loadWIdx_y + off] = (unsigned short)(t.y >> 16);
-    ws[8 * loadWIdx_x + 4][loadWIdx_y + off] = (unsigned short)(t.z & 0xFFFF);
-    ws[8 * loadWIdx_x + 5][loadWIdx_y + off] = (unsigned short)(t.z >> 16);
-    ws[8 * loadWIdx_x + 6][loadWIdx_y + off] = (unsigned short)(t.w & 0xFFFF);
-    ws[8 * loadWIdx_x + 7][loadWIdx_y + off] = (unsigned short)(t.w >> 16);
+    logits_lds_store8(&wsT[loadWIdx_y + off][8 * loadWIdx_x], t);
   }
   __syncthreads();
 
@@ -3719,8 +4185,12 @@ matmul_logits_argmax_bf16_kernel_tuned(
         for (int in = 0; in < nIterWaveN; ++in) {
           const int row = yInBlockTile * WM + MFMA_M * im + Ai;
           const int col = xInBlockTile * WN + MFMA_N * in + Bj;
-          Afloat av; Bfloat bv;
-          for (int t = 0; t < 4; ++t) { av[t] = xs[k + Ak + t][row]; bv[t] = ws[k + Bk + t][col]; }
+          // Lane L can A[i = L%16][k = 4*(L/16)+r], r = 0..3: BON phan tu k lien
+          // tiep cua CUNG mot hang -> mot ds_read_b64 (dia chi boi 8 vi KPAD boi
+          // 4, k boi 16 va Ak/Bk boi 4). Afloat/Bfloat la vector 8 byte nen cast
+          // nay chinh la thu bao cho LLVM duoc phat mot lenh duy nhat.
+          const Afloat av = *reinterpret_cast<const Afloat*>(&xsT[row][k + Ak]);
+          const Bfloat bv = *reinterpret_cast<const Bfloat*>(&wsT[col][k + Bk]);
           CDfloat acc = acc_local[im * nIterWaveN + in];
           acc = __builtin_amdgcn_mfma_f32_16x16x16bf16_1k(av, bv, acc, 0, 0, 0);
           acc_local[im * nIterWaveN + in] = acc;
@@ -3734,21 +4204,11 @@ matmul_logits_argmax_bf16_kernel_tuned(
         int ry = loadXIdx_y + off;
         if (ry >= BM) break;
         float4 v = regX[i];
-        xs[4 * loadXIdx_x + 0][ry] = f32_to_bf16bits(v.x);
-        xs[4 * loadXIdx_x + 1][ry] = f32_to_bf16bits(v.y);
-        xs[4 * loadXIdx_x + 2][ry] = f32_to_bf16bits(v.z);
-        xs[4 * loadXIdx_x + 3][ry] = f32_to_bf16bits(v.w);
+        logits_lds_store4(&xsT[ry][4 * loadXIdx_x], v);
       }
       for (int i = 0; i < nbLoadsW; ++i) {
         int off = i * strideW;
-        ws[8 * loadWIdx_x + 0][loadWIdx_y + off] = (unsigned short)(regW[i].x & 0xFFFF);
-        ws[8 * loadWIdx_x + 1][loadWIdx_y + off] = (unsigned short)(regW[i].x >> 16);
-        ws[8 * loadWIdx_x + 2][loadWIdx_y + off] = (unsigned short)(regW[i].y & 0xFFFF);
-        ws[8 * loadWIdx_x + 3][loadWIdx_y + off] = (unsigned short)(regW[i].y >> 16);
-        ws[8 * loadWIdx_x + 4][loadWIdx_y + off] = (unsigned short)(regW[i].z & 0xFFFF);
-        ws[8 * loadWIdx_x + 5][loadWIdx_y + off] = (unsigned short)(regW[i].z >> 16);
-        ws[8 * loadWIdx_x + 6][loadWIdx_y + off] = (unsigned short)(regW[i].w & 0xFFFF);
-        ws[8 * loadWIdx_x + 7][loadWIdx_y + off] = (unsigned short)(regW[i].w >> 16);
+        logits_lds_store8(&wsT[loadWIdx_y + off][8 * loadWIdx_x], regW[i]);
       }
     }
     __syncthreads();
