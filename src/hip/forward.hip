@@ -3921,16 +3921,27 @@ static inline void getp_matmul_attn_o_bf16(
 }
 
 
+// Anh xa float -> uint32 giu nguyen thu tu, de so sanh so thuc tro thanh so
+// sanh so nguyen khong dau: so khong am duoc dua len nua tren, so am bi lat het.
+__device__ inline unsigned int order_preserving_bits(float v) {
+  unsigned int b = __float_as_uint(v);
+  return (b & 0x80000000u) ? ~b : (b | 0x80000000u);
+}
+__device__ inline float order_preserving_bits_inv(unsigned int k) {
+  return __uint_as_float((k & 0x80000000u) ? (k & 0x7fffffffu) : ~k);
+}
+// Khoa don dieu theo (gia tri, -idx): gia tri lon thang, hoa thi idx NHO thang.
+// Nho vay argmax chi con la mot lenh atomicMax, khong con vong CAS va khong con
+// phu thuoc thu tu block den.
 __device__ inline unsigned long long pack_val_idx(float v, unsigned int idx) {
-  unsigned int vb = __float_as_uint(v);
-  return (static_cast<unsigned long long>(vb) << 32) | static_cast<unsigned long long>(idx);
+  return (static_cast<unsigned long long>(order_preserving_bits(v)) << 32) |
+         static_cast<unsigned long long>(0xffffffffu - idx);
 }
 __device__ inline float unpack_val(unsigned long long p) {
-  unsigned int vb = static_cast<unsigned int>(p >> 32);
-  return __uint_as_float(vb);
+  return order_preserving_bits_inv(static_cast<unsigned int>(p >> 32));
 }
 __device__ inline unsigned int unpack_idx(unsigned long long p) {
-  return static_cast<unsigned int>(p & 0xffffffffu);
+  return 0xffffffffu - static_cast<unsigned int>(p & 0xffffffffu);
 }
 __device__ inline float atomicMaxFloat(float* addr, float val) {
   int* a = reinterpret_cast<int*>(addr);
@@ -3944,15 +3955,12 @@ __device__ inline float atomicMaxFloat(float* addr, float val) {
   return oldf;
 }
 __device__ inline void atomic_update_max_pair(unsigned long long* addr, float v, unsigned int idx) {
-  while (true) {
-    unsigned long long old = *addr;
-    float ov = unpack_val(old);
-    unsigned int oi = unpack_idx(old);
-    float thr = 1e-6f * fmaxf(fabsf(v), fabsf(ov));
-    bool take = (v > ov + thr) || (fabsf(v - ov) <= thr && idx < oi);
-    if (!take) break;
-    if (atomicCAS(reinterpret_cast<unsigned long long*>(addr), old, pack_val_idx(v, idx)) == old) break;
-  }
+  // Truoc day day la mot vong CAS voi phep so sanh dung nguong TUONG DOI
+  // (1e-6 * max(|v|,|ov|)), tuc mot quan he KHONG BAC CAU: A ~ B va B ~ C khong
+  // suy ra A ~ C. Voi hang nghin block cot cung tranh mot o, ke thang phu thuoc
+  // thu tu den, va ket qua doi giua hai lan chay cung mot binary. Khoa don dieu
+  // o tren bien viec nay thanh mot atomicMax duy nhat, co thu tu toan phan chat.
+  atomicMax(addr, pack_val_idx(v, idx));
 }
 __global__ void init_argmax_pairs(unsigned long long* pairs, int B, int V) {
   int i = blockIdx.x * blockDim.x + threadIdx.x;
