@@ -2300,6 +2300,277 @@ void getp_vecadd(float *x, float *y, int size, int batch_size,
   
 }
 
+// ============================================================================
+// Attention giai ma dung mfma_f32_16x16x16bf16_1k.
+//
+// Ban cu dat truc K cua phep nhan vao 16 BLOCK cua mfma 4x4x4, nen sau moi lenh
+// MFMA con phai gop 16 block lai bang 4 vong __shfl_down roi phat tan diem so
+// bang 16 lan __shfl nua: 128 lenh cheo lane va 80 lenh __expf cho moi 16 key,
+// doi lay dung 4 lenh MFMA. Phep thu dong chay (thay toan bo phan tinh bang mot
+// phep cong duy nhat, giu nguyen duong nap HBM + LDS + barrier) do duoc 56%
+// thoi gian kernel nam o phan tinh do - tuc no dang la cho ton, khong phai
+// dong du lieu.
+//
+// Ban nay dat KEY tren truc M va HEAD tren truc N:
+//
+//     S^T = K   . Q^T    A = K  [16 key   x 16 chieu]  B = Q^T [16 chieu x 16 head]
+//     O^T = V^T . P^T    A = V^T[16 chieu x 16 key]    B = P^T [16 key   x 16 head]
+//
+// Diem mau chot: bo cuc ket qua D cua MFMA (lane giu D[4*(lane>>4)+m][lane&15])
+// TRUNG dung bo cuc toan hang B. Nen P^T di thang tu MFMA thu nhat sang MFMA
+// thu hai - khong chuyen vi, khong mot lenh cheo lane nao. Ca tile 16 key chi
+// con 2 lenh __shfl_xor (gop max theo nhom g) va 5 lenh exp.
+//
+// Gia phai tra: moi wave chi nam HPW head that trong 16 cot cua truc N, so cot
+// con lai dien 0. HPW = 4 giu nguyen cach chia head cu (2 wave/block, 25% cot
+// co ich); HPW = 8 cho mot wave om ca 8 head cua mot kv_head - mot nua so lenh
+// MFMA nhung cung mot nua so thread nap du lieu. Chon bang co bien dich.
+// ============================================================================
+#ifndef FLASH_HEADS_PER_WAVE
+#define FLASH_HEADS_PER_WAVE 8
+#endif
+#ifndef FLASH_LDS_PAD
+#define FLASH_LDS_PAD 4
+#endif
+// Tach P thanh hai bf16 (phan cao + phan du) roi cong bang HAI lenh MFMA, cho
+// tich PV co do chinh xac gan fp32 nhu ban cu. Dung de kiem chung gia thuyet
+// "lam tron P la nguyen nhan lech"; chi giu neu that su la nguyen nhan, vi no
+// them 4 lenh MFMA moi tile.
+#ifndef FLASH_P_HILO
+#define FLASH_P_HILO 0
+#endif
+
+template <int HPW, bool APPLY_MASK>
+__global__ void __launch_bounds__(64 * (8 / HPW))
+flash_attn_decode_mfma16_kernel(
+  float *__restrict__ tb, const __hip_bfloat16 *__restrict__ key_cache,
+  const __hip_bfloat16 *__restrict__ value_cache, const float *__restrict__ q,
+  const int *__restrict__ mask_on,
+  const float *__restrict__ attn_sinks, int head_dim, int n_attn_heads,
+  int n_kv_heads, int pos, int batch_size, int kv_dim, int kv_mul,
+  int sliding_window, int cache_tcap, float inv_sqrt_d
+) {
+  constexpr int HEAD_DIM   = 64;
+  constexpr int TILE       = 16;                 // = M = N = K cua MFMA
+  constexpr int NCHUNK     = HEAD_DIM / TILE;    // 4 chunk 16 chieu
+  constexpr int KV_MUL     = 8;
+  constexpr int WAVES      = KV_MUL / HPW;
+  constexpr int BLOCK_SIZE = 64 * WAVES;
+  constexpr int PAD        = FLASH_LDS_PAD;
+
+  // PAD = 4 -> hang dai 68 ushort = 136 byte = 34 bank; 34 mod 32 = 2 nen 16 lane
+  // doc b64 phu kin dung mot lan 32 bank, khong xung dot. Doi lai hang chi con
+  // can 8 byte, nen phan nap ghi hai lenh b64 thay vi mot lenh b128.
+  static_assert(HPW == 4 || HPW == 8, "HPW chi ho tro 4 hoac 8");
+  static_assert(PAD % 4 == 0, "PAD phai chia het 4 de hang con can 8 byte");
+  static_assert(TILE * (HEAD_DIM / 8) % BLOCK_SIZE == 0, "nap KV khong chia deu");
+
+  using bf16x4 = __attribute__((__vector_size__(8)))  unsigned short;
+  using f32x4  = __attribute__((__vector_size__(16))) float;
+
+  assert(head_dim == HEAD_DIM);
+  assert(kv_mul == KV_MUL);
+  assert(blockDim.x == BLOCK_SIZE);
+
+  const int waveIdx = threadIdx.x / warpSize;
+  const int lane    = threadIdx.x % warpSize;
+  const int ln      = lane & 15;   // truc M cua A, truc N cua B va D
+  const int g       = lane >> 4;   // truc K cua A va B, nhom hang cua D
+
+  const int kv_h = blockIdx.x;
+  const int b    = blockIdx.y;
+  if (!mask_on[b]) return;
+
+  const int t_start = APPLY_MASK ? MAX(0, pos - sliding_window + 1)
+                                 : MAX(0, pos + 1 - cache_tcap);
+  const int n_steps = pos + 1 - t_start;
+  const int t_end   = t_start + n_steps;
+
+  __shared__ __align__(16) unsigned short ks[TILE][HEAD_DIM + PAD];
+  __shared__ __align__(16) unsigned short vs[TILE][HEAD_DIM + PAD];
+  __shared__ float ot[WAVES][HPW][HEAD_DIM];
+
+  // ---- Q^T lam toan hang B: lane giu B[4g+kk][ln] = q[head ln][chunk*16+4g+kk].
+  // Cot ln >= HPW khong ung voi head nao nen dien 0; diem so cua chung bang 0
+  // (huu han, khong sinh NaN) va khong bao gio duoc ghi ra. Chi so head duoc
+  // kep lai de con tro khong bao gio ra ngoai mang q.
+  const int hg_self = kv_h * KV_MUL + waveIdx * HPW + (ln < HPW ? ln : 0);
+  bf16x4 qB[NCHUNK];
+  {
+    const float *qrow =
+        q + (size_t)b * n_attn_heads * head_dim + (size_t)hg_self * head_dim;
+    #pragma unroll
+    for (int c = 0; c < NCHUNK; ++c) {
+      #pragma unroll
+      for (int kk = 0; kk < 4; ++kk)
+        qB[c][kk] = (ln < HPW)
+            ? f32_to_bf16bits(inv_sqrt_d * qrow[c * TILE + 4 * g + kk])
+            : (unsigned short)0;
+    }
+  }
+
+  constexpr int nbLoadsKV = TILE * (HEAD_DIM / 8) / BLOCK_SIZE;
+  constexpr int strideKV  = BLOCK_SIZE / (HEAD_DIM / 8);
+  const int ly = threadIdx.x / (HEAD_DIM / 8);
+  const int lx = threadIdx.x % (HEAD_DIM / 8);
+
+  // Hang LDS chi can 8 byte (136 = 8 x 17) nen mot lenh b128 se lech can chinh;
+  // hai lenh b64 chuyen du 16 byte ma van hop le.
+  auto put16 = [](unsigned short *dst, uint4 v) {
+    *reinterpret_cast<uint2 *>(dst)     = make_uint2(v.x, v.y);
+    *reinterpret_cast<uint2 *>(dst + 4) = make_uint2(v.z, v.w);
+  };
+
+  for (int i = 0; i < nbLoadsKV; ++i) {
+    const int offset  = i * strideKV;
+    const int index_y = t_start + ly + offset;
+    if (index_y < t_end) {
+      const size_t off = (size_t)(index_y % cache_tcap) * batch_size * kv_dim +
+                         (size_t)b * kv_dim + (size_t)kv_h * head_dim + 8 * lx;
+      put16(&ks[ly + offset][lx * 8], *reinterpret_cast<const uint4 *>(key_cache + off));
+      put16(&vs[ly + offset][lx * 8], *reinterpret_cast<const uint4 *>(value_cache + off));
+    } else {
+      put16(&ks[ly + offset][lx * 8], make_uint4(0, 0, 0, 0));
+      put16(&vs[ly + offset][lx * 8], make_uint4(0, 0, 0, 0));
+    }
+  }
+  __syncthreads();
+
+  f32x4 acc_o[NCHUNK];
+  #pragma unroll
+  for (int c = 0; c < NCHUNK; ++c) {
+    #pragma unroll
+    for (int i = 0; i < 4; ++i) acc_o[c][i] = 0.f;
+  }
+  float m_run = -INFINITY;
+  float l_run = 0.f;
+
+  for (int bt = t_start; bt < t_end; bt += TILE) {
+    uint4 regK[nbLoadsKV];
+    uint4 regV[nbLoadsKV];
+    const bool has_next = (bt + TILE < t_end);
+    if (has_next) {
+      #pragma unroll
+      for (int i = 0; i < nbLoadsKV; ++i) {
+        const int index_y = bt + TILE + ly + i * strideKV;
+        if (index_y < t_end) {
+          const size_t off = (size_t)(index_y % cache_tcap) * batch_size * kv_dim +
+                             (size_t)b * kv_dim + (size_t)kv_h * head_dim + 8 * lx;
+          regK[i] = *reinterpret_cast<const uint4 *>(key_cache + off);
+          regV[i] = *reinterpret_cast<const uint4 *>(value_cache + off);
+        } else {
+          regK[i] = regV[i] = make_uint4(0, 0, 0, 0);
+        }
+      }
+    }
+
+    // ---- S^T = K . Q^T : A[key][chieu] doc mot lenh b64 moi chunk
+    f32x4 st;
+    #pragma unroll
+    for (int i = 0; i < 4; ++i) st[i] = 0.f;
+    #pragma unroll
+    for (int c = 0; c < NCHUNK; ++c) {
+      bf16x4 kA;
+      *reinterpret_cast<uint2 *>(&kA) =
+          *reinterpret_cast<const uint2 *>(&ks[ln][c * TILE + 4 * g]);
+      st = __builtin_amdgcn_mfma_f32_16x16x16bf16_1k(kA, qB[c], st, 0, 0, 0);
+    }
+
+    // ---- mat na duoi. Hang ks ngoai pham vi bi dien 0 nen cho diem 0, ma
+    // exp(0 - m) > 0 se lam hong tong -> phai ep ve -INFINITY.
+    const int kbase = bt + 4 * g;
+    #pragma unroll
+    for (int m = 0; m < 4; ++m)
+      if (kbase + m >= t_end) st[m] = -INFINITY;
+
+    // ---- max cua tile, dung chung cho ca 4 nhom g cua cung mot head. Bat buoc
+    // phai gop truoc khi tinh m_new: mot nhom g co the khong co key hop le nao
+    // (m_tile = -INF) va se sinh NaN neu tu tinh lay. Sau khi gop thi moi tile
+    // chac chan co it nhat mot key hop le nen m_tile huu han.
+    float m_tile = fmaxf(fmaxf(st[0], st[1]), fmaxf(st[2], st[3]));
+    m_tile = fmaxf(m_tile, __shfl_xor(m_tile, 16));
+    m_tile = fmaxf(m_tile, __shfl_xor(m_tile, 32));
+
+    const float m_new = fmaxf(m_run, m_tile);
+    const float alpha = __expf(m_run - m_new);
+
+    // ---- P^T = exp(S^T - m_new), lam tron bf16 de lam toan hang B ngay.
+    bf16x4 pB;
+#if FLASH_P_HILO
+    bf16x4 pLo;
+#endif
+    float lsum = 0.f;
+    #pragma unroll
+    for (int m = 0; m < 4; ++m) {
+      const float e = __expf(st[m] - m_new);   // = 0 khi st[m] = -INF
+      lsum += e;
+      pB[m] = f32_to_bf16bits(e);
+#if FLASH_P_HILO
+      pLo[m] = f32_to_bf16bits(e - __bfloat162float(bf16bits_to_bf16(pB[m])));
+#endif
+    }
+
+    // l giu rieng theo nhom g; vi ca 4 nhom dung chung m_new nen cong lai mot
+    // lan o phan ket la du - gop moi tile la thua.
+    l_run = l_run * alpha + lsum;
+    m_run = m_new;
+
+    // ---- O^T += V^T . P^T
+    #pragma unroll
+    for (int c = 0; c < NCHUNK; ++c) {
+      bf16x4 vA;
+      #pragma unroll
+      for (int kk = 0; kk < 4; ++kk) vA[kk] = vs[4 * g + kk][c * TILE + ln];
+      #pragma unroll
+      for (int i = 0; i < 4; ++i) acc_o[c][i] *= alpha;
+      acc_o[c] = __builtin_amdgcn_mfma_f32_16x16x16bf16_1k(vA, pB, acc_o[c], 0, 0, 0);
+#if FLASH_P_HILO
+      acc_o[c] = __builtin_amdgcn_mfma_f32_16x16x16bf16_1k(vA, pLo, acc_o[c], 0, 0, 0);
+#endif
+    }
+
+    __syncthreads();
+    if (has_next) {
+      #pragma unroll
+      for (int i = 0; i < nbLoadsKV; ++i) {
+        put16(&ks[ly + i * strideKV][lx * 8], regK[i]);
+        put16(&vs[ly + i * strideKV][lx * 8], regV[i]);
+      }
+    }
+    __syncthreads();
+  }
+
+  // ---- gop l qua 4 nhom g (mot lan duy nhat)
+  l_run += __shfl_xor(l_run, 16);
+  l_run += __shfl_xor(l_run, 32);
+
+  if (ln < HPW) {
+    const float sink  = attn_sinks[hg_self];
+    const float m_fin = fmaxf(m_run, sink);
+    const float a     = __expf(m_run - m_fin);
+    const float l     = l_run * a + __expf(sink - m_fin);
+    const float scale = a / l;
+    #pragma unroll
+    for (int c = 0; c < NCHUNK; ++c)
+      *reinterpret_cast<float4 *>(&ot[waveIdx][ln][c * TILE + 4 * g]) =
+          make_float4(acc_o[c][0] * scale, acc_o[c][1] * scale,
+                      acc_o[c][2] * scale, acc_o[c][3] * scale);
+  }
+  __syncthreads();
+
+  // ---- chuyen vi qua LDS roi ghi lien mach: moi head 256 byte lien nhau,
+  // thay cho 16 lane ghi rai rac sang cac hang head khac nhau.
+  float *obase = tb + (size_t)b * n_attn_heads * head_dim;
+  #pragma unroll
+  for (int idx = lane; idx < HPW * HEAD_DIM / 4; idx += 64) {
+    const int hh = idx / (HEAD_DIM / 4);
+    const int d4 = idx % (HEAD_DIM / 4);
+    *reinterpret_cast<float4 *>(
+        obase + (size_t)(kv_h * KV_MUL + waveIdx * HPW + hh) * head_dim + d4 * 4) =
+        *reinterpret_cast<const float4 *>(&ot[waveIdx][hh][d4 * 4]);
+  }
+}
+
 template <int TILE_T>
 __global__ void __launch_bounds__(128)
 flash_attn_decode_even_layer_bf16_matrix_core_kernel(
@@ -2785,6 +3056,50 @@ flash_attn_decode_odd_layer_bf16_matrix_core_kernel(
 #ifndef FLASH_DECODE_TILE_T
 #define FLASH_DECODE_TILE_T 16
 #endif
+// 1 = kernel attention mfma 16x16x16 (xem chu thich o dinh nghia),
+// 0 = duong cu mfma 4x4x4. Giu ca hai de con A/B duoc.
+#ifndef FLASH_MFMA16
+#define FLASH_MFMA16 1
+#endif
+// Bat rieng tung lop de chia doi loi: neu chi mot phia sai thi loi nam o
+// duong co mat na truot, khong phai o phep nhan.
+#ifndef FLASH_MFMA16_EVEN
+#define FLASH_MFMA16_EVEN FLASH_MFMA16
+#endif
+#ifndef FLASH_MFMA16_ODD
+#define FLASH_MFMA16_ODD  FLASH_MFMA16
+#endif
+#if FLASH_MFMA16_EVEN || FLASH_MFMA16_ODD
+static_assert(FLASH_DECODE_TILE_T == 16,
+              "kernel mfma 16x16x16 buoc tile phai la 16");
+#endif
+// Ghi tb ra file de so so hoc giua hai ban kernel. Chi bat khi GETP_DUMP_ATTN=1
+// luc bien dich VA co bien moi truong GETP_DUMP_FILE luc chay.
+#if GETP_DUMP_ATTN
+#include <cstdlib>
+static inline void getp_dump_attn(const float *tb, int batch_size,
+                                  int n_attn_heads, int head_dim, int layer_id,
+                                  int pos, hipStream_t stream) {
+  const char *base = getenv("GETP_DUMP_FILE");
+  if (!base) return;
+  const char *el = getenv("GETP_DUMP_LAYER");
+  const char *ep = getenv("GETP_DUMP_POS");
+  if (el && layer_id != atoi(el)) return;
+  if (ep && pos != atoi(ep)) return;
+  int dev = 0;
+  HIP_CHECK(hipGetDevice(&dev));
+  const size_t n = (size_t)batch_size * n_attn_heads * head_dim;
+  float *h = (float *)malloc(n * sizeof(float));
+  HIP_CHECK(hipStreamSynchronize(stream));
+  HIP_CHECK(hipMemcpy(h, tb, n * sizeof(float), hipMemcpyDeviceToHost));
+  char path[512];
+  snprintf(path, sizeof path, "%s.L%d.P%d.D%d.bin", base, layer_id, pos, dev);
+  FILE *f = fopen(path, "wb");
+  if (f) { fwrite(h, sizeof(float), n, f); fclose(f); }
+  free(h);
+}
+#endif
+
 static inline void getp_flash_attn_decode_bf16(
     float *tb, const __hip_bfloat16 *key_cache_layer,
     const __hip_bfloat16 *value_cache_layer, const float *q, const int *mask_on,
@@ -2798,6 +3113,17 @@ static inline void getp_flash_attn_decode_bf16(
   const int apply_mask = (sliding_window > 0 && ((layer_id & 1) == 0)) ? 1 : 0;
 
   if (apply_mask) {
+#if FLASH_MFMA16_EVEN
+    dim3 block(64 * (8 / FLASH_HEADS_PER_WAVE));
+    dim3 grid(n_kv_heads, batch_size);
+    flash_attn_decode_mfma16_kernel<FLASH_HEADS_PER_WAVE, true><<<grid, block, 0, stream>>>
+      (tb, key_cache_layer,
+       value_cache_layer, q,
+       mask_on,
+       attn_sinks_layer, head_dim, n_attn_heads,
+       n_kv_heads, pos, batch_size, kv_dim, kv_mul,
+       sliding_window, cache_tcap, invsd);
+#else
     dim3 block(128);
     dim3 grid(n_kv_heads, batch_size);
     flash_attn_decode_even_layer_bf16_matrix_core_kernel<FLASH_DECODE_TILE_T><<<grid, block, 0, stream>>>
@@ -2807,8 +3133,20 @@ static inline void getp_flash_attn_decode_bf16(
        attn_sinks_layer, head_dim, n_attn_heads, 
        n_kv_heads, pos, batch_size, kv_dim, kv_mul, 
        sliding_window, cache_tcap, invsd);
+#endif
   }
   else {
+#if FLASH_MFMA16_ODD
+    dim3 block(64 * (8 / FLASH_HEADS_PER_WAVE));
+    dim3 grid(n_kv_heads, batch_size);
+    flash_attn_decode_mfma16_kernel<FLASH_HEADS_PER_WAVE, false><<<grid, block, 0, stream>>>
+      (tb, key_cache_layer,
+      value_cache_layer, q,
+      mask_on,
+      attn_sinks_layer, head_dim, n_attn_heads,
+      n_kv_heads, pos, batch_size, kv_dim, kv_mul,
+      sliding_window, cache_tcap, invsd);
+#else
     dim3 block(128);
     dim3 grid(n_kv_heads, batch_size);
     flash_attn_decode_odd_layer_bf16_matrix_core_kernel<FLASH_DECODE_TILE_T><<<grid, block, 0, stream>>>
@@ -2818,9 +3156,14 @@ static inline void getp_flash_attn_decode_bf16(
       attn_sinks_layer, head_dim, n_attn_heads, 
       n_kv_heads, pos, batch_size, kv_dim, kv_mul, 
       cache_tcap, invsd);
+#endif
     }
 
   
+
+#if GETP_DUMP_ATTN
+  getp_dump_attn(tb, batch_size, n_attn_heads, head_dim, layer_id, pos, stream);
+#endif
 }
 
 __global__ void gather_embedding_bf16_kernel(float *x,
