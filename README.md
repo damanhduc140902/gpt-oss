@@ -10,7 +10,7 @@
   <img src="https://img.shields.io/github/last-commit/damanhduc140902/gpt-oss?style=flat-square&label=commit&color=57606a&labelColor=24292f" alt="Last commit">
 </p>
 
-[Overview](#overview) · [Quick Start](#quick-start) · [Results](#results) · [How It Works](#how-it-works) · [Blog](#blog) · [Docs](docs/)
+[Overview](#overview) · [Quick Start](#quick-start) · [Results](#results) · [How It Works](#how-it-works) · [Blog](#blog) · [Docs](docs/) · [License](LICENSE)
 
 </div>
 
