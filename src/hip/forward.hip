@@ -416,7 +416,12 @@ moe_scatter_acts_to_expert_frombf16_kernel<<<grid, block, 0, stream>>>(
 #endif
 
 #ifndef MATMUL_MLP2_BLOCK_ROWS
-#define MATMUL_MLP2_BLOCK_ROWS 64
+// 96, not 64 and not 128. mlp2 packs 1.78x less MFMA into each LDS read than
+// mlp1 does (1.50 against 2.67 per ds_read_b64), which is the whole of why it
+// reached 34% of MFMA peak where mlp1 reaches 55%. A taller block raises that
+// ratio. 128 is measurably faster still (+6.9%) but produces WRONG output -
+// see the note on NUM_CTA_MLP2 - so 96 is the tallest block that is bit-exact.
+#define MATMUL_MLP2_BLOCK_ROWS 96
 #endif
 #ifndef MATMUL_MLP2_BLOCK_COLS
 #define MATMUL_MLP2_BLOCK_COLS 64
@@ -436,7 +441,22 @@ moe_scatter_acts_to_expert_frombf16_kernel<<<grid, block, 0, stream>>>(
 #define MATMUL_MLP2_WAVES_PER_BLOCK (((MATMUL_MLP2_BLOCK_ROWS) / (MATMUL_MLP2_WARP_TILE_M)) * ((MATMUL_MLP2_BLOCK_COLS) / (MATMUL_MLP2_WARP_TILE_N)))
 #endif
 #ifndef NUM_CTA_MLP2
-#define NUM_CTA_MLP2 4
+// The second argument of __launch_bounds__ is a MINIMUM waves-per-SIMD promise,
+// and it does not set occupancy - it DIVIDES THE REGISTER BUDGET. gfx90a has
+// 512 VGPR per lane per SIMD, so promising N waves caps each wave at 512/N.
+//
+// The old value of 4 promised an occupancy LDS can never deliver: this tile
+// needs 16,640 B of LDS, so a CU holds floor(65536/16640) = 3 blocks = 3 waves
+// per SIMD. Occupancy stayed at 3 either way; the only effect of the 4 was to
+// cut the budget from 512/3 = 168 registers down to 128, for nothing. mlp1 has
+// no such mismatch - its LDS allows 2 blocks and NUM_CTA_MLP1 is exactly 2.
+//
+// The previous sweep could not have found this: it tried 2, 4 and 8 only. 8
+// cuts the budget to 64 and spills; 2 lets the compiler take 256 registers,
+// which drops real occupancy to 2 blocks per CU. Both lose, for opposite
+// reasons, and the optimum is 3 - which is not a power of two and so was never
+// on the grid. The rule is floor(65536 / LDS_bytes) * WARPS / 4.
+#define NUM_CTA_MLP2 3
 #endif
 
 
