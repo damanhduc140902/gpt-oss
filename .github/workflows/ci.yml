@@ -14,16 +14,48 @@ jobs:
   # unit has to compile for anything to work at all. Several commits in this
   # repository's history were caught by exactly this check being run by hand.
   compile:
-    name: HIP syntax check (gfx90a)
+    name: HIP compile (gfx90a)
     runs-on: ubuntu-latest
     container: rocm/dev-ubuntu-22.04:6.2
     steps:
       - uses: actions/checkout@v4
 
+      # This job is worthless if the device pass silently does not run, and a
+      # green tick would then be worse than no CI at all. So prove the toolchain
+      # compiles device code before trusting anything it says: feed it a file
+      # that is valid on the host and invalid on gfx90a, and require a failure.
+      - name: Prove the device pass actually runs
+        run: |
+          cat > /tmp/devcheck.hip <<'EOF'
+          #include <hip/hip_runtime.h>
+          __global__ void k(float *o) {
+            // __builtin_amdgcn_mfma_f32_16x16x16bf16_1k needs vector operands;
+            // passing scalars is a device-side error and nothing else.
+            *o = __builtin_amdgcn_mfma_f32_16x16x16bf16_1k(1, 2, 3, 0, 0, 0);
+          }
+          EOF
+          if hipcc --std=c++17 --offload-arch=gfx90a -fsyntax-only \
+                   /tmp/devcheck.hip 2>/tmp/devcheck.log; then
+            echo "::error::hipcc accepted device-invalid code - the gfx90a pass is NOT running,"
+            echo "::error::so every compile step below would pass without checking anything."
+            cat /tmp/devcheck.log
+            exit 1
+          fi
+          echo "device pass confirmed: hipcc rejected the bad kernel as expected"
+
       - name: Compile the unity translation unit
         run: |
           hipcc --std=c++17 -Iinclude -Isrc --offload-arch=gfx90a -O3 \
-                -fsyntax-only src/run.cpp
+                -c -o /tmp/run.o src/run.cpp
+
+      - name: Check the object really contains gfx90a device code
+        run: |
+          if ! llvm-objdump -h /tmp/run.o | grep -qi hip_fatbin; then
+            echo "::error::the object has no device fatbin - host-only compile"
+            llvm-objdump -h /tmp/run.o
+            exit 1
+          fi
+          echo "fatbin present"
 
       - name: Compile with the debug harnesses enabled
         # These are off by default but must keep compiling, or the next person
