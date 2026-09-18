@@ -4,7 +4,7 @@
 server: the whole workload is known before the first token is produced, every request is resident on
 a GPU for the entire run, and the schedule is frozen at start-up. There is no queue, no continuous
 batching, no eviction and no work stealing. That closed-world assumption is what makes 12288
-sequences advance in lockstep at 58309 tokens per second on eight MI250 GCDs, and it is also the
+sequences advance in lockstep at 60850 tokens per second on eight MI250 GCDs, and it is also the
 source of every limitation described on this page. The machinery lives in five places:
 [`src/getp/run.cpp`](../src/getp/run.cpp), [`src/getp/transformer.cpp`](../src/getp/transformer.cpp),
 [`src/getp/state_ext.cpp`](../src/getp/state_ext.cpp),
@@ -623,7 +623,7 @@ shipped one runs. Working backwards from the published figures:
 | --- | --- | --- |
 | Sequences in flight | 12288 | 6144 |
 | Forward passes (`-n 1024`, `while (pos + 1 < steps)`) | 1023 | 1023 |
-| Measured throughput | 58309 tok/s | 19463 tok/s |
+| Measured throughput | 60850 tok/s | 19837 tok/s |
 | Implied token-step time | 362 ms | 467 ms |
 | Barrier crossings per step | 49 | 73 |
 | Host stream syncs per step | ≈ 120 | ≈ 180 |
