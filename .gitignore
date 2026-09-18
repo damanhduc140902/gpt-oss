@@ -3,6 +3,13 @@
 !*/
 !*.*
 
+# ...but some files that belong in the repository have no suffix either, and
+# the rule above swallows them silently: `git add` just skips them and the
+# commit goes through looking fine. LICENSE was lost exactly that way.
+# Makefile survives only because it was tracked before the rule existed.
+!LICENSE
+!Makefile
+
 # Virtual env
 .venv/
 
