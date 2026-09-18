@@ -52,7 +52,8 @@ Both checkpoints share every width; they differ in depth and in how many experts
 ## Quick Start
 
 You need an AMD GPU node with ROCm and `hipcc` on your `PATH`, Python 3.10+, and disk for the converted
-weights — roughly 13 GB for 20B and 65 GB for 120B. The build takes well under a minute.
+weights — the exporter writes fp32, so roughly 84 GB for 20B and 467 GB for 120B (the safetensors
+downloads themselves are about 13 GB and 65 GB). The build takes well under a minute.
 
 ### 1. Clone and set up
 
@@ -71,7 +72,10 @@ Download the `safetensors` and convert them to the flat `.bin` file the C++ load
 dequantizes the FP4 tensors and flattens everything into one blob.
 
 ```bash
-python tools/model_export/gpt-oss-20b/export_model_bin.py      # or gpt-oss-120b/
+python tools/model_export/gpt-oss-20b/export_model_bin.py \
+  --input  /path/to/gpt-oss-20b/original/model.safetensors \
+  --config tools/model_export/gpt-oss-20b/config.json \
+  --output gpt-oss-20b.bin                 # or gpt-oss-120b/
 ```
 
 | Model          | Hugging Face                                                      | Export script                                                          |
@@ -119,12 +123,16 @@ Interactive chat, optionally with a system prompt:
 
 `getp` is the batch serving mode, and the one every throughput number on this page comes from.
 
-**It accepts exactly one request count, and it is not negotiable.** `distribute_requests` asserts that the
-file holds `n_devices × BATCH_SIZE` requests — 1536 per GPU for the 20B model, 768 per GPU for the 120B —
-so on eight GPUs that is 12,288 and 6,144 respectively. Those are the two numbers in the
-[results table](#results). Anything else aborts at
-[`src/getp/run.cpp:268`](src/getp/run.cpp#L268), and **none of the input files shipped in this repository
-is the right length**; they declare 32, 256, 448, 3584 and 4096. Build one that fits:
+**It will not take an arbitrary request count.** `inference()` asserts that each model replica's slice
+of the file divides evenly into `EXPERT_PARALLELISM × BATCH_SIZE` blocks — 2 × 1536 = 3072 requests for
+the 20B model, 8 × 768 = 6144 for the 120B on eight GPUs. The 20B path then pins the total exactly:
+`Model_20b::distribute_requests` asserts `requests_per_model == EXPERT_PARALLELISM × BATCH_SIZE`, which
+works out to `n_devices × 1536` requests and nothing else — 12,288 on eight GPUs. The 120B path carries
+no such assert; `Model_120b::distribute_requests` walks its slice in chunks of
+`EXPERT_PARALLELISM × BATCH_SIZE`, so any positive multiple of 6,144 runs, one chunk after another. The
+two counts in the [results table](#results) are 12,288 and 6,144. A count that satisfies neither rule
+trips an assert in [`src/getp/run.cpp`](src/getp/run.cpp), and **none of the input files shipped in
+this repository is the right length**; they declare 32, 256, 448, 3584 and 4096. Build one that fits:
 
 ```bash
 ./run.sh mkinput 20b 8 input_20b.txt        # 12288 requests
@@ -134,12 +142,15 @@ is the right length**; they declare 32, 256, 448, 3584 and 4096. Build one that 
 The output file holds token ids, not text. Turn them back into words:
 
 ```bash
-./run.sh decode -i out.txt                  # every completion
+./run.sh decode -1 -i out.txt               # every completion
 ./run.sh decode 0 -i out.txt                # just the first
 ```
 
-Every visible GPU is used automatically, up to 8. To use fewer, regenerate the input for that count —
-the required size follows the device count:
+Every visible GPU is used automatically — `warm_up` takes the count from `hipGetDeviceCount` and uses
+all of it, with no cap. To use fewer, regenerate the input for that count — the required size follows
+the device count. The count itself has to be even for the 20B model, which pins
+`EXPERT_PARALLELISM = 2` and exits during warm-up when the device count is not divisible by it,
+however the input was sized:
 
 ```bash
 ./run.sh mkinput 20b 2 input_2gpu.txt       # 3072 requests
@@ -151,9 +162,17 @@ length; pass `-s your_prompts.txt` to use your own. Repetition is fine for a thr
 makes the output redundant for quality scoring. The file format is a line giving the request count,
 then one prompt per line.
 
-> **120B on fewer than 8 GPUs does not work.** The 120B path sets `EXPERT_PARALLELISM = n_devices`, and the
-> dispatch at [`src/getp/run.cpp:524`](src/getp/run.cpp#L524) only routes to the 120B implementation when
-> that equals 8. On any other count it silently falls through to the 20B path and fails an assert there.
+> **The 120B configuration is only set up for 8 GPUs.** `warm_up` sets `EXPERT_PARALLELISM = n_devices`
+> for the 120B model, and the dispatch in [`inference()`](src/getp/run.cpp) only routes to
+> `Model_120b::distribute_requests` when that equals 8. On any other count it silently falls through to
+> the 20B path, and nothing stops it: the only asserts there are request-count checks, which a file from
+> `./run.sh mkinput 120b <gpus>` satisfies. The fall-through is harmless in itself — both namespaces run
+> the same `getp_forward_120b`, and with `EXPERT_PARALLELISM = n_devices` there is exactly one model
+> replica, so the two `distribute_requests` do the same thing for a single chunk. What breaks is memory:
+> `warm_up` shards the experts as `n_experts / EXPERT_PARALLELISM`, so fewer devices means more experts
+> on each. Four GPUs is 32 experts per device, about 57 GB of expert weights in bf16; add the dense
+> weights and the KV cache and it is well past what a 64 GB MI250 device holds, so the run dies on a
+> failed `hipMalloc` during warm-up.
 
 ### 6. Check the tokenizer
 
@@ -219,7 +238,7 @@ Where those numbers came from, one optimisation at a time on the 20B model:
 | Per-step allocations, events and a dead 35 MB memset removed |      57019 |  +1.0% |
 | Argmax made independent of block arrival order               |      57343 |  +0.6% |
 | mlp2 block 64 -> 96 with a matching register budget          |      58309 |  +1.7% |
-| Attention scratch LDS reused; five HBM round-trips removed   |  **60850** |  +4.3% |
+| Attention scratch LDS reused; five HBM round-trips removed   |  **60850** |  +4.4% |
 
 The 120B model went from 13,149 to 19,837 tok/s over the same work, with no
 changes specific to it - it runs the same kernels with the same defaults.
@@ -231,14 +250,16 @@ Throughput is aggregate across all eight GPUs, not single-stream latency. The qu
 0.3 and BERTScore 0.9; both models clear them several times over, so the speed was not bought with
 degraded output.
 
-Every figure in that table comes from one run each, and the completions those scores were computed
-from are committed in [`tests/submission/`](tests/submission/) — so the numbers can be checked without
-a GPU, by scoring the files in the repository. `./run.sh eval 20b` reproduces the last two columns.
+Every figure in that table comes from one run each. The completions committed in
+[`tests/submission/`](tests/submission/) are from the starting point of that table, before any of the
+optimisations in it, so they are not the ones those scores were computed from — but they can still be
+scored without a GPU: `./run.sh eval 20b` reports METEOR 0.533 and BERTScore 0.978 on them, a hair
+under the table's METEOR and the same BERTScore.
 
 Repeating a run moves throughput by well under a percent, but it moves the completions a great deal.
 The engine is not bit-deterministic — the same prompt at a different batch index takes a different path
 through the expert grouping — and greedy decoding turns any difference into a different trajectory. Two
-runs of the _same binary_ at 8 GPUs and 1024 steps agree on only about 68% of tokens, while the quality
+runs of the _same binary_ at 8 GPUs and 1024 steps agree on only about 64% of tokens, while the quality
 scores stay put. That is worth knowing before using token agreement to check a change: at this scale it
 cannot tell a real bug from a rounding difference, and METEOR and BERTScore are the gates that can.
 

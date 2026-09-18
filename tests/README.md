@@ -61,6 +61,7 @@ srun --gres=gpu:2 python eval.py -m 120b
   ```bash
   python eval.py -m 20b -s /path/to/your_output_4096.txt
   ```
+
 - `-r, --references PATH`
   Override path to reference completions (space-separated token IDs per line).
 - `-e, --encoding NAME` (default: `o200k_harmony`)
@@ -68,7 +69,7 @@ srun --gres=gpu:2 python eval.py -m 120b
 
 Run `python eval.py -h` for the full help text. See the docstring in `eval.py` for details on defaults and behavior.
 
-> If `threshold.json` is present in the `tests/` folder, the script reads target thresholds for METEOR and BERTScore F1 and **raises an `AssertionError`** if either metric is below its threshold.
+> `threshold.json` must be present in the `tests/` folder: `eval.py` opens it before it even parses arguments, so a missing file aborts the run with `FileNotFoundError`. It holds the target thresholds for METEOR and BERTScore F1, and the script **raises an `AssertionError`** if either metric is below its threshold.
 
 ## Sample output (truncated)
 
@@ -102,9 +103,9 @@ bertscore_f1    0.977838
 
 Those two numbers come from the completions committed in `submission/`: `gpt-oss-20b` in `getp` mode
 on 8x AMD MI250, 12288 requests, scored over the first 4096. They clear both thresholds in
-`threshold.json` comfortably and agree with the [main README](../README.md) table to the digits it
-reports. They are a separate measurement from the one that produced that table, so small differences
-are expected -- see the note on batch-position nondeterminism below.
+`threshold.json` comfortably. They sit just under the METEOR 0.534 and BERTScore 0.978 in the
+[main README](../README.md) table, and that gap is a different engine rather than run-to-run noise --
+see the note under the 120B block.
 
 ```bash
 120b
@@ -116,7 +117,10 @@ bertscore_f1    0.98164
 ```
 
 Both models' completions in `submission/` come from runs on 8x AMD MI250, scored over the first 4096
-of 12288 (20B) and 6144 (120B) requests.
+of 12288 (20B) and 6144 (120B) requests -- on the pre-rewrite build that ran at 33,979 and 13,149
+tok/s, not the current one, which scores METEOR 0.534 / BERTScore 0.978 on 20B and 0.566 / 0.981 on
+120B. Reproducing the table's last two columns therefore means re-running `getp` on this commit and
+re-scoring, not scoring the files committed here.
 
 **Expected runtime:** \~4 minutes for 4096 samples on 2 GPUs (your hardware and load may vary).
 
@@ -128,16 +132,19 @@ the reference files here hold 4096 completions. The two line up if you build the
 
 ```bash
 python3 ../tools/make_getp_input.py -m 20b -g 8 -s input.txt -o /tmp/input_12288.txt
-../run gpt-oss-20b.bin -m getp -i /tmp/input_12288.txt -o /tmp/out.txt
+../run ../gpt-oss-20b.bin -m getp -i /tmp/input_12288.txt -o /tmp/out.txt -z ../tokenizer.bin
 head -4096 /tmp/out.txt > /tmp/submission.txt
 python eval.py -m 20b -s /tmp/submission.txt
 ```
 
-Completions are written in request order, so output line *i* is the answer to prompt *i*.
+Completions are written in request order, so output line _i_ is the answer to prompt _i_.
 
-Note that the engine is not deterministic with respect to batch position: the same prompt placed at a
-different index takes a different numerical path through the expert grouping, so repeated copies of one
-prompt do not produce identical completions even at temperature 0. Scores move slightly between runs.
+Note that the engine is not deterministic. The same prompt placed at a different batch index takes a
+different numerical path through the expert grouping, so repeated copies of one prompt do not produce
+identical completions even at temperature 0 -- and neither do two runs of the same binary on the same
+input file: at 8 GPUs and 1024 steps they agree on only about 64% of tokens, while METEOR and BERTScore
+stay put. (At 16 steps on 4 GPUs it is exactly deterministic.) Token agreement therefore cannot validate
+a change at this scale; the quality scores are the gate.
 
 ## Tips & troubleshooting
 
