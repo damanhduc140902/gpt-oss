@@ -50,9 +50,12 @@ jobs:
 
       - name: Check the object really contains gfx90a device code
         run: |
-          if ! llvm-objdump -h /tmp/run.o | grep -qi hip_fatbin; then
+          # readelf, not llvm-objdump: the ROCm image does not put the LLVM
+          # tools on PATH, and a missing tool made this step fail for a reason
+          # that had nothing to do with the code.
+          if ! readelf -S /tmp/run.o | grep -qi hip_fatbin; then
             echo "::error::the object has no device fatbin - host-only compile"
-            llvm-objdump -h /tmp/run.o
+            readelf -S /tmp/run.o
             exit 1
           fi
           echo "fatbin present"
