@@ -1,0 +1,63 @@
+name: CI
+
+# The previous workflow fired only on pushes to a branch called `main`, which
+# this repository does not have - the default branch is `one-for-all` - so it
+# had never run once. Listing the branches that exist fixes that.
+on:
+  push:
+    branches: [one-for-all, "restructure/**"]
+  pull_request:
+  workflow_dispatch:
+
+jobs:
+  # The valuable one: the kernels are a unity build, so a single translation
+  # unit has to compile for anything to work at all. Several commits in this
+  # repository's history were caught by exactly this check being run by hand.
+  compile:
+    name: HIP syntax check (gfx90a)
+    runs-on: ubuntu-latest
+    container: rocm/dev-ubuntu-22.04:6.2
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Compile the unity translation unit
+        run: |
+          hipcc --std=c++17 -Iinclude -Isrc --offload-arch=gfx90a -O3 \
+                -fsyntax-only src/run.cpp
+
+      - name: Compile with the debug harnesses enabled
+        # These are off by default but must keep compiling, or the next person
+        # who needs them finds they rotted.
+        run: |
+          hipcc --std=c++17 -Iinclude -Isrc --offload-arch=gfx90a -O3 \
+                -DGETP_DUMP_ATTN=1 -DDEBUG_LDS_POISON \
+                -fsyntax-only src/run.cpp
+
+      - name: Compile the CPU-only tools
+        run: |
+          g++ --std=c++17 -O2 -Iinclude -Isrc -c src/tokenizer.cpp -o /dev/null
+
+  style:
+    name: Code style (pre-commit)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - run: pip install pre-commit
+
+      # Only the files this change touches. Running --all-files would demand a
+      # whole-tree reformat before anything could go green, which would bury
+      # the history in one enormous unrelated diff.
+      - name: Run hooks on changed files
+        run: |
+          if [ "${{ github.event_name }}" = "pull_request" ]; then
+            pre-commit run --from-ref "origin/${{ github.base_ref }}" --to-ref HEAD
+          else
+            pre-commit run --from-ref "HEAD^" --to-ref HEAD
+          fi

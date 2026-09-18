@@ -1,0 +1,20 @@
+# Matches the style the tree is already written in: two-space indents, 80
+# columns, attached braces. It exists mainly so that `clang-format --style=file`
+# has something to read - without it clang-format silently falls back to LLVM
+# style, which is not what this code is written in, and every hook run would
+# want to reformat the whole repository.
+---
+Language: Cpp
+BasedOnStyle: LLVM
+IndentWidth: 2
+ColumnLimit: 80
+DerivePointerAlignment: false
+PointerAlignment: Right
+AllowShortFunctionsOnASingleLine: Inline
+AllowShortIfStatementsOnASingleLine: WithoutElse
+AllowShortLoopsOnASingleLine: true
+SortIncludes: false
+# The kernels use deep template parameter lists and long MFMA builtin calls;
+# breaking them by column count makes them harder to read, not easier.
+PenaltyBreakAssignment: 100
+PenaltyReturnTypeOnItsOwnLine: 1000
