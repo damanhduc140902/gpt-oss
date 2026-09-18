@@ -36,16 +36,16 @@ Two things are measured, and both have to hold:
 
 Both checkpoints share every width; they differ in depth and in how many experts each layer holds.
 
-| | `gpt-oss-20b` | `gpt-oss-120b` |
-| --- | ---: | ---: |
-| Transformer layers | 24 | 36 |
-| Experts per layer | 32 | 128 |
-| Experts per token | 4 | 4 |
-| Attention heads | 64 | 64 |
-| Key/value heads (GQA) | 8 | 8 |
-| Head dimension | 64 | 64 |
-| Hidden size | 2880 | 2880 |
-| Vocabulary | 201,088 | 201,088 |
+|                       | `gpt-oss-20b` | `gpt-oss-120b` |
+| --------------------- | ------------: | -------------: |
+| Transformer layers    |            24 |             36 |
+| Experts per layer     |            32 |            128 |
+| Experts per token     |             4 |              4 |
+| Attention heads       |            64 |             64 |
+| Key/value heads (GQA) |             8 |              8 |
+| Head dimension        |            64 |             64 |
+| Hidden size           |          2880 |           2880 |
+| Vocabulary            |       201,088 |        201,088 |
 
 ---
 
@@ -74,11 +74,11 @@ dequantizes the FP4 tensors and flattens everything into one blob.
 python tools/model_export/gpt-oss-20b/export_model_bin.py      # or gpt-oss-120b/
 ```
 
-| Model | Hugging Face | Export script |
-| --- | --- | --- |
-| `gpt-oss-20b` | [openai/gpt-oss-20b](https://huggingface.co/openai/gpt-oss-20b) | [`tools/model_export/gpt-oss-20b/`](tools/model_export/gpt-oss-20b/) |
+| Model          | Hugging Face                                                      | Export script                                                          |
+| -------------- | ----------------------------------------------------------------- | ---------------------------------------------------------------------- |
+| `gpt-oss-20b`  | [openai/gpt-oss-20b](https://huggingface.co/openai/gpt-oss-20b)   | [`tools/model_export/gpt-oss-20b/`](tools/model_export/gpt-oss-20b/)   |
 | `gpt-oss-120b` | [openai/gpt-oss-120b](https://huggingface.co/openai/gpt-oss-120b) | [`tools/model_export/gpt-oss-120b/`](tools/model_export/gpt-oss-120b/) |
-| `gpt-oss-7m` | [tiny-random/gpt-oss](https://huggingface.co/tiny-random/gpt-oss) | [`tools/model_export/gpt-oss-7m/`](tools/model_export/gpt-oss-7m/) |
+| `gpt-oss-7m`   | [tiny-random/gpt-oss](https://huggingface.co/tiny-random/gpt-oss) | [`tools/model_export/gpt-oss-7m/`](tools/model_export/gpt-oss-7m/)     |
 
 The 7M model is randomly initialised and says nothing sensible, but it is two layers wide and loads in a
 second — use it to prove the build works before committing to a 65 GB download.
@@ -185,17 +185,17 @@ recommended; see [`tests/README.md`](tests/README.md).
 ./run.sh --help
 ```
 
-| Flag | Meaning | Default |
-| --- | --- | --- |
-| `-m` | mode: `generate`, `chat` or `getp` | `generate` |
-| `-i` | prompt, or input file in `getp` mode | — |
-| `-o` | output file, `getp` mode only | — |
-| `-n` | steps to run; `0` means the full context | `1024` |
-| `-t` | temperature; `0.0` is greedy and reproducible | `0.0` |
-| `-p` | top-p (nucleus) sampling | `0.9` |
-| `-s` | random seed | `time(NULL)` |
-| `-y` | system prompt, `chat` mode only | — |
-| `-z` | custom tokenizer path | `tokenizer.bin` |
+| Flag | Meaning                                       | Default         |
+| ---- | --------------------------------------------- | --------------- |
+| `-m` | mode: `generate`, `chat` or `getp`            | `generate`      |
+| `-i` | prompt, or input file in `getp` mode          | —               |
+| `-o` | output file, `getp` mode only                 | —               |
+| `-n` | steps to run; `0` means the full context      | `1024`          |
+| `-t` | temperature; `0.0` is greedy and reproducible | `0.0`           |
+| `-p` | top-p (nucleus) sampling                      | `0.9`           |
+| `-s` | random seed                                   | `time(NULL)`    |
+| `-y` | system prompt, `chat` mode only               | —               |
+| `-z` | custom tokenizer path                         | `tokenizer.bin` |
 
 ---
 
@@ -203,23 +203,23 @@ recommended; see [`tests/README.md`](tests/README.md).
 
 Measured on one node of 8× AMD MI250 in batch (`getp`) mode.
 
-| Model | Requests | Warm-up (s) | Inference (s) | Throughput (TPS) | METEOR | BERTScore |
-| --- | ---: | ---: | ---: | ---: | ---: | ---: |
-| `gpt-oss-20b` | 12288 | 23 | 201 | **60850** | 0.534 | 0.978 |
-| `gpt-oss-120b` | 6144 | 176 | 306 | **19837** | 0.566 | 0.981 |
+| Model          | Requests | Warm-up (s) | Inference (s) | Throughput (TPS) | METEOR | BERTScore |
+| -------------- | -------: | ----------: | ------------: | ---------------: | -----: | --------: |
+| `gpt-oss-20b`  |    12288 |          23 |           201 |        **60850** |  0.534 |     0.978 |
+| `gpt-oss-120b` |     6144 |         176 |           306 |        **19837** |  0.566 |     0.981 |
 
 Where those numbers came from, one optimisation at a time on the 20B model:
 
-| | Throughput | Change |
-| --- | ---: | ---: |
-| Starting point | 33979 | — |
-| GEMM tile tuning and per-tile attention softmax | 42540 | +25.2% |
-| Attention rewritten on `mfma_f32_16x16x16bf16_1k` | 50464 | +18.6% |
-| LDS tiles stored k-contiguous in all five GEMMs | 56434 | +11.8% |
-| Per-step allocations, events and a dead 35 MB memset removed | 57019 | +1.0% |
-| Argmax made independent of block arrival order | 57343 | +0.6% |
-| mlp2 block 64 -> 96 with a matching register budget | 58309 | +1.7% |
-| Attention scratch LDS reused; five HBM round-trips removed | **60850** | +4.3% |
+|                                                              | Throughput | Change |
+| ------------------------------------------------------------ | ---------: | -----: |
+| Starting point                                               |      33979 |      — |
+| GEMM tile tuning and per-tile attention softmax              |      42540 | +25.2% |
+| Attention rewritten on `mfma_f32_16x16x16bf16_1k`            |      50464 | +18.6% |
+| LDS tiles stored k-contiguous in all five GEMMs              |      56434 | +11.8% |
+| Per-step allocations, events and a dead 35 MB memset removed |      57019 |  +1.0% |
+| Argmax made independent of block arrival order               |      57343 |  +0.6% |
+| mlp2 block 64 -> 96 with a matching register budget          |      58309 |  +1.7% |
+| Attention scratch LDS reused; five HBM round-trips removed   |  **60850** |  +4.3% |
 
 The 120B model went from 13,149 to 19,837 tok/s over the same work, with no
 changes specific to it - it runs the same kernels with the same defaults.
@@ -238,7 +238,7 @@ a GPU, by scoring the files in the repository. `./run.sh eval 20b` reproduces th
 Repeating a run moves throughput by well under a percent, but it moves the completions a great deal.
 The engine is not bit-deterministic — the same prompt at a different batch index takes a different path
 through the expert grouping — and greedy decoding turns any difference into a different trajectory. Two
-runs of the *same binary* at 8 GPUs and 1024 steps agree on only about 68% of tokens, while the quality
+runs of the _same binary_ at 8 GPUs and 1024 steps agree on only about 68% of tokens, while the quality
 scores stay put. That is worth knowing before using token agreement to check a change: at this scale it
 cannot tell a real bug from a rounding difference, and METEOR and BERTScore are the gates that can.
 
@@ -246,12 +246,12 @@ cannot tell a real bug from a rounding difference, and METEOR and BERTScore are 
 
 ## How It Works
 
-| | What it does | Detail |
-| --- | --- | --- |
-| **Model** | The architecture as this code implements it, the `.bin` weight format and its FP4 dequantization, the `o200k_harmony` tokenizer and the sampling path. | [MODEL.md](docs/MODEL.md) |
-| **Kernels** | A blocktiled GEMM issued entirely on the matrix cores with double buffering, a FlashAttention-style attention kernel that exploits grouped-query attention, and one fused kernel that serves every expert in a single launch. | [KERNELS.md](docs/KERNELS.md) |
-| **Parallelism** | Expert × Data parallelism across the GPUs, with all-gather and reduce-scatter built from peer-to-peer copies alone and ordered so PCIe runs full-duplex. | [PARALLELISM.md](docs/PARALLELISM.md) |
-| **Serving** | The `getp` batch runtime: how requests are batched and scheduled, what the warm-up buys, and where the throughput actually comes from. | [SERVING.md](docs/SERVING.md) |
+|                 | What it does                                                                                                                                                                                                                  | Detail                                |
+| --------------- | ----------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- | ------------------------------------- |
+| **Model**       | The architecture as this code implements it, the `.bin` weight format and its FP4 dequantization, the `o200k_harmony` tokenizer and the sampling path.                                                                        | [MODEL.md](docs/MODEL.md)             |
+| **Kernels**     | A blocktiled GEMM issued entirely on the matrix cores with double buffering, a FlashAttention-style attention kernel that exploits grouped-query attention, and one fused kernel that serves every expert in a single launch. | [KERNELS.md](docs/KERNELS.md)         |
+| **Parallelism** | Expert × Data parallelism across the GPUs, with all-gather and reduce-scatter built from peer-to-peer copies alone and ordered so PCIe runs full-duplex.                                                                      | [PARALLELISM.md](docs/PARALLELISM.md) |
+| **Serving**     | The `getp` batch runtime: how requests are batched and scheduled, what the warm-up buys, and where the throughput actually comes from.                                                                                        | [SERVING.md](docs/SERVING.md)         |
 
 ### Code structure
 

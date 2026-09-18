@@ -22,10 +22,10 @@ read and write the wrong cache rows. Reviving it means fixing that line first.
 not be modified. It reads a request count from the first line of the input file and copies each
 subsequent line verbatim into two flat arenas:
 
-| Arena | Stride per request | Holds |
-| --- | --- | --- |
-| `str_reqs` | `max_token_len × (max_seq_len + 1)` bytes | the raw prompt text |
-| `tok_gens` | `max_seq_len + 1` ints | the generated token ids, `-1`-terminated |
+| Arena      | Stride per request                        | Holds                                    |
+| ---------- | ----------------------------------------- | ---------------------------------------- |
+| `str_reqs` | `max_token_len × (max_seq_len + 1)` bytes | the raw prompt text                      |
+| `tok_gens` | `max_seq_len + 1` ints                    | the generated token ids, `-1`-terminated |
 
 Both are `calloc`ed whole in `build_requests` ([`src/getp/eval.cpp:17-28`](../src/getp/eval.cpp)).
 The `max_seq_len` passed in is `steps`, that is the `-n` value clamped to the model's `seq_len`, so
@@ -63,20 +63,20 @@ int n_parallel_models = n_devices / EXPERT_PARALLELISM;
 int num_reqs_per_device = requests->num_reqs / n_parallel_models;
 ```
 
-Group *g* owns the contiguous request slice `[g·N/n_parallel_models, (g+1)·N/n_parallel_models)`
+Group _g_ owns the contiguous request slice `[g·N/n_parallel_models, (g+1)·N/n_parallel_models)`
 ([`src/getp/run.cpp:510-520`](../src/getp/run.cpp)). Groups share nothing — not weights, not KV
 cache, not a barrier. For the 20B model with `EXPERT_PARALLELISM = 2` there are four groups of two
 GPUs; for the 120B model with `EXPERT_PARALLELISM = 8` there is one group of eight.
 
 How rigid the partition is differs between the two paths:
 
-| | 20B | 120B |
-| --- | --- | --- |
-| Model groups on 8 GPUs | 4 (2 GPUs each) | 1 (8 GPUs) |
-| Rows per device (`BATCH_SIZE`) | 1536 | 768 |
-| Requests per group | 3072 | 6144 |
-| Accepted request count | exactly `n_devices × 1536` (12288 on 8 GPUs) | any multiple of `n_devices × 768` (6144 on 8 GPUs) — but only on exactly 8 GPUs |
-| Enforced by | two asserts at [`run.cpp:268-269`](../src/getp/run.cpp) | the chunk loop in `Model_120b::distribute_requests` |
+|                                | 20B                                                     | 120B                                                                            |
+| ------------------------------ | ------------------------------------------------------- | ------------------------------------------------------------------------------- |
+| Model groups on 8 GPUs         | 4 (2 GPUs each)                                         | 1 (8 GPUs)                                                                      |
+| Rows per device (`BATCH_SIZE`) | 1536                                                    | 768                                                                             |
+| Requests per group             | 3072                                                    | 6144                                                                            |
+| Accepted request count         | exactly `n_devices × 1536` (12288 on 8 GPUs)            | any multiple of `n_devices × 768` (6144 on 8 GPUs) — but only on exactly 8 GPUs |
+| Enforced by                    | two asserts at [`run.cpp:268-269`](../src/getp/run.cpp) | the chunk loop in `Model_120b::distribute_requests`                             |
 
 `Model_20b::distribute_requests` asserts both `n_parallel_models * requests_per_model ==
 requests->num_reqs` and `requests_per_model == EXPERT_PARALLELISM * BATCH_SIZE`, so on eight GPUs
@@ -96,7 +96,7 @@ exactly one accepted count, `n_devices × 768` = 3072, enforced by the 20B asser
 of 6144" row holds on exactly eight devices and nowhere else.
 
 The same loop contains an index confusion that is inert but confusing to read:
-`if (i == n_parallel_models - 1) workers[i].request_end = requests->num_reqs;` compares the *device*
+`if (i == n_parallel_models - 1) workers[i].request_end = requests->num_reqs;` compares the _device_
 index `i` (0, 2, 4, 6 for the 20B model) against `n_parallel_models - 1` (3), so it never fires for
 the 20B model; for the 120B model it fires on the only group, where it is already a no-op.
 
@@ -124,10 +124,10 @@ num_reqs == n_devices × BATCH_SIZE
 `BATCH_SIZE` is 1536 for the 20B model and 768 for the 120B model, hard-coded in `warm_up`. So on
 eight GPUs:
 
-| Model | `EXPERT_PARALLELISM` | `BATCH_SIZE` | Required `num_reqs` on 8 GPUs |
-| --- | --- | --- | --- |
-| 20B | 2 | 1536 | 8 × 1536 = **12288** |
-| 120B | 8 | 768 | 8 × 768 = **6144**, or any multiple of it |
+| Model | `EXPERT_PARALLELISM` | `BATCH_SIZE` | Required `num_reqs` on 8 GPUs             |
+| ----- | -------------------- | ------------ | ----------------------------------------- |
+| 20B   | 2                    | 1536         | 8 × 1536 = **12288**                      |
+| 120B  | 8                    | 768          | 8 × 768 = **6144**, or any multiple of it |
 
 Those are exactly the two "sequences in flight" figures in the results table. They are not defaults
 you get for free; they are the only counts the runtime accepts.
@@ -142,13 +142,13 @@ and inherits these same two asserts.
 
 **Every shipped input fails it**, not just the obvious one:
 
-| File | Declared requests | Runs on 8 GPUs? |
-| --- | --- | --- |
-| [`tests/input.txt`](../tests/input.txt) | 4096 | no — needs 12288 (20B) or a multiple of 6144 (120B) |
-| [`tests/data/input.txt`](../tests/data/input.txt) | 32 | no |
-| `tests/data/input_test.txt` | 256 | no |
-| `tests/data/input_original.txt` | 448 | no |
-| `tests/data/input-multi.txt` | 3584 | no |
+| File                                              | Declared requests | Runs on 8 GPUs?                                     |
+| ------------------------------------------------- | ----------------- | --------------------------------------------------- |
+| [`tests/input.txt`](../tests/input.txt)           | 4096              | no — needs 12288 (20B) or a multiple of 6144 (120B) |
+| [`tests/data/input.txt`](../tests/data/input.txt) | 32                | no                                                  |
+| `tests/data/input_test.txt`                       | 256               | no                                                  |
+| `tests/data/input_original.txt`                   | 448               | no                                                  |
+| `tests/data/input-multi.txt`                      | 3584              | no                                                  |
 
 [`run.sh`](../run.sh) no longer points its worked example at any of them: its usage text states the
 rule outright and its `getp` example builds a file with `mkinput` first (`run.sh:59-62`). Invoking
@@ -216,12 +216,12 @@ used by the expert-aggregate exchange. Because the 120B path sets `EXPERT_PARALL
 with no clamp, a node exposing more than eight HIP devices would write past that array.
 
 One structural fact about the tree is worth stating here, because several behaviours on this page
-follow from it. `include/transformer.hpp:8` reads `int EXPERT_PARALLELISM = 8;` — a *definition* in a
+follow from it. `include/transformer.hpp:8` reads `int EXPERT_PARALLELISM = 8;` — a _definition_ in a
 header, not a declaration. That would be a duplicate-symbol link error in a normal multi-file build.
 It works because the whole program is a single translation unit assembled by `#include`-ing `.cpp`
 files: [`src/run.cpp`](../src/run.cpp) includes `getp/eval.cpp` and then `getp/run.cpp`, which in
 turn includes `collectives.cpp`, `state_ext.cpp` and `transformer.cpp`. There is one object file. The
-practical consequence is that include *order* decides which of several competing `#define`s wins —
+practical consequence is that include _order_ decides which of several competing `#define`s wins —
 see the `HIP_CHECK` note in the next section.
 
 ## KV cache sizing
@@ -258,12 +258,12 @@ which is why the re-export advice below comes with a warning attached.
 The resulting sizes, with `kv_dim = head_dim × n_kv_heads = 64 × 8 = 512`, so K+V in bf16 costs
 exactly 2 KiB per time slot per batch row:
 
-| Model | `seq_len` | Slots per device | Per row | Per device (B rows) |
-| --- | --- | --- | --- | --- |
-| 20B (24 layers, B=1536) | 2048 | 12×128 + 12×1024 = 13824 | 28.3 MB | 43.49 GB |
-| 20B | 1024 | 12×128 + 12×512 = 7680 | 15.7 MB | 24.16 GB |
-| 120B (36 layers, B=768) | 2048 | 18×128 + 18×1024 = 20736 | 42.5 MB | 32.61 GB |
-| 120B | 1024 | 18×128 + 18×512 = 11520 | 23.6 MB | 18.12 GB |
+| Model                   | `seq_len` | Slots per device         | Per row | Per device (B rows) |
+| ----------------------- | --------- | ------------------------ | ------- | ------------------- |
+| 20B (24 layers, B=1536) | 2048      | 12×128 + 12×1024 = 13824 | 28.3 MB | 43.49 GB            |
+| 20B                     | 1024      | 12×128 + 12×512 = 7680   | 15.7 MB | 24.16 GB            |
+| 120B (36 layers, B=768) | 2048      | 18×128 + 18×1024 = 20736 | 42.5 MB | 32.61 GB            |
+| 120B                    | 1024      | 18×128 + 18×512 = 11520  | 23.6 MB | 18.12 GB            |
 
 For comparison, take the naive version of the same thing: every layer given all `seq_len` slots, in
 fp32. For the 20B configuration at `seq_len` 2048 that is 24 × 2048 × 512 × 4 B × 1536 =
@@ -275,9 +275,9 @@ against a K-only baseline would credit the slot reduction alone and give bf16 no
 Weights are the other resident cost, and they are comfortably accounted for:
 
 | Model | Dense bf16 | Expert shard (16 experts) | Total per device |
-| --- | --- | --- | --- |
-| 20B | 3.60 GB | 19.12 GB | 22.7 GB |
-| 120B | 4.26 GB | 28.68 GB | 32.9 GB |
+| ----- | ---------- | ------------------------- | ---------------- |
+| 20B   | 3.60 GB    | 19.12 GB                  | 22.7 GB          |
+| 120B  | 4.26 GB    | 28.68 GB                  | 32.9 GB          |
 
 Put the two tables together and the shipped constants do not fit the shipped `config.json`. With
 `max_seq_len = 2048` from [`tools/model_export/gpt-oss-20b/config.json`](../tools/model_export/gpt-oss-20b/config.json),
@@ -307,7 +307,7 @@ layers to be exact, and small enough that `seq_len/2` slots per odd layer still 
 weights. At `BATCH_SIZE = 1536` on a 64 GB GCD those two constraints do not both hold for a
 1024-step run; something has to give, and the honest levers are `BATCH_SIZE` and the step count.
 
-The layout is `[layer][t][batch][kv_dim]` — batch-major *inside* a time slot
+The layout is `[layer][t][batch][kv_dim]` — batch-major _inside_ a time slot
 ([`forward.hip:3586-3596`](../src/hip/forward.hip)). That ordering exists for the write side: every
 step writes one slot for all 1536 rows at once, and batch-major makes that write fully coalesced.
 The read side pays for it with a strided gather, which the flash-decode kernel absorbs by staging
@@ -370,12 +370,12 @@ model (8 dense tensors plus four per layer × 24 layers) and 152 times for the 1
 (8 + 4 × 36). The largest staging buffers are 1.16 GB for the embedding and unembedding tables
 (579 M elements each) and 531 MB for one layer's `w_mlp1` shard.
 
-| | 20B | 120B |
-| --- | --- | --- |
-| Checkpoint on disk (fp32) | 83.7 GB (20.91 B params) | 467.3 GB (116.8 B params) |
-| `getp_memcpy_fp32_to_bf16` calls per device | 104 | 152 |
-| Scalar `__float2bfloat16` per thread | 11.36 × 10⁹ | 16.47 × 10⁹ |
-| Measured warm-up | 180 s | 390 s |
+|                                             | 20B                      | 120B                      |
+| ------------------------------------------- | ------------------------ | ------------------------- |
+| Checkpoint on disk (fp32)                   | 83.7 GB (20.91 B params) | 467.3 GB (116.8 B params) |
+| `getp_memcpy_fp32_to_bf16` calls per device | 104                      | 152                       |
+| Scalar `__float2bfloat16` per thread        | 11.36 × 10⁹              | 16.47 × 10⁹               |
+| Measured warm-up                            | 180 s                    | 390 s                     |
 
 Only four tensors escape the conversion and stay in fp32 — the two per-layer rmsnorm scales, the
 final norm, and the attention sinks. They share one pinned buffer and a plain `memcpy`.
@@ -442,14 +442,14 @@ inline void sync_workers(hipStream_t stream, Barrier &sync_point) {
 ```
 
 Synchronize this thread's compute stream, then wait on the barrier. After it returns, this device's
-work is complete *and* every peer has reached the same point — which is exactly the precondition for
+work is complete _and_ every peer has reached the same point — which is exactly the precondition for
 reading a buffer a peer just wrote by `hipMemcpyPeerAsync`. It runs twice per layer: once after the
 hidden-state and router all-gather, once after the MoE aggregate.
 
 | Model | Layers | `sync_workers` per layer | Barrier crossings per token step |
-| --- | --- | --- | --- |
-| 20B | 24 | 2 | 2 × 24 + 1 = 49 |
-| 120B | 36 | 2 | 2 × 36 + 1 = 73 |
+| ----- | ------ | ------------------------ | -------------------------------- |
+| 20B   | 24     | 2                        | 2 × 24 + 1 = 49                  |
+| 120B  | 36     | 2                        | 2 × 36 + 1 = 73                  |
 
 The `+ 1` is the third barrier, and it is easy to miss because it lives outside the forward pass:
 `sync_point.wait()` at [`run.cpp:218`](../src/getp/run.cpp), on the same `Barrier` object, is what
@@ -464,16 +464,16 @@ Each `DeviceTransformer` creates four non-blocking streams
 `cgCreate` adds a fifth per-device stream that only the never-called generic collectives in
 [`src/getp/collectives.cpp`](../src/getp/collectives.cpp) touch. The two that matter:
 
-| Stream | Carries |
-| --- | --- |
-| `compute_stream` | every kernel, plus the final argmax read-back |
-| `memory_stream` | all `hipMemcpyPeerAsync` traffic and the aggregate `hipMemsetAsync` |
+| Stream           | Carries                                                             |
+| ---------------- | ------------------------------------------------------------------- |
+| `compute_stream` | every kernel, plus the final argmax read-back                       |
+| `memory_stream`  | all `hipMemcpyPeerAsync` traffic and the aggregate `hipMemsetAsync` |
 
 Overlap is real but narrow, and it is event-driven rather than stream-priority driven. Three places
 in the layer body actually hide work:
 
 1. **Hidden-state all-gather behind the router GEMM.** `hipEventRecord(event_rmsnorm,
-   compute_stream)` is issued right after the FFN rmsnorm; `memory_stream` waits on it and then
+compute_stream)` is issued right after the FFN rmsnorm; `memory_stream` waits on it and then
    converts `ext_t` to bf16 and peer-copies it, while `compute_stream` proceeds into the router GEMM
    and top-k ([`forward.hip:3670-3690`](../src/hip/forward.hip)). This is the one substantial win.
 2. **Aggregate memset behind both MLPs.** `hipMemsetAsync` of `ext_e_agg` is issued on
@@ -482,8 +482,8 @@ in the layer body actually hide work:
    of `EXPERT_PARALLELISM × BATCH_SIZE × hidden_dim` floats hides behind MLP1 and MLP2.
 3. **Expert-aggregate reduction interleaved with its copies.** Each peer copy records its own
    `events_e_agg[j]`, and the matching `getp_vecadd` waits only on that one event
-   ([`forward.hip:3789-3813`](../src/hip/forward.hip)), so reduction of peer *j* overlaps the arrival
-   of peer *j+1*.
+   ([`forward.hip:3789-3813`](../src/hip/forward.hip)), so reduction of peer _j_ overlaps the arrival
+   of peer _j+1_.
 
 Against that, the top-k tensors are a missed opportunity: their peer copies are issued on
 `memory_stream` but behind `hipStreamWaitEvent(memory_stream, event_router_topk)`
@@ -500,14 +500,14 @@ is part of why the 20B configuration scales so cleanly.
 Overlap is bounded by how often the host has to stop and look at the device. Per layer there are five
 host-side stream synchronisations plus a pageable device-to-host read:
 
-| Site | Why |
-| --- | --- |
-| [`forward.hip:225`](../src/hip/forward.hip), inside `build_moe_block_schedule` | reads `total_blocks` to size the bucketed MLP launch |
-| [`forward.hip:268`](../src/hip/forward.hip), inside `build_moe_buckets_local_pos` | reads the expert-offset array to compute `cap_pairs` |
-| [`forward.hip:3716`](../src/hip/forward.hip), `hipStreamSynchronize(memory_stream)` | the peer copies must land before the barrier |
-| [`forward.hip:3717`](../src/hip/forward.hip), inside `sync_workers` | compute-stream drain before the barrier |
-| [`forward.hip:3734`](../src/hip/forward.hip), `hipMemcpyAsync` of `total_pairs` into a stack `int` | grid size for the scatter kernel |
-| [`forward.hip:3782`](../src/hip/forward.hip), inside `sync_workers` | compute-stream drain after the MoE aggregate |
+| Site                                                                                               | Why                                                  |
+| -------------------------------------------------------------------------------------------------- | ---------------------------------------------------- |
+| [`forward.hip:225`](../src/hip/forward.hip), inside `build_moe_block_schedule`                     | reads `total_blocks` to size the bucketed MLP launch |
+| [`forward.hip:268`](../src/hip/forward.hip), inside `build_moe_buckets_local_pos`                  | reads the expert-offset array to compute `cap_pairs` |
+| [`forward.hip:3716`](../src/hip/forward.hip), `hipStreamSynchronize(memory_stream)`                | the peer copies must land before the barrier         |
+| [`forward.hip:3717`](../src/hip/forward.hip), inside `sync_workers`                                | compute-stream drain before the barrier              |
+| [`forward.hip:3734`](../src/hip/forward.hip), `hipMemcpyAsync` of `total_pairs` into a stack `int` | grid size for the scatter kernel                     |
+| [`forward.hip:3782`](../src/hip/forward.hip), inside `sync_workers`                                | compute-stream drain after the MoE aggregate         |
 
 The MoE read-backs are not laziness. Block counts depend on data-dependent expert occupancy — how
 many of the `EXPERT_PARALLELISM × BATCH_SIZE × 4` (token, expert) pairs landed on each of this
@@ -534,11 +534,11 @@ the scatter kernel silently gets a stale grid size.
 
 Allocation also sits on the critical path, and it is cheap to overlook.
 
-| Frequency | Call | Site |
-| --- | --- | --- |
-| Per token step | `hipMalloc` / `hipFree` of the argmax pair buffer | [`forward.hip:3438`, `3446`](../src/hip/forward.hip) |
-| Per token step | `hipHostMalloc` / `hipHostFree` of the `next_host` result buffer | [`forward.hip:3825`](../src/hip/forward.hip), freed at [`run.cpp:231`](../src/getp/run.cpp) |
-| Per **layer** | `hipMallocAsync` / `hipFreeAsync` of the split-K partials in `getp_matmul_router_bf16` | [`forward.hip:2853`, `2878`](../src/hip/forward.hip) |
+| Frequency      | Call                                                                                   | Site                                                                                        |
+| -------------- | -------------------------------------------------------------------------------------- | ------------------------------------------------------------------------------------------- |
+| Per token step | `hipMalloc` / `hipFree` of the argmax pair buffer                                      | [`forward.hip:3438`, `3446`](../src/hip/forward.hip)                                        |
+| Per token step | `hipHostMalloc` / `hipHostFree` of the `next_host` result buffer                       | [`forward.hip:3825`](../src/hip/forward.hip), freed at [`run.cpp:231`](../src/getp/run.cpp) |
+| Per **layer**  | `hipMallocAsync` / `hipFreeAsync` of the split-K partials in `getp_matmul_router_bf16` | [`forward.hip:2853`, `2878`](../src/hip/forward.hip)                                        |
 
 The first row is worse than "a round-trip". `hipFree` is device-synchronising: it blocks the calling
 thread until every kernel queued on every stream of that device has finished. So
@@ -614,26 +614,26 @@ row.
 
 The harness times `inference()` end to end and divides the accumulated output token count by the wall
 time. Two facts about the measurement before the arithmetic. The binary is the `runfast` target —
-`hipcc --std=c++17 --offload-arch=gfx90a -O3` ([`Makefile`](../Makefile)) — and *not* the default
+`hipcc --std=c++17 --offload-arch=gfx90a -O3` ([`Makefile`](../Makefile)) — and _not_ the default
 `make run` target, which is the one target that drops `$(CFLAGS)` and builds at `-O0` with no offload
 arch at all. And the input is a 12288- or 6144-request file built as described above, since no
 shipped one runs. Working backwards from the published figures:
 
-| | 20B | 120B |
-| --- | --- | --- |
-| Sequences in flight | 12288 | 6144 |
-| Forward passes (`-n 1024`, `while (pos + 1 < steps)`) | 1023 | 1023 |
-| Measured throughput | 60850 tok/s | 19837 tok/s |
-| Implied token-step time | 362 ms | 467 ms |
-| Barrier crossings per step | 49 | 73 |
-| Host stream syncs per step | ≈ 120 | ≈ 180 |
+|                                                       | 20B         | 120B        |
+| ----------------------------------------------------- | ----------- | ----------- |
+| Sequences in flight                                   | 12288       | 6144        |
+| Forward passes (`-n 1024`, `while (pos + 1 < steps)`) | 1023        | 1023        |
+| Measured throughput                                   | 60850 tok/s | 19837 tok/s |
+| Implied token-step time                               | 362 ms      | 467 ms      |
+| Barrier crossings per step                            | 49          | 73          |
+| Host stream syncs per step                            | ≈ 120       | ≈ 180       |
 
 Both figures are averages over a run whose step time grows. The odd layers' attention work scales
 with `pos + 1 - t_start` until the `seq_len/2` cap is reached, while the even layers stay pinned at
 128 positions regardless of `pos`. Early steps are therefore cheaper than late ones, and the
 alternating layer design caps how badly the tail degrades: half the layers never grow at all.
 
-The design has one structural idle cost. A group runs until its *last* sequence finishes; when it
+The design has one structural idle cost. A group runs until its _last_ sequence finishes; when it
 does, its GPUs sit idle while other groups continue. On this workload that costs almost nothing,
 because the reference outputs average 991.4 of a possible 1020 tokens — nearly every sequence runs to
 the step limit. That is precisely the assumption the runtime was built on, and it is the assumption
@@ -646,7 +646,7 @@ Collected in one place, in rough order of how likely they are to bite:
 - **No continuous batching.** A finished row holds its slot, its KV cache and its share of every
   dense GEMM until the whole group stops.
 - **Fixed request counts.** `num_reqs` must be `n_devices × BATCH_SIZE`: 12288 for the 20B model on
-  8 GPUs, a multiple of 6144 for the 120B model on 8 GPUs. *Every* input file in the repository
+  8 GPUs, a multiple of 6144 for the 120B model on 8 GPUs. _Every_ input file in the repository
   fails this; `run.sh`'s own `getp` example builds one with `mkinput` instead of using them. See
   [Building an input file that runs](#building-an-input-file-that-runs).
 - **`EXPERT_PARALLELISM == 8` dispatch.** On anything other than eight devices the 120B model falls
@@ -670,20 +670,20 @@ parts of the design are load-bearing and which are simply unfinished.
 
 ## Where to look in the code
 
-| Concept | File |
-| --- | --- |
-| `warm_up`, `BATCH_SIZE` / `EXPERT_PARALLELISM` choice, request partitioning, generation loop | [`src/getp/run.cpp`](../src/getp/run.cpp) |
-| Weight upload, fp32→bf16 conversion, KV cache sizing, stream creation | [`src/getp/transformer.cpp`](../src/getp/transformer.cpp) |
-| MoE extension buffers (`ext_alloc_device`) | [`src/getp/state_ext.cpp`](../src/getp/state_ext.cpp) |
-| Spin barrier | [`include/barrier.hpp`](../include/barrier.hpp) |
-| `getp_forward_120b`, `sync_workers`, peer copies, MoE schedule build, fused logits+argmax | [`src/hip/forward.hip`](../src/hip/forward.hip) |
-| `GPUWorker`, `MAXIMUM_GPU`, weight struct | [`include/transformer.hpp`](../include/transformer.hpp) |
-| Request arena, warm-up and throughput timing (fixed harness) | [`src/getp/eval.cpp`](../src/getp/eval.cpp) |
-| Unused generic collectives, `cgCreate` | [`src/getp/collectives.cpp`](../src/getp/collectives.cpp) |
-| CLI, `-n` default of 1024, checkpoint mmap, and the single-translation-unit include chain | [`src/run.cpp`](../src/run.cpp) |
-| fp32 checkpoint export | [`tools/model_export`](../tools/model_export) |
-| Generating an input file of the accepted length | [`tools/make_getp_input.py`](../tools/make_getp_input.py) |
-| Build targets (`runfast` is the one the numbers come from) | [`Makefile`](../Makefile) |
+| Concept                                                                                      | File                                                      |
+| -------------------------------------------------------------------------------------------- | --------------------------------------------------------- |
+| `warm_up`, `BATCH_SIZE` / `EXPERT_PARALLELISM` choice, request partitioning, generation loop | [`src/getp/run.cpp`](../src/getp/run.cpp)                 |
+| Weight upload, fp32→bf16 conversion, KV cache sizing, stream creation                        | [`src/getp/transformer.cpp`](../src/getp/transformer.cpp) |
+| MoE extension buffers (`ext_alloc_device`)                                                   | [`src/getp/state_ext.cpp`](../src/getp/state_ext.cpp)     |
+| Spin barrier                                                                                 | [`include/barrier.hpp`](../include/barrier.hpp)           |
+| `getp_forward_120b`, `sync_workers`, peer copies, MoE schedule build, fused logits+argmax    | [`src/hip/forward.hip`](../src/hip/forward.hip)           |
+| `GPUWorker`, `MAXIMUM_GPU`, weight struct                                                    | [`include/transformer.hpp`](../include/transformer.hpp)   |
+| Request arena, warm-up and throughput timing (fixed harness)                                 | [`src/getp/eval.cpp`](../src/getp/eval.cpp)               |
+| Unused generic collectives, `cgCreate`                                                       | [`src/getp/collectives.cpp`](../src/getp/collectives.cpp) |
+| CLI, `-n` default of 1024, checkpoint mmap, and the single-translation-unit include chain    | [`src/run.cpp`](../src/run.cpp)                           |
+| fp32 checkpoint export                                                                       | [`tools/model_export`](../tools/model_export)             |
+| Generating an input file of the accepted length                                              | [`tools/make_getp_input.py`](../tools/make_getp_input.py) |
+| Build targets (`runfast` is the one the numbers come from)                                   | [`Makefile`](../Makefile)                                 |
 
 Related pages: [MODEL.md](MODEL.md) for the architecture these constants come from,
 [KERNELS.md](KERNELS.md) for the GEMM, attention and MoE kernels the scheduler feeds, and
