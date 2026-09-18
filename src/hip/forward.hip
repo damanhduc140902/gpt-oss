@@ -43,48 +43,8 @@ extern CollectiveGroup g_world;
 #define MAX(x, y) (((x) > (y)) ? (x) : (y))
 #define MIN(x, y) (((x) < (y)) ? (x) : (y))
 
-__global__ void rmsnorm_kernel(float *o, float *x, float *weight, int size) {
-  extern __shared__ float smem[];
-  float *ss_ptr = &smem[blockDim.x];
-  int tid = threadIdx.x;
-  // blockIdx.y equal to batch index
-  // shift o,x to the corresponding batch
-  o += blockIdx.y * size;
-  x += blockIdx.y * size;
-  smem[tid] = 0;
-  for (int offset = 0; offset < size; offset += blockDim.x) {
-    if (tid + offset < size) {
-      float t = x[tid + offset];
-      smem[tid] += t * t;
-    }
-  }
-  __syncthreads();
-  for (int stride = blockDim.x / 2; stride > 0; stride /= 2) {
-    if (tid < stride) smem[tid] += smem[tid + stride];
-    __syncthreads();
-  }
-  if (tid == 0) *ss_ptr = smem[0];
-  __syncthreads();
-  float ss = *ss_ptr;
-  ss /= size;
-  ss += 1e-5f;
-  ss = 1.0f / sqrtf(ss);
-  for (int offset = 0; offset < size; offset += blockDim.x) {
-    if (tid + offset < size) {
-      o[tid + offset] = weight[tid + offset] * (ss * x[tid + offset]);
-    }
-  }
-}
-void getp_rmsnorm(float *o, float *x, float *weight, int batch_size, int dim,
-                  hipStream_t stream) {
-  
-  dim3 blockDim(1024);
-  dim3 gridDim(1, batch_size);
-  rmsnorm_kernel<<<gridDim, blockDim, sizeof(float) * (blockDim.x + 1),
-                   stream>>>(o, x, weight, dim);
-  
-  
-}
+// rmsnorm da chuyen xuong DUOI cac ham doi bf16 (tim rmsnorm_kernel_out), vi
+// no can f32_to_bf16bits de ghi thang bf16.
 
 union __bf16_bits_u {
   __hip_bfloat16 b;
@@ -117,6 +77,89 @@ __device__ inline unsigned short f32_to_bf16bits(float v) {
 
 using f32x4 = __attribute__((vector_size(16))) float;
 using bf16x4 = __attribute__((vector_size(8))) unsigned short;
+
+// ---------------------------------------------------------------------------
+// rmsnorm voi dau ra chon duoc: fp32, bf16, hoac CA HAI.
+//
+// Gia tri fp32 duoc tinh y HET nhu ban cu - weight * (ss * x), hai phep nhan,
+// khong co phep cong nen trinh dich khong the hop thanh FMA va doi ket qua.
+// Vi mot lan ghi roi doc lai fp32 qua HBM la BIT-CHINH-XAC, ban bf16 ghi thang
+// o day bang dung nhung bit ma fp32_to_bf16_kernel rieng se tao ra. Bo kernel
+// do di la mot thay doi BIT-EXACT, khong phai xap xi.
+//
+// Vi sao khong can trao doi qua LDS: viec lam tron chay tren DUNG thread da
+// sinh ra gia tri, tren dung phan tu do. Dau ra bf16 la 2 byte moi lane, buoc
+// 2 byte -> mot wave ghi 128 byte lien mach.
+// ---------------------------------------------------------------------------
+template <bool WRITE_F32, bool WRITE_BF16>
+__global__ void rmsnorm_kernel_out(float *o, __hip_bfloat16 *ob,
+                                   const float *x, const float *weight,
+                                   int size) {
+  extern __shared__ float smem[];
+  float *ss_ptr = &smem[blockDim.x];
+  int tid = threadIdx.x;
+  // blockIdx.y equal to batch index
+  const size_t row = (size_t)blockIdx.y * (size_t)size;
+  if constexpr (WRITE_F32) o += row;
+  unsigned short *obu = nullptr;
+  if constexpr (WRITE_BF16) obu = reinterpret_cast<unsigned short *>(ob) + row;
+  x += row;
+  smem[tid] = 0;
+  for (int offset = 0; offset < size; offset += blockDim.x) {
+    if (tid + offset < size) {
+      float t = x[tid + offset];
+      smem[tid] += t * t;
+    }
+  }
+  __syncthreads();
+  for (int stride = blockDim.x / 2; stride > 0; stride /= 2) {
+    if (tid < stride) smem[tid] += smem[tid + stride];
+    __syncthreads();
+  }
+  if (tid == 0) *ss_ptr = smem[0];
+  __syncthreads();
+  float ss = *ss_ptr;
+  ss /= size;
+  ss += 1e-5f;
+  ss = 1.0f / sqrtf(ss);
+  for (int offset = 0; offset < size; offset += blockDim.x) {
+    if (tid + offset < size) {
+      const float v = weight[tid + offset] * (ss * x[tid + offset]);
+      if constexpr (WRITE_F32)  o[tid + offset] = v;
+      if constexpr (WRITE_BF16) obu[tid + offset] = f32_to_bf16bits(v);
+    }
+  }
+}
+
+void getp_rmsnorm(float *o, float *x, float *weight, int batch_size, int dim,
+                  hipStream_t stream) {
+  dim3 blockDim(1024);
+  dim3 gridDim(1, batch_size);
+  rmsnorm_kernel_out<true, false>
+      <<<gridDim, blockDim, sizeof(float) * (blockDim.x + 1), stream>>>(
+          o, nullptr, x, weight, dim);
+}
+
+// Chi bf16: dung khi ban fp32 khong con ai doc (duong pre-qkv).
+void getp_rmsnorm_bf16(__hip_bfloat16 *ob, float *x, float *weight,
+                       int batch_size, int dim, hipStream_t stream) {
+  dim3 blockDim(1024);
+  dim3 gridDim(1, batch_size);
+  rmsnorm_kernel_out<false, true>
+      <<<gridDim, blockDim, sizeof(float) * (blockDim.x + 1), stream>>>(
+          nullptr, ob, x, weight, dim);
+}
+
+// Ca hai: dung khi van con mot consumer doc fp32 (router doc ext_t).
+void getp_rmsnorm_f32_bf16(float *o, __hip_bfloat16 *ob, float *x,
+                           float *weight, int batch_size, int dim,
+                           hipStream_t stream) {
+  dim3 blockDim(1024);
+  dim3 gridDim(1, batch_size);
+  rmsnorm_kernel_out<true, true>
+      <<<gridDim, blockDim, sizeof(float) * (blockDim.x + 1), stream>>>(
+          o, ob, x, weight, dim);
+}
 
 __global__ void kv_store_pair_fp32_to_bf16_kernel(
     const float *__restrict__ k, const float *__restrict__ v,
@@ -1461,7 +1504,13 @@ static inline void launch_mlp2_partial_bf16_bucketed_frombf16(
 }
 
 
+// Lat cat [own_lo, own_hi) cua e_agg la phan danh cho TOKEN CUA CHINH THIET BI
+// NAY: khong peer nao doc no (peer keo lat cat mang chi so cua PEER tu buffer
+// cua ta). Nen thay vi ghi ra roi de vecadd doc lai, cong thang vao dong du.
+// Nhanh re theo blockIdx.y nen dong nhat trong ca block, khong phan ky.
 __global__ void moe_gather_pairs_kernel(float *__restrict__ e_agg,
+                                        float *__restrict__ x_resid,
+                                        int own_lo, int own_hi,
                                         const float *__restrict__ z_partial,
                                         const int *__restrict__ pair_pos, int H,
                                         int K, int B) {
@@ -1474,19 +1523,39 @@ __global__ void moe_gather_pairs_kernel(float *__restrict__ e_agg,
     int pos = pair_pos[base + k];
     if (pos >= 0) s += z_partial[(size_t)pos * (size_t)H + row];
   }
-  // Ghi DE, khong cong don: moi o duoc ghi dung mot lan (luoi phu tron
-  // B x H), nen khong can memset 35,4 MB truoc do nua.
-  e_agg[(size_t)b * (size_t)H + row] = s;
+  if (b >= own_lo && b < own_hi) {
+    // Bit-exact: s la dung so fp32 ma e_agg se chua, va vecadd cung cong
+    // dung mot lan nhu the.
+    x_resid[(size_t)(b - own_lo) * (size_t)H + row] += s;
+  } else {
+    // Ghi DE, khong cong don: moi o duoc ghi dung mot lan (luoi phu tron
+    // B x H), nen khong can memset 35,4 MB truoc do nua.
+    e_agg[(size_t)b * (size_t)H + row] = s;
+  }
 }
 
 static inline void moe_gather_pairs(float *e_agg, const float *z_partial,
                                     const int *pair_pos, int H, int K, int B,
                                     hipStream_t stream) {
-  
+
   dim3 blk(256), grd((H + blk.x - 1) / blk.x, B);
-  moe_gather_pairs_kernel<<<grd, blk, 0, stream>>>(e_agg, z_partial, pair_pos,
+  // own_lo == own_hi: khong hang nao di vao dong du, y het ban cu.
+  moe_gather_pairs_kernel<<<grd, blk, 0, stream>>>(e_agg, nullptr, 0, 0,
+                                                   z_partial, pair_pos,
                                                    H, K, B);
-  
+
+}
+
+static inline void moe_gather_pairs_acc(float *e_agg, float *x_resid,
+                                        int own_lo, int own_hi,
+                                        const float *z_partial,
+                                        const int *pair_pos, int H, int K,
+                                        int B, hipStream_t stream) {
+  dim3 blk(256), grd((H + blk.x - 1) / blk.x, B);
+  moe_gather_pairs_kernel<<<grd, blk, 0, stream>>>(e_agg, x_resid,
+                                                   own_lo, own_hi,
+                                                   z_partial, pair_pos,
+                                                   H, K, B);
 }
 
 // ===========================================================================
@@ -2635,7 +2704,8 @@ void getp_vecadd(float *x, float *y, int size, int batch_size,
 template <int HPW, bool APPLY_MASK>
 __global__ void __launch_bounds__(64 * (8 / HPW))
 flash_attn_decode_mfma16_kernel(
-  float *__restrict__ tb, const __hip_bfloat16 *__restrict__ key_cache,
+  __hip_bfloat16 *__restrict__ tb_bf16, float *__restrict__ tb_f32,
+  const __hip_bfloat16 *__restrict__ key_cache,
   const __hip_bfloat16 *__restrict__ value_cache, const float *__restrict__ q,
   const int *__restrict__ mask_on,
   const float *__restrict__ attn_sinks, int head_dim, int n_attn_heads,
@@ -2678,9 +2748,20 @@ flash_attn_decode_mfma16_kernel(
   const int n_steps = pos + 1 - t_start;
   const int t_end   = t_start + n_steps;
 
-  __shared__ __align__(16) unsigned short ks[TILE][HEAD_DIM + PAD];
-  __shared__ __align__(16) unsigned short vs[TILE][HEAD_DIM + PAD];
-  __shared__ float ot[WAVES][HPW][HEAD_DIM];
+  // Mot vung LDS duy nhat cho ca ba. `ot` chi song o phan ket, khi ks/vs da
+  // chet, nen cap phat rieng cho no la giu 2 KB suot ca vong lap ma khong dung
+  // - va LDS la thu quyet dinh so workgroup moi CU.
+  constexpr int KV_SHORTS = TILE * (HEAD_DIM + PAD);
+  constexpr int OT_SHORTS = WAVES * HPW * HEAD_DIM * 2;   // float = 2 short
+  static_assert(OT_SHORTS <= 2 * KV_SHORTS,
+                "ot khong nam gon trong vung ks+vs - phai cap phat rieng lai");
+  __shared__ __align__(16) unsigned short kvo[2 * KV_SHORTS];
+  unsigned short (*ks)[HEAD_DIM + PAD] =
+      reinterpret_cast<unsigned short (*)[HEAD_DIM + PAD]>(kvo);
+  unsigned short (*vs)[HEAD_DIM + PAD] =
+      reinterpret_cast<unsigned short (*)[HEAD_DIM + PAD]>(kvo + KV_SHORTS);
+  // Cung dia chi voi ks: chi duoc cham vao SAU vong lap.
+  float (*ot)[HEAD_DIM] = reinterpret_cast<float (*)[HEAD_DIM]>(kvo);
 
   // ---- Q^T lam toan hang B: lane giu B[4g+kk][ln] = q[head ln][chunk*16+4g+kk].
   // Cot ln >= HPW khong ung voi head nao nen dien 0; diem so cua chung bang 0
@@ -2833,6 +2914,9 @@ flash_attn_decode_mfma16_kernel(
   }
 
   // ---- gop l qua 4 nhom g (mot lan duy nhat)
+  // Barrier truoc khi dung lai vung LDS cua ks/vs lam `ot`: moi wave phai doc
+  // xong tile cuoi cung truoc khi co wave nao ghi de len no.
+  __syncthreads();
   l_run += __shfl_xor(l_run, 16);
   l_run += __shfl_xor(l_run, 32);
 
@@ -2844,7 +2928,7 @@ flash_attn_decode_mfma16_kernel(
     const float scale = a / l;
     #pragma unroll
     for (int c = 0; c < NCHUNK; ++c)
-      *reinterpret_cast<float4 *>(&ot[waveIdx][ln][c * TILE + 4 * g]) =
+      *reinterpret_cast<float4 *>(&ot[waveIdx * HPW + ln][c * TILE + 4 * g]) =
           make_float4(acc_o[c][0] * scale, acc_o[c][1] * scale,
                       acc_o[c][2] * scale, acc_o[c][3] * scale);
   }
@@ -2852,15 +2936,35 @@ flash_attn_decode_mfma16_kernel(
 
   // ---- chuyen vi qua LDS roi ghi lien mach: moi head 256 byte lien nhau,
   // thay cho 16 lane ghi rai rac sang cac hang head khac nhau.
-  float *obase = tb + (size_t)b * n_attn_heads * head_dim;
+  // Ghi THANG bf16: consumer duy nhat cua tb la matmul attn_o, va no chi doc
+  // bf16. Viec lam tron nam TRONG lane - moi lane dang giu dung 4 float lien
+  // tiep cua mot head - nen khong can them mot trao doi LDS nao. Cap so hoc
+  // giong het fp32_to_bf16_kernel: no doc lai chinh 4 float nay tu HBM roi goi
+  // f32_to_bf16bits. Mot vong doc-ghi HBM cua ca tensor bien mat.
+  unsigned short *obase = reinterpret_cast<unsigned short *>(tb_bf16) +
+                          (size_t)b * n_attn_heads * head_dim;
   #pragma unroll
   for (int idx = lane; idx < HPW * HEAD_DIM / 4; idx += 64) {
     const int hh = idx / (HEAD_DIM / 4);
     const int d4 = idx % (HEAD_DIM / 4);
+    const float4 v = *reinterpret_cast<const float4 *>(&ot[waveIdx * HPW + hh][d4 * 4]);
+    uint2 packed;
+    packed.x = (unsigned)f32_to_bf16bits(v.x) |
+               ((unsigned)f32_to_bf16bits(v.y) << 16);
+    packed.y = (unsigned)f32_to_bf16bits(v.z) |
+               ((unsigned)f32_to_bf16bits(v.w) << 16);
+    const size_t off =
+        (size_t)(kv_h * KV_MUL + waveIdx * HPW + hh) * head_dim + d4 * 4;
+    *reinterpret_cast<uint2 *>(obase + off) = packed;
+#if GETP_DUMP_ATTN
+    // Duong go roi: van giu ban fp32 de getp_dump_attn so sanh duoc.
     *reinterpret_cast<float4 *>(
-        obase + (size_t)(kv_h * KV_MUL + waveIdx * HPW + hh) * head_dim + d4 * 4) =
-        *reinterpret_cast<const float4 *>(&ot[waveIdx][hh][d4 * 4]);
+        tb_f32 + (size_t)b * n_attn_heads * head_dim + off) = v;
+#endif
   }
+#if !GETP_DUMP_ATTN
+  (void)tb_f32;
+#endif
 }
 
 template <int TILE_T>
@@ -3393,7 +3497,7 @@ static inline void getp_dump_attn(const float *tb, int batch_size,
 #endif
 
 static inline void getp_flash_attn_decode_bf16(
-    float *tb, const __hip_bfloat16 *key_cache_layer,
+    __hip_bfloat16 *tb_bf16, float *tb, const __hip_bfloat16 *key_cache_layer,
     const __hip_bfloat16 *value_cache_layer, const float *q, const int *mask_on,
     const float *attn_sinks_layer, int head_dim, int n_attn_heads,
     int n_kv_heads, int pos, int seq_len, int sliding_window, int layer_id,
@@ -3409,7 +3513,7 @@ static inline void getp_flash_attn_decode_bf16(
     dim3 block(64 * (8 / FLASH_HEADS_PER_WAVE));
     dim3 grid(n_kv_heads, batch_size);
     flash_attn_decode_mfma16_kernel<FLASH_HEADS_PER_WAVE, true><<<grid, block, 0, stream>>>
-      (tb, key_cache_layer,
+      (tb_bf16, tb, key_cache_layer,
        value_cache_layer, q,
        mask_on,
        attn_sinks_layer, head_dim, n_attn_heads,
@@ -3425,6 +3529,8 @@ static inline void getp_flash_attn_decode_bf16(
        attn_sinks_layer, head_dim, n_attn_heads, 
        n_kv_heads, pos, batch_size, kv_dim, kv_mul, 
        sliding_window, cache_tcap, invsd);
+    tensor_fp32_to_bf16(tb_bf16, tb,
+                        batch_size * n_attn_heads * head_dim, stream);
 #endif
   }
   else {
@@ -3432,7 +3538,7 @@ static inline void getp_flash_attn_decode_bf16(
     dim3 block(64 * (8 / FLASH_HEADS_PER_WAVE));
     dim3 grid(n_kv_heads, batch_size);
     flash_attn_decode_mfma16_kernel<FLASH_HEADS_PER_WAVE, false><<<grid, block, 0, stream>>>
-      (tb, key_cache_layer,
+      (tb_bf16, tb, key_cache_layer,
       value_cache_layer, q,
       mask_on,
       attn_sinks_layer, head_dim, n_attn_heads,
@@ -3448,6 +3554,8 @@ static inline void getp_flash_attn_decode_bf16(
       attn_sinks_layer, head_dim, n_attn_heads, 
       n_kv_heads, pos, batch_size, kv_dim, kv_mul, 
       cache_tcap, invsd);
+    tensor_fp32_to_bf16(tb_bf16, tb,
+                        batch_size * n_attn_heads * head_dim, stream);
 #endif
     }
 
@@ -3655,6 +3763,7 @@ template<
   int BM, int BN, int BK,
   int WM, int WN,
   int WARPS_PER_BLOCK,
+  bool ACC = false,
   int THREADS = 64 * WARPS_PER_BLOCK
 >
 __global__ void __launch_bounds__(THREADS)
@@ -3907,7 +4016,12 @@ matmul_attn_o_bf16_kernel_tuned(
         if (gx < N && gy < M) {
           float v = acc_local[acc_index][i];
           if (b) v += __bfloat162float(b[gx]);
-          xout[(size_t)gy * N + gx] = v;
+          // ACC: cong thang vao dong du (dev_x) thay vi ghi ra tb2 roi de
+          // vecadd doc lai. Moi o (gy,gx) do DUNG MOT thread sinh ra - khong
+          // co split-k trong kernel nay - nen doc-sua-ghi la an toan, khong
+          // can atomic. Bit-exact: v la dung so fp32 ma tb2 se chua.
+          if constexpr (ACC) xout[(size_t)gy * N + gx] += v;
+          else               xout[(size_t)gy * N + gx]  = v;
         }
       }
     }
@@ -3935,9 +4049,32 @@ static inline void getp_matmul_attn_o_bf16(
   dim3 block(64 * WARPS);
   dim3 grid((N + BN - 1) / BN, (M + BM - 1) / BM);
 
-  matmul_attn_o_bf16_kernel_tuned<BM,BN,BK,WM,WN,WARPS>
+  matmul_attn_o_bf16_kernel_tuned<BM,BN,BK,WM,WN,WARPS,false>
       <<<grid, block, 0, stream>>>(xout, x_bf16, w, b, M, N, K);
-  
+
+}
+
+// Nhu tren nhung CONG vao xout (dong du fp32) thay vi ghi de. Bo hoan toan
+// tensor tb2: mot lan ghi 17,7 MB va mot lan doc 17,7 MB moi lop.
+static inline void getp_matmul_attn_o_bf16_acc(
+    float *x_resid, const __hip_bfloat16 *x_bf16,
+    const __hip_bfloat16 *w, const __hip_bfloat16 *b,
+    int n, int d, int batch_size, hipStream_t stream) {
+
+  const int M = batch_size, N = d, K = n;
+
+  constexpr int BM = MATMUL_ATTN_O_BLOCK_ROWS;
+  constexpr int BN = MATMUL_ATTN_O_BLOCK_COLS;
+  constexpr int BK = MATMUL_ATTN_O_BLOCK_DEPTH;
+  constexpr int WM = MATMUL_ATTN_O_WARP_TILE_M;
+  constexpr int WN = MATMUL_ATTN_O_WARP_TILE_N;
+  constexpr int WARPS = MATMUL_ATTN_O_WAVES_PER_BLOCK;
+
+  dim3 block(64 * WARPS);
+  dim3 grid((N + BN - 1) / BN, (M + BM - 1) / BM);
+
+  matmul_attn_o_bf16_kernel_tuned<BM,BN,BK,WM,WN,WARPS,true>
+      <<<grid, block, 0, stream>>>(x_resid, x_bf16, w, b, M, N, K);
 }
 
 
@@ -4450,9 +4587,14 @@ int *getp_forward_120b(Transformer * /*transformer*/,
   const size_t even_stride = (size_t)even_tcap;
   const size_t odd_stride = (size_t)odd_tcap;
 
+  const int own_slice = device_index - base_device_index;
+
   for (unsigned long long l = 0; l < p->n_layers; l++) {
-    getp_rmsnorm(dev_s->t, dev_x, dev_w->rms_attn_w + 1ll * l * hidden_dim,
-                 BATCH_SIZE, hidden_dim, compute_stream);
+    // rmsnorm ghi THANG bf16 vao pre_qkv_bf16: ban fp32 (dev_s->t) khong con
+    // consumer nao trong duong 120b.
+    getp_rmsnorm_bf16(ext->pre_qkv_bf16, dev_x,
+                      dev_w->rms_attn_w + 1ll * l * hidden_dim,
+                      BATCH_SIZE, hidden_dim, compute_stream);
 
     const bool is_even = (((int)l & 1) == 0);
     const int idx_half = ((int)l) >> 1;
@@ -4485,8 +4627,6 @@ int *getp_forward_120b(Transformer * /*transformer*/,
     __hip_bfloat16 *dev_b_qkv =
         dev_w->b_qkv_bf16 +
         1ll * l * (head_dim * p->n_attn_heads + 2 * head_dim * p->n_kv_heads);
-    tensor_fp32_to_bf16(ext->pre_qkv_bf16, dev_s->t,
-                        BATCH_SIZE * hidden_dim, compute_stream);
     getp_matmul_qkv_fused_bf16(dev_s->q, k_step, v_step, ext->pre_qkv_bf16,
                                dev_w_qkv, dev_b_qkv, hidden_dim, head_dim,
                                p->n_attn_heads, p->n_kv_heads, BATCH_SIZE,
@@ -4508,7 +4648,8 @@ int *getp_forward_120b(Transformer * /*transformer*/,
       const float *attn_sinks_layer =
           dev_w->attn_sinks + (size_t)l * p->n_attn_heads;
       getp_flash_attn_decode_bf16(
-          dev_s->tb, k_layer, v_layer, q_ptr, ext->mask_on, attn_sinks_layer, head_dim,
+          ext->attn_o_bf16, dev_s->tb,
+          k_layer, v_layer, q_ptr, ext->mask_on, attn_sinks_layer, head_dim,
           p->n_attn_heads, p->n_kv_heads, pos, p->seq_len, p->sliding_window,
           (int)l, BATCH_SIZE, cache_tcap, compute_stream);
     }
@@ -4516,17 +4657,18 @@ int *getp_forward_120b(Transformer * /*transformer*/,
     __hip_bfloat16 *dev_w_o =
         dev_w->w_o_bf16 + 1ll * l * (head_dim * p->n_attn_heads) * hidden_dim;
     __hip_bfloat16 *dev_b_o = dev_w->b_o_bf16 + 1ll * l * hidden_dim;
-    tensor_fp32_to_bf16(ext->attn_o_bf16, dev_s->tb,
-                        BATCH_SIZE * head_dim * p->n_attn_heads,
-                        compute_stream);
-    getp_matmul_attn_o_bf16(dev_s->tb2, ext->attn_o_bf16, dev_w_o, dev_b_o,
-                            head_dim * p->n_attn_heads, hidden_dim, BATCH_SIZE,
-                            compute_stream);
-    getp_vecadd(dev_x, dev_s->tb2, hidden_dim, BATCH_SIZE, compute_stream);
+    // attention da ghi bf16 vao attn_o_bf16; matmul cong thang vao dev_x.
+    getp_matmul_attn_o_bf16_acc(dev_x, ext->attn_o_bf16, dev_w_o, dev_b_o,
+                                head_dim * p->n_attn_heads, hidden_dim,
+                                BATCH_SIZE, compute_stream);
 
-    getp_rmsnorm(ext->ext_t + (size_t)(device_index - base_device_index) * BATCH_SIZE * hidden_dim,
-                 dev_x, dev_w->rms_ffn_w + 1ll * l * hidden_dim,
-                 BATCH_SIZE, hidden_dim, compute_stream);
+    // Router doc ext_t fp32, peer copy doc ext_t_bf16: sinh ca hai trong mot
+    // luot, thay cho mot kernel doi kieu rieng tren memory_stream.
+    getp_rmsnorm_f32_bf16(
+        ext->ext_t + (size_t)own_slice * BATCH_SIZE * hidden_dim,
+        ext->ext_t_bf16 + (size_t)own_slice * BATCH_SIZE * hidden_dim,
+        dev_x, dev_w->rms_ffn_w + 1ll * l * hidden_dim,
+        BATCH_SIZE, hidden_dim, compute_stream);
     HIP_CHECK(hipEventRecord(event_rmsnorm, compute_stream));
 
     __hip_bfloat16 *dev_w_router =
@@ -4545,11 +4687,8 @@ int *getp_forward_120b(Transformer * /*transformer*/,
         BATCH_SIZE, compute_stream);
     HIP_CHECK(hipEventRecord(event_router_topk, compute_stream));
 
+    // ext_t_bf16 da duoc rmsnorm ghi trong compute_stream truoc event_rmsnorm.
     HIP_CHECK(hipStreamWaitEvent(memory_stream, event_rmsnorm));
-    tensor_fp32_to_bf16(
-        ext->ext_t_bf16 + (size_t)(device_index - base_device_index) * BATCH_SIZE * hidden_dim,
-        ext->ext_t + (size_t)(device_index - base_device_index) * BATCH_SIZE * hidden_dim,
-        BATCH_SIZE * hidden_dim, memory_stream);
 
     for (int delta = 1; delta < EXPERT_PARALLELISM; ++delta) {
       int i = (device_index + delta) % EXPERT_PARALLELISM;
@@ -4652,15 +4791,16 @@ int *getp_forward_120b(Transformer * /*transformer*/,
       ext->e_offsets, ext->blk_offsets, ext->e_dev, p->intermediate_dim,
       hidden_dim, experts_per_device, total_blocks_mlp2, compute_stream);
   
-    moe_gather_pairs(ext->ext_e_agg, ext->z_partial, ext->pair_pos, hidden_dim,
-                     p->experts_per_token, EXPERT_PARALLELISM * BATCH_SIZE,
-                     compute_stream);
+    // Lat cat own_slice di thang vao dev_x; cac lat cat khac van ra ext_e_agg
+    // vi peer se keo chung. Bo han mot vecadd (doc 17,7 MB + ghi 17,7 MB).
+    moe_gather_pairs_acc(ext->ext_e_agg, dev_x,
+                         own_slice * BATCH_SIZE,
+                         own_slice * BATCH_SIZE + BATCH_SIZE,
+                         ext->z_partial, ext->pair_pos, hidden_dim,
+                         p->experts_per_token, EXPERT_PARALLELISM * BATCH_SIZE,
+                         compute_stream);
 
     sync_workers(compute_stream, sync_point);
-
-    getp_vecadd(dev_x,
-                ext->ext_e_agg + (size_t)(device_index - base_device_index) * BATCH_SIZE * hidden_dim,
-                hidden_dim, BATCH_SIZE, compute_stream);
 
     for (int delta = 1, j = 0; delta < EXPERT_PARALLELISM; ++delta) {
       int i = (device_index + delta) % EXPERT_PARALLELISM;
@@ -4812,7 +4952,8 @@ int *getp_forward_20b(Transformer * /*transformer*/,
       const float *attn_sinks_layer =
           dev_w->attn_sinks + (size_t)l * p->n_attn_heads;
       getp_flash_attn_decode_bf16(
-          dev_s->tb, k_layer, v_layer, q_ptr, ext->mask_on, attn_sinks_layer, head_dim,
+          ext->attn_o_bf16, dev_s->tb,
+          k_layer, v_layer, q_ptr, ext->mask_on, attn_sinks_layer, head_dim,
           p->n_attn_heads, p->n_kv_heads, pos, p->seq_len, p->sliding_window,
           (int)l, batch_size, cache_tcap, nullptr);
     }
@@ -4823,14 +4964,9 @@ int *getp_forward_20b(Transformer * /*transformer*/,
     // getp_new_matmul(dev_s->tb2, dev_s->tb, dev_w_o, dev_b_o,
     //                     head_dim * p->n_attn_heads, hidden_dim,
     //                     batch_size, nullptr);
-    tensor_fp32_to_bf16(ext->attn_o_bf16, dev_s->tb,
-                        batch_size * head_dim * p->n_attn_heads, nullptr);
-    getp_matmul_attn_o_bf16(dev_s->tb2, ext->attn_o_bf16, dev_w_o, dev_b_o,
-                            head_dim * p->n_attn_heads, hidden_dim,
-                            batch_size, nullptr);
-    
-
-    getp_vecadd(dev_x, dev_s->tb2, hidden_dim, batch_size, nullptr);
+    getp_matmul_attn_o_bf16_acc(dev_x, ext->attn_o_bf16, dev_w_o, dev_b_o,
+                                head_dim * p->n_attn_heads, hidden_dim,
+                                batch_size, nullptr);
 
     getp_rmsnorm(dev_s->t, dev_x, dev_w->rms_ffn_w + 1ll * l * hidden_dim,
                  batch_size, hidden_dim, nullptr);
