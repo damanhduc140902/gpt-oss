@@ -195,12 +195,12 @@ static inline void kv_store_pair_fp32_to_bf16(__hip_bfloat16 *kdst,
                                               __hip_bfloat16 *vdst,
                                               const float *k, const float *v,
                                               int elems, hipStream_t stream) {
-  
+
                                                 int threads = 256;
   int blocks = ((elems + 3) / 4 + threads - 1) / threads;
   kv_store_pair_fp32_to_bf16_kernel<<<blocks, threads, 0, stream>>>(
       k, v, kdst, vdst, elems);
-  
+
 }
 
 __global__ void fp32_to_bf16_kernel(const float *__restrict__ src,
@@ -228,13 +228,13 @@ __global__ void fp32_to_bf16_kernel(const float *__restrict__ src,
 
 static inline void tensor_fp32_to_bf16(__hip_bfloat16 *dst, const float *src,
                                        int elems, hipStream_t stream) {
-  
+
   const int threads = 256;
   const int vec_elems = (elems + 3) / 4;
   const int blocks = (vec_elems + threads - 1) / threads;
   fp32_to_bf16_kernel<<<blocks, threads, 0, stream>>>(src, dst, elems);
   // HIP_CHECK(hipGetLastError());
-  
+
 }
 
 __global__ void moe_count_local_kernel(const int *local_ids, const int *n_local,
@@ -275,7 +275,7 @@ __global__ void moe_blocks_per_expert_kernel(const int *offsets, int E, int BM,
 static inline int build_moe_block_schedule(const int *offsets, int E, int BM,
                                            int *blk_counts, int *blk_offsets,
                                            hipStream_t stream) {
-                                            
+
   dim3 b(256), g((E + b.x - 1) / b.x);
   moe_blocks_per_expert_kernel<<<g, b, 0, stream>>>(offsets, E, BM, blk_counts);
   exclusive_scan_small_kernel<<<dim3(1), dim3(256), sizeof(int) * 256,
@@ -284,7 +284,7 @@ static inline int build_moe_block_schedule(const int *offsets, int E, int BM,
   HIP_CHECK(hipMemcpyAsync(&total_blocks, blk_offsets + E, sizeof(int),
                            hipMemcpyDeviceToHost, stream));
   HIP_CHECK(hipStreamSynchronize(stream));
-  
+
   return total_blocks;
 }
 
@@ -315,7 +315,7 @@ static inline int build_moe_buckets_local_pos(
     const int *local_ids, const float *local_wts, const int *n_local, int B,
     int K, int E, int *e_counts, int *e_offsets, int *tok_idx_out, float *w_out,
     int *pair_pos, hipStream_t stream) {
-      
+
   HIP_CHECK(hipMemsetAsync(e_counts, 0, sizeof(int) * E, stream));
   moe_count_local_kernel<<<dim3(B), dim3(128), 0, stream>>>(local_ids, n_local,
                                                             B, K, E, e_counts);
@@ -334,7 +334,7 @@ static inline int build_moe_buckets_local_pos(
   moe_fill_local_pos_kernel<<<dim3(B), dim3(128), 0, stream>>>(
       local_ids, local_wts, n_local, B, K, E, e_offsets, e_counts, tok_idx_out,
       w_out, pair_pos);
-      
+
   return cap_pairs;
 }
 
@@ -375,11 +375,11 @@ static inline void moe_scatter_acts_to_expert_bf16(__hip_bfloat16 *a_in,
                                                    const int *tok_idx,
                                                    int total_pairs, int H,
                                                    hipStream_t stream) {
-  
+
   dim3 block(256), grid(total_pairs);
   moe_scatter_acts_to_expert_bf16_kernel<<<grid, block, 0, stream>>>(
       a_in, x, tok_idx, total_pairs, H);
-  
+
 }
 
 __global__ void moe_scatter_acts_to_expert_frombf16_kernel(
@@ -704,7 +704,7 @@ mlp1_swiglu_bf16_bucketed_kernel_outbf16_tuned(
 
   // Fast/Slow Path Split optimization: Separate boundary-safe and boundary-check loads
   constexpr int safe_iters = (BM >= strideX8) ? (BM - strideX8) / strideX8 : 0;
-  
+
   // Fast path: No boundary checks (all safe iterations)
   #pragma unroll
   for (int i = 0; i < safe_iters; ++i) {
@@ -712,7 +712,7 @@ mlp1_swiglu_bf16_bucketed_kernel_outbf16_tuned(
     const int kk = 0 + LOAD_VEC * loadX_x8;
     const int r = loadX_y8 + off;
     const int pos = base + r;
-    
+
     // 8 short lien tiep theo k cua mot hang = 2 o ke nhau theo truc plane k0.
     bf16x4* dst = &sxs[(size_t)((LOAD_VEC * loadX_x8) / KP) * SM + r];
 
@@ -727,7 +727,7 @@ mlp1_swiglu_bf16_bucketed_kernel_outbf16_tuned(
       dst[SM] = mlp1_pack2(0u, 0u);
     }
   }
-  
+
   // Slow path: With boundary checks (remaining iterations)
   #pragma unroll
   for (int i = safe_iters; i * strideX8 < BM; ++i) {
@@ -735,7 +735,7 @@ mlp1_swiglu_bf16_bucketed_kernel_outbf16_tuned(
     const int kk = 0 + LOAD_VEC * loadX_x8;
     const int r = loadX_y8 + off;
     const int pos = base + r;
-    
+
     // 8 short lien tiep theo k cua mot hang = 2 o ke nhau theo truc plane k0.
     bf16x4* dst = &sxs[(size_t)((LOAD_VEC * loadX_x8) / KP) * SM + r];
 
@@ -793,7 +793,7 @@ mlp1_swiglu_bf16_bucketed_kernel_outbf16_tuned(
         const int kk = bk + BK + LOAD_VEC * loadX_x8;
         const int r = loadX_y8 + off;
         const int pos = base + r;
-        
+
         if (r < tcnt && kk + 7 < H) {
           const uint4* p = reinterpret_cast<const uint4*>(A_in + (size_t)pos * H + kk);
           regX[i] = *p;
@@ -801,22 +801,22 @@ mlp1_swiglu_bf16_bucketed_kernel_outbf16_tuned(
           regX[i] = make_uint4(0, 0, 0, 0);
         }
       }
-  
+
       #pragma unroll
       for (int i = 0; i < nbLoadsW; ++i) {
         int off = i * strideW;
         const int kk = bk + BK + 8 * loadW_x;
         const int col = colBase + loadW_y + off;
-  
+
         if (col < I && kk + 7 < H) {
           const size_t w1_gate_off = w1_e + (size_t)(2 * col + 0) * H + kk;
           const size_t w1_up_off = w1_e + (size_t)(2 * col + 1) * H + kk;
           const uint4* pg = reinterpret_cast<const uint4*>(W1 + w1_gate_off);
           const uint4* pu = reinterpret_cast<const uint4*>(W1 + w1_up_off);
-          
+
           regWG[i] = *pg;
           regWU[i] = *pu;
-          
+
         } else {
           regWG[i] = make_uint4(0, 0, 0, 0);
           regWU[i] = make_uint4(0, 0, 0, 0);
@@ -856,7 +856,7 @@ mlp1_swiglu_bf16_bucketed_kernel_outbf16_tuned(
             gv_array[in] = swgs[(size_t)kslot * SN + c];         // 1 x ds_read_b64
             uv_array[in] = swus[(size_t)kslot * SN + c];         // 1 x ds_read_b64
           }
-          
+
           // Execute MFMAs with all data in registers
           #pragma unroll
           for (int in = 0; in < nIterN; ++in) {
@@ -924,33 +924,33 @@ mlp1_swiglu_bf16_bucketed_kernel_outbf16_tuned(
       }
     }
   }
-  
+
   constexpr float swiglu_a = 1.702f;
   const float swiglu_limit_neg = -swiglu_limit;
-  
+
   #pragma unroll
   for (int im = 0; im < nIterM; ++im) {
     #pragma unroll
     for (int i = 0; i < 4; ++i) {
       const int row = yTile * WM + im * 16 + (yD + i);
       if (row >= tcnt) continue;
-      
+
       const int pos = base + row;
       unsigned short* output_row = reinterpret_cast<unsigned short*>(gate_up_bf16) + (size_t)pos * I;
-      
+
       #pragma unroll
       for (int g = 0; g < BN_AGG; ++g) {
         #pragma unroll
         for (int in = 0; in < nIterN; ++in) {
           const int col = blockIdx.x * BNt + xTile * WN + in * 16 + xD + g * BN;
           if (col >= I) continue;
-          
+
           float gval = fminf(fmaxf(dg_acc[g][im][in][i] + bg_loc[g][in], swiglu_limit_neg), swiglu_limit);
           float uval = fminf(fmaxf(du_acc[g][im][in][i] + bu_loc[g][in], swiglu_limit_neg), swiglu_limit);
-          
+
           const float sgm = 1.f / (1.f + __expf(-swiglu_a * gval));
           const float out = (gval * sgm) * (uval + 1.f);
-          
+
           output_row[col] = f32_to_bf16bits(out);
         }
       }
@@ -1181,7 +1181,7 @@ mlp2_partial_bf16_bucketed_splitk_kernel_inbf16_tuned(
 
   // Fast/Slow Path Split for MLP2 initial load
   constexpr int safe_iters_mlp2 = (BM >= strideX8) ? (BM - strideX8) / strideX8 : 0;
-  
+
   // Fast path: boundary-safe loads
   #pragma unroll
   for (int i = 0; i < safe_iters_mlp2; ++i) {
@@ -1189,15 +1189,15 @@ mlp2_partial_bf16_bucketed_splitk_kernel_inbf16_tuned(
     const int kk = kBeg + LOAD_VEC * loadX_x8;
     const int r = loadX_y8 + off;
     const int pos = base + r;
-    
+
     // 8 short lien tiep theo k cua MOT hang = 2 o ke nhau theo truc plane k0.
     bf16x4* dst = &sxs[((LOAD_VEC * loadX_x8) / KP) * SM + r];
-    
+
     if (r < tcnt && kk + 7 < kEnd) {
       const __hip_bfloat16* src = gate_up_bf16 + (size_t)pos * (size_t)I + kk;
       const uint4* p = reinterpret_cast<const uint4*>(src);
       const uint4 v = *p;
-      
+
       dst[0]  = mlp2_pack2(v.x, v.y);   // k+0 .. k+3   ds_write_b64
       dst[SM] = mlp2_pack2(v.z, v.w);   // k+4 .. k+7   ds_write_b64
     } else {
@@ -1205,7 +1205,7 @@ mlp2_partial_bf16_bucketed_splitk_kernel_inbf16_tuned(
       dst[SM] = mlp2_pack2(0u, 0u);
     }
   }
-  
+
   // Slow path: with boundary checks
   #pragma unroll
   for (int i = safe_iters_mlp2; i * strideX8 < BM; ++i) {
@@ -1213,15 +1213,15 @@ mlp2_partial_bf16_bucketed_splitk_kernel_inbf16_tuned(
     const int kk = kBeg + LOAD_VEC * loadX_x8;
     const int r = loadX_y8 + off;
     const int pos = base + r;
-    
+
     // 8 short lien tiep theo k cua MOT hang = 2 o ke nhau theo truc plane k0.
     bf16x4* dst = &sxs[((LOAD_VEC * loadX_x8) / KP) * SM + r];
-    
+
     if (r < tcnt && kk + 7 < kEnd) {
       const __hip_bfloat16* src = gate_up_bf16 + (size_t)pos * (size_t)I + kk;
       const uint4* p = reinterpret_cast<const uint4*>(src);
       const uint4 v = *p;
-      
+
       dst[0]  = mlp2_pack2(v.x, v.y);   // k+0 .. k+3   ds_write_b64
       dst[SM] = mlp2_pack2(v.z, v.w);   // k+4 .. k+7   ds_write_b64
     } else {
@@ -1235,15 +1235,15 @@ mlp2_partial_bf16_bucketed_splitk_kernel_inbf16_tuned(
   for (int off = 0; off < BNt; off += strideW) {
     const int kk = kBeg + 8 * loadW_x;
     const int col = colBase + loadW_y + off;
-    
+
     static_assert(LOAD_VEC == 2 * KP, "mot uint4 tu HBM phai phu dung 2 o KPack");
     bf16x4* dst = &sws[((8 * loadW_x) / KP) * SN + (loadW_y + off)];
-    
+
     if (col < H && kk + 7 < kEnd) {
       const size_t w2_off = w2_e + (size_t)col * (size_t)I + kk;
       const uint4* pw = reinterpret_cast<const uint4*>(W2 + w2_off);
       const uint4 wb = *pw;
-      
+
       dst[0]  = mlp2_pack2(wb.x, wb.y);   // k+0 .. k+3   ds_write_b64
       dst[SN] = mlp2_pack2(wb.z, wb.w);   // k+4 .. k+7   ds_write_b64
     } else {
@@ -1267,7 +1267,7 @@ mlp2_partial_bf16_bucketed_splitk_kernel_inbf16_tuned(
         const int kk = bk + BK + LOAD_VEC * loadX_x8;
         const int r = loadX_y8 + off;
         const int pos = base + r;
-        
+
         if (r < tcnt && kk + 7 < kEnd) {
           // Vectorized uint4 load (8 bf16)
           const __hip_bfloat16* src = gate_up_bf16 + (size_t)pos * (size_t)I + kk;
@@ -1284,7 +1284,7 @@ mlp2_partial_bf16_bucketed_splitk_kernel_inbf16_tuned(
         int off = i * strideW;
         const int kk = bk + BK + 8 * loadW_x;
         const int col = colBase + loadW_y + off;
-        
+
         if (col < H && kk + 7 < kEnd) {
           // Vectorized uint4 load (8 bf16)
           const size_t w2_off = w2_e + (size_t)col * (size_t)I + kk;
@@ -1302,7 +1302,7 @@ mlp2_partial_bf16_bucketed_splitk_kernel_inbf16_tuned(
       // basek = k + 4*yMF luon chia het 4 -> plane k0 = basek/4 = (k>>2) + yMF;
       // 4 phan tu mot lane can (k..k+3 cua CUNG mot hang) nam gon trong mot o.
       const int kslot = (k >> 2) + yMF;
-      
+
       // Pre-load all activation vectors
       bf16x4 av_array[nIterM];
       #pragma unroll
@@ -1310,16 +1310,16 @@ mlp2_partial_bf16_bucketed_splitk_kernel_inbf16_tuned(
         const int row = yTile * WM + im * 16 + xMF;
         av_array[im] = sxs[kslot * SM + row];              // 1 x ds_read_b64
       }
-      
+
       // Compute with improved ILP
       #pragma unroll
       for (int im = 0; im < nIterM; ++im) {
         const bf16x4 av = av_array[im];
-        
+
         #pragma unroll
         for (int g = 0; g < BN_AGG; ++g) {
           const int col_base = xTile * WN + xMF + g * BN;
-          
+
           // Pre-load all weight vectors
           bf16x4 bv_array[nIterN];
           #pragma unroll
@@ -1327,7 +1327,7 @@ mlp2_partial_bf16_bucketed_splitk_kernel_inbf16_tuned(
             const int c = col_base + in * 16;
             bv_array[in] = sws[kslot * SN + c];                // 1 x ds_read_b64
           }
-          
+
           // Execute MFMAs with all data in registers
           #pragma unroll
           for (int in = 0; in < nIterN; ++in) {
@@ -1345,12 +1345,12 @@ mlp2_partial_bf16_bucketed_splitk_kernel_inbf16_tuned(
         int off = i * strideX8;
         const int r = loadX_y8 + off;
         const int pos = base + r;
-        
+
         // 8 short lien tiep theo k cua MOT hang = 2 o ke nhau theo truc plane k0.
         bf16x4* dst = &sxs[((LOAD_VEC * loadX_x8) / KP) * SM + r];
-        
+
         const uint4 v = regX[i];
-        
+
         dst[0]  = mlp2_pack2(v.x, v.y);   // k+0 .. k+3   ds_write_b64
         dst[SM] = mlp2_pack2(v.z, v.w);   // k+4 .. k+7   ds_write_b64
       }
@@ -1360,12 +1360,12 @@ mlp2_partial_bf16_bucketed_splitk_kernel_inbf16_tuned(
       for (int i = 0; i < nbLoadsW; ++i) {
         int off = i * strideW;
         const int col = colBase + loadW_y + off;
-        
+
         static_assert(LOAD_VEC == 2 * KP, "mot uint4 tu HBM phai phu dung 2 o KPack");
         bf16x4* dst = &sws[((8 * loadW_x) / KP) * SN + (loadW_y + off)];
-        
+
         const uint4 wb = regW[i];
-        
+
         dst[0]  = mlp2_pack2(wb.x, wb.y);   // k+0 .. k+3   ds_write_b64
         dst[SN] = mlp2_pack2(wb.z, wb.w);   // k+4 .. k+7   ds_write_b64
       }
@@ -1376,7 +1376,7 @@ mlp2_partial_bf16_bucketed_splitk_kernel_inbf16_tuned(
 
   const int xD = lane & 15;
   const int yD = 4 * (lane >> 4);
-  
+
   // Optimized output with full unroll
   #pragma unroll
   for (int im = 0; im < nIterM; ++im) {
@@ -1384,21 +1384,21 @@ mlp2_partial_bf16_bucketed_splitk_kernel_inbf16_tuned(
     for (int i = 0; i < 4; ++i) {
       const int row = yTile * WM + im * 16 + (yD + i);
       if (row >= tcnt) continue;
-      
+
       const int pos = base + row;
       const float w = w_by_bucket[pos];
       float* output_row = z_partial + (size_t)pos * (size_t)H;
-      
+
       #pragma unroll
       for (int g = 0; g < BN_AGG; ++g) {
         #pragma unroll
         for (int in = 0; in < nIterN; ++in) {
           const int col = blockIdx.x * (BN * BN_AGG) + xTile * WN + in * 16 + xD + g * BN;
           if (col >= H) continue;
-          
+
           const float bia = (B2 && splits == 1) ? __bfloat162float(B2[b2_e + col]) : 0.f;
           float* dst = output_row + col;
-          
+
           if (splits == 1) {
             *dst = (d_acc[g][im][in][i] + bia) * w;
           } else {
@@ -1418,7 +1418,7 @@ static inline void launch_mlp1_swiglu_bf16_bucketed_outbf16(
   const int* offsets, const int* blk_offs, int H, int I, int E,
   int total_blocks, float swiglu_limit, hipStream_t stream
 ) {
-  
+
   constexpr int BM = MATMUL_MLP1_BLOCK_ROWS;
   constexpr int BN = MATMUL_MLP1_BLOCK_COLS;
   constexpr int BK = MATMUL_MLP1_BLOCK_DEPTH;
@@ -1441,7 +1441,7 @@ static inline void launch_mlp1_swiglu_bf16_bucketed_outbf16(
   size_t shmem = LdsPlan::bytes;
   mlp1_swiglu_bf16_bucketed_kernel_outbf16_tuned<BM,BN,BK,WM,WN,BN_AGG,CTA>
     <<<grid, block, shmem, stream>>>(gate_up_bf16, a_in, w1_layer, b1_layer, offsets, blk_offs, H, I, E, swiglu_limit);
-    
+
 }
 
 static inline void launch_mlp2_partial_bf16_bucketed_frombf16(
@@ -1450,7 +1450,7 @@ static inline void launch_mlp2_partial_bf16_bucketed_frombf16(
   const float* w_by_bucket, const int* offsets, const int* blk_offs,
   const int* tok_idx, int I, int H, int E, int total_blocks, hipStream_t stream
 ) {
-  
+
   constexpr int BM = MATMUL_MLP2_BLOCK_ROWS;
   constexpr int BN = MATMUL_MLP2_BLOCK_COLS;
   constexpr int BK = MATMUL_MLP2_BLOCK_DEPTH;
@@ -1503,7 +1503,7 @@ static inline void launch_mlp2_partial_bf16_bucketed_frombf16(
   mlp2_partial_bf16_bucketed_splitk_kernel_inbf16_tuned<BM,BN,BK,WM,WN,BN_AGG,NUM_CTA_MLP2>
     <<<grid, block, shmem, stream>>>(z_partial, gate_up_bf16, w2_layer, b2_layer, w_by_bucket,
                                      offsets, blk_offs, tok_idx, I, H, E, splits);
-  
+
 }
 
 
@@ -1683,7 +1683,7 @@ new_matmul_qkv_fused_kernel(
   constexpr int MFMA_M = 16;
   constexpr int MFMA_N = 16;
   constexpr int MFMA_K = 16;
-  
+
   constexpr int GPRs_A  = 2;
   constexpr int GPRs_B  = 2;
   constexpr int GPRs_CD = 4;
@@ -1800,7 +1800,7 @@ new_matmul_qkv_fused_kernel(
     dst[SW] = getp_qkv_pack2(tmp.z, tmp.w);   // k+4 .. k+7
   }
   __syncthreads();
-  
+
   #pragma unroll 1
   for (int bkIdx = 0; bkIdx < K; bkIdx += BK) {
     // Prefetch
@@ -1840,7 +1840,7 @@ new_matmul_qkv_fused_kernel(
           w_local = wss[((k + Bk) / KP) * SW +
                         (xInBlockTile * WN + MFMA_N * iterWaveN + Bj)];
 
-          CDfloat y_local = acc_local[iterWaveM * nIterWaveN + iterWaveN]; 
+          CDfloat y_local = acc_local[iterWaveM * nIterWaveN + iterWaveN];
           y_local  = __builtin_amdgcn_mfma_f32_16x16x16bf16_1k(x_local, w_local, y_local, 0, 0, 0);
           acc_local[iterWaveM * nIterWaveN + iterWaveN] = y_local;
         }
@@ -1906,7 +1906,7 @@ static inline void getp_matmul_qkv_fused_bf16(
     const __hip_bfloat16 *b_qkv_bf16,
     int n, int head_dim, int n_attn_heads, int n_kv_heads, int batch_size,
     hipStream_t stream) {
-      
+
   const int q_len = head_dim * n_attn_heads;
   const int k_len = head_dim * n_kv_heads;
   const int v_len = head_dim * n_kv_heads;
@@ -1927,7 +1927,7 @@ static inline void getp_matmul_qkv_fused_bf16(
 
   new_matmul_qkv_fused_kernel<<<grid, block, 0, stream>>>(
       q, k, v, x_bf16, w_qkv_bf16, b_qkv_bf16, n, q_len, k_len, v_len, batch_size);
-  
+
 }
 
 __global__ void __launch_bounds__(MATMUL_ROUTER_THREADS)
@@ -1986,7 +1986,7 @@ __global__ void __launch_bounds__(MATMUL_ROUTER_THREADS)
     constexpr int strideX8 = THREADS / (BK / X_VEC);
   constexpr int nbLoadsX = (BM + strideX8 - 1) / strideX8;
   constexpr int nbLoadsW = (BNt + strideW - 1) / strideW;
-    
+
   // Initial load into first buffer
     #pragma unroll
   for (int i = 0; i < nbLoadsX; ++i) {
@@ -1994,12 +1994,12 @@ __global__ void __launch_bounds__(MATMUL_ROUTER_THREADS)
       if (loadX_y8 + off >= BM) break;
       const int row = rowBase + loadX_y8 + off;
     const int kk = X_VEC * loadX_x8;
-      
+
       if (row < M && kk + 7 < K) {
         const float* p = x + (size_t)row * K + kk;
         const float4 v1 = *reinterpret_cast<const float4*>(p);
         const float4 v2 = *reinterpret_cast<const float4*>(p + 4);
-        
+
       sx0[(X_VEC * loadX_x8 + 0) * BM + (loadX_y8 + off)] = f32_to_bf16bits(v1.x);
       sx0[(X_VEC * loadX_x8 + 1) * BM + (loadX_y8 + off)] = f32_to_bf16bits(v1.y);
       sx0[(X_VEC * loadX_x8 + 2) * BM + (loadX_y8 + off)] = f32_to_bf16bits(v1.z);
@@ -2013,7 +2013,7 @@ __global__ void __launch_bounds__(MATMUL_ROUTER_THREADS)
       for (int t = 0; t < X_VEC; ++t) sx0[(X_VEC * loadX_x8 + t) * BM + (loadX_y8 + off)] = 0;
       }
     }
-    
+
     #pragma unroll
   for (int i = 0; i < nbLoadsW; ++i) {
     const int off = i * strideW;
@@ -2021,11 +2021,11 @@ __global__ void __launch_bounds__(MATMUL_ROUTER_THREADS)
     const int kk = 8 * loadW_x;
       const int col = colBase + loadW_y + off;
     unsigned short *dst = sw0 + (size_t)(8 * loadW_x) * BNt + (loadW_y + off);
-      
+
       if (col < N && kk + 7 < K) {
         const uint4* p = reinterpret_cast<const uint4*>(w + (size_t)col * K + kk);
         const uint4 t = *p;
-        
+
         dst[0 * BNt] = (unsigned short)(t.x & 0xFFFF);
         dst[1 * BNt] = (unsigned short)(t.x >> 16);
         dst[2 * BNt] = (unsigned short)(t.y & 0xFFFF);
@@ -2047,12 +2047,12 @@ __global__ void __launch_bounds__(MATMUL_ROUTER_THREADS)
     unsigned short *sw = (bk / BK) & 1 ? sw1 : sw0;
     unsigned short *sx_next = (bk / BK) & 1 ? sx0 : sx1;
     unsigned short *sw_next = (bk / BK) & 1 ? sw0 : sw1;
-    
+
     // Prefetch next tile into registers
     float4 regX_v1[nbLoadsX];
     float4 regX_v2[nbLoadsX];
     uint4 regW[nbLoadsW];
-    
+
     if (bk + BK < K) {
       #pragma unroll
       for (int i = 0; i < nbLoadsX; ++i) {
@@ -2060,7 +2060,7 @@ __global__ void __launch_bounds__(MATMUL_ROUTER_THREADS)
         if (loadX_y8 + off >= BM) break;
         const int row = rowBase + loadX_y8 + off;
         const int kk = bk + BK + X_VEC * loadX_x8;
-        
+
         if (row < M && kk + 7 < K) {
           const float* p = x + (size_t)row * K + kk;
           regX_v1[i] = *reinterpret_cast<const float4*>(p);
@@ -2070,14 +2070,14 @@ __global__ void __launch_bounds__(MATMUL_ROUTER_THREADS)
           regX_v2[i] = make_float4(0, 0, 0, 0);
         }
       }
-      
+
       #pragma unroll
       for (int i = 0; i < nbLoadsW; ++i) {
         const int off = i * strideW;
         if (loadW_y + off >= BNt) break;
         const int kk = bk + BK + 8 * loadW_x;
         const int col = colBase + loadW_y + off;
-        
+
         if (col < N && kk + 7 < K) {
           const uint4* p = reinterpret_cast<const uint4*>(w + (size_t)col * K + kk);
           regW[i] = *p;
@@ -2086,34 +2086,34 @@ __global__ void __launch_bounds__(MATMUL_ROUTER_THREADS)
         }
       }
     }
-    
+
     // MFMA compute from shared memory
     #pragma unroll
     for (int k = 0; k < BK; k += 16) {
       const int basek = k + yMF * 4;
       const int row = yTile * WM + xMF;
       const int c = xTile * WN + xMF;
-      
+
       const unsigned short* sx_ptr = &sx[basek * BM + row];
       bf16x4 av = {sx_ptr[0], sx_ptr[BM], sx_ptr[2*BM], sx_ptr[3*BM]};
-      
+
       #pragma unroll
       for (int g = 0; g < GETP_BN_AGG; ++g) {
         const unsigned short* sw_ptr = &sw[basek * BNt + c + g * BN];
         bf16x4 bv = {sw_ptr[0], sw_ptr[BNt], sw_ptr[2*BNt], sw_ptr[3*BNt]};
-        
+
         d_acc[g] = __builtin_amdgcn_mfma_f32_16x16x16bf16_1k(av, bv, d_acc[g], 0, 0, 0);
       }
     }
     __syncthreads();
-    
+
     // Store prefetched data to shared memory
     if (bk + BK < K) {
       #pragma unroll
       for (int i = 0; i < nbLoadsX; ++i) {
         const int off = i * strideX8;
         if (loadX_y8 + off >= BM) break;
-        
+
         sx_next[(X_VEC * loadX_x8 + 0) * BM + (loadX_y8 + off)] = f32_to_bf16bits(regX_v1[i].x);
         sx_next[(X_VEC * loadX_x8 + 1) * BM + (loadX_y8 + off)] = f32_to_bf16bits(regX_v1[i].y);
         sx_next[(X_VEC * loadX_x8 + 2) * BM + (loadX_y8 + off)] = f32_to_bf16bits(regX_v1[i].z);
@@ -2123,13 +2123,13 @@ __global__ void __launch_bounds__(MATMUL_ROUTER_THREADS)
         sx_next[(X_VEC * loadX_x8 + 6) * BM + (loadX_y8 + off)] = f32_to_bf16bits(regX_v2[i].z);
         sx_next[(X_VEC * loadX_x8 + 7) * BM + (loadX_y8 + off)] = f32_to_bf16bits(regX_v2[i].w);
       }
-      
+
       #pragma unroll
       for (int i = 0; i < nbLoadsW; ++i) {
         const int off = i * strideW;
         if (loadW_y + off >= BNt) break;
         unsigned short *dst = sw_next + (size_t)(8 * loadW_x) * BNt + (loadW_y + off);
-        
+
         dst[0 * BNt] = (unsigned short)(regW[i].x & 0xFFFF);
         dst[1 * BNt] = (unsigned short)(regW[i].x >> 16);
         dst[2 * BNt] = (unsigned short)(regW[i].y & 0xFFFF);
@@ -2145,20 +2145,20 @@ __global__ void __launch_bounds__(MATMUL_ROUTER_THREADS)
 
   const int xD = lane & 15;
   const int yD = 4 * (lane >> 4);
-  
+
   // AGGRESSIVE output: fully unrolled with pre-computed base
   #pragma unroll
   for (int i = 0; i < 4; ++i) {
     const int row = rowBase + yTile * WM + (yD + i);
     if (row >= M) continue;
-    
+
     float* output_row = xout + (size_t)row * N;
-    
+
     #pragma unroll
     for (int g = 0; g < GETP_BN_AGG; ++g) {
       const int col = colBase + xTile * WN + xD + g * BN;
       if (col >= N) continue;
-      
+
       float v = d_acc[g][i];
       if (b) v += __bfloat162float(b[col]);
       output_row[col] = v;
@@ -2227,7 +2227,7 @@ matmul_kernel_splitk_store_tuned(
     constexpr int strideX8 = THREADS / (BK / X_VEC);
   constexpr int nbLoadsX = (BM + strideX8 - 1) / strideX8;
   constexpr int nbLoadsW = (BNt + strideW - 1) / strideW;
-    
+
   // Initial load into first buffer
   if (kBeg < kEnd) {
     #pragma unroll
@@ -2236,12 +2236,12 @@ matmul_kernel_splitk_store_tuned(
       if (loadX_y8 + off >= BM) break;
       const int row = rowBase + loadX_y8 + off;
       const int kk = kBeg + X_VEC * loadX_x8;
-      
+
       if (row < M && kk + 7 < kEnd) {
         const float* p = x + (size_t)row * K + kk;
         const float4 v1 = *reinterpret_cast<const float4*>(p);
         const float4 v2 = *reinterpret_cast<const float4*>(p + 4);
-        
+
         sx0[(X_VEC * loadX_x8 + 0) * BM + (loadX_y8 + off)] = f32_to_bf16bits(v1.x);
         sx0[(X_VEC * loadX_x8 + 1) * BM + (loadX_y8 + off)] = f32_to_bf16bits(v1.y);
         sx0[(X_VEC * loadX_x8 + 2) * BM + (loadX_y8 + off)] = f32_to_bf16bits(v1.z);
@@ -2255,7 +2255,7 @@ matmul_kernel_splitk_store_tuned(
         for (int t = 0; t < X_VEC; ++t) sx0[(X_VEC * loadX_x8 + t) * BM + (loadX_y8 + off)] = 0;
       }
     }
-    
+
     #pragma unroll
     for (int i = 0; i < nbLoadsW; ++i) {
       const int off = i * strideW;
@@ -2263,11 +2263,11 @@ matmul_kernel_splitk_store_tuned(
       const int kk = kBeg + 8 * loadW_x;
       const int col = colBase + loadW_y + off;
       unsigned short *dst = sw0 + (size_t)(8 * loadW_x) * BNt + (loadW_y + off);
-      
+
       if (col < N && kk + 7 < kEnd) {
         const uint4* p = reinterpret_cast<const uint4*>(w + (size_t)col * K + kk);
         const uint4 t = *p;
-        
+
         dst[0 * BNt] = (unsigned short)(t.x & 0xFFFF);
         dst[1 * BNt] = (unsigned short)(t.x >> 16);
         dst[2 * BNt] = (unsigned short)(t.y & 0xFFFF);
@@ -2290,12 +2290,12 @@ matmul_kernel_splitk_store_tuned(
     unsigned short *sw = ((bk - kBeg) / BK) & 1 ? sw1 : sw0;
     unsigned short *sx_next = ((bk - kBeg) / BK) & 1 ? sx0 : sx1;
     unsigned short *sw_next = ((bk - kBeg) / BK) & 1 ? sw0 : sw1;
-    
+
     // Prefetch next tile into registers
     float4 regX_v1[nbLoadsX];
     float4 regX_v2[nbLoadsX];
     uint4 regW[nbLoadsW];
-    
+
     if (bk + BK < kEnd) {
       #pragma unroll
       for (int i = 0; i < nbLoadsX; ++i) {
@@ -2303,7 +2303,7 @@ matmul_kernel_splitk_store_tuned(
         if (loadX_y8 + off >= BM) break;
         const int row = rowBase + loadX_y8 + off;
         const int kk = bk + BK + X_VEC * loadX_x8;
-        
+
         if (row < M && kk + 7 < kEnd) {
           const float* p = x + (size_t)row * K + kk;
           regX_v1[i] = *reinterpret_cast<const float4*>(p);
@@ -2313,14 +2313,14 @@ matmul_kernel_splitk_store_tuned(
           regX_v2[i] = make_float4(0, 0, 0, 0);
         }
       }
-      
+
       #pragma unroll
       for (int i = 0; i < nbLoadsW; ++i) {
         const int off = i * strideW;
         if (loadW_y + off >= BNt) break;
         const int kk = bk + BK + 8 * loadW_x;
         const int col = colBase + loadW_y + off;
-        
+
         if (col < N && kk + 7 < kEnd) {
           const uint4* p = reinterpret_cast<const uint4*>(w + (size_t)col * K + kk);
           regW[i] = *p;
@@ -2336,27 +2336,27 @@ matmul_kernel_splitk_store_tuned(
       const int basek = k + yMF * 4;
       const int row = yTile * WM + xMF;
       const int c = xTile * WN + xMF;
-      
+
       const unsigned short* sx_ptr = &sx[basek * BM + row];
       bf16x4 av = {sx_ptr[0], sx_ptr[BM], sx_ptr[2*BM], sx_ptr[3*BM]};
-      
+
       #pragma unroll
       for (int g = 0; g < BN_AGG; ++g) {
         const unsigned short* sw_ptr = &sw[basek * BNt + c + g * BN];
         bf16x4 bv = {sw_ptr[0], sw_ptr[BNt], sw_ptr[2*BNt], sw_ptr[3*BNt]};
-        
+
         d_acc[g] = __builtin_amdgcn_mfma_f32_16x16x16bf16_1k(av, bv, d_acc[g], 0, 0, 0);
       }
     }
     __syncthreads();
-    
+
     // Store prefetched data to shared memory
     if (bk + BK < kEnd) {
       #pragma unroll
       for (int i = 0; i < nbLoadsX; ++i) {
         const int off = i * strideX8;
         if (loadX_y8 + off >= BM) break;
-        
+
         sx_next[(X_VEC * loadX_x8 + 0) * BM + (loadX_y8 + off)] = f32_to_bf16bits(regX_v1[i].x);
         sx_next[(X_VEC * loadX_x8 + 1) * BM + (loadX_y8 + off)] = f32_to_bf16bits(regX_v1[i].y);
         sx_next[(X_VEC * loadX_x8 + 2) * BM + (loadX_y8 + off)] = f32_to_bf16bits(regX_v1[i].z);
@@ -2366,13 +2366,13 @@ matmul_kernel_splitk_store_tuned(
         sx_next[(X_VEC * loadX_x8 + 6) * BM + (loadX_y8 + off)] = f32_to_bf16bits(regX_v2[i].z);
         sx_next[(X_VEC * loadX_x8 + 7) * BM + (loadX_y8 + off)] = f32_to_bf16bits(regX_v2[i].w);
       }
-      
+
       #pragma unroll
       for (int i = 0; i < nbLoadsW; ++i) {
         const int off = i * strideW;
         if (loadW_y + off >= BNt) break;
         unsigned short *dst = sw_next + (size_t)(8 * loadW_x) * BNt + (loadW_y + off);
-        
+
         dst[0 * BNt] = (unsigned short)(regW[i].x & 0xFFFF);
         dst[1 * BNt] = (unsigned short)(regW[i].x >> 16);
         dst[2 * BNt] = (unsigned short)(regW[i].y & 0xFFFF);
@@ -2391,15 +2391,15 @@ matmul_kernel_splitk_store_tuned(
 
   const int xD = lane & 15;
   const int yD = 4 * (lane >> 4);
-  
+
   // AGGRESSIVE split-K output: fully unrolled with base pointer optimization
   #pragma unroll
   for (int i = 0; i < 4; ++i) {
     const int row = rowBase + yTile * WM + (yD + i);
     if (row >= M) continue;
-    
+
     float* output_row = partial + base_out + (size_t)row * N;
-    
+
     #pragma unroll
     for (int g = 0; g < BN_AGG; ++g) {
       const int col = colBase + xTile * WN + xD + g * BN;
@@ -2466,7 +2466,7 @@ void getp_compute_cos_sin(int pos, float base, int head_dim,
                           float scaling_factor, float initial_context_length,
                           float ntk_beta, float ntk_alpha, float *cos_out,
                           float *sin_out, float *inv_freq, hipStream_t stream) {
-  
+
   int d_half = head_dim / 2;
   float concentration =
       scaling_factor > 1.0f ? 0.1f * logf(scaling_factor) + 1.0f : 1.0f;
@@ -2483,7 +2483,7 @@ void getp_compute_cos_sin(int pos, float base, int head_dim,
     compute_cos_sin_kernel<<<gridDim, blockDim, 0, stream>>>(
         cos_out, sin_out, inv_freq, concentration, pos, d_half);
   }
-  
+
 }
 
 __global__ void apply_rotary_emb_kernel(float *x, float *cos, float *sin,
@@ -2506,13 +2506,13 @@ __global__ void apply_rotary_emb_kernel(float *x, float *cos, float *sin,
 }
 void getp_apply_rotary_emb(float *x, float *cos, float *sin, int n_heads,
                            int head_dim, int batch_size, hipStream_t stream) {
-  
+
   dim3 blockDim(16, 16);
   dim3 gridDim((head_dim / 2 + blockDim.x - 1) / blockDim.x,
                (n_heads + blockDim.y - 1) / blockDim.y, batch_size);
   apply_rotary_emb_kernel<<<gridDim, blockDim, 0, stream>>>(x, cos, sin,
                                                             n_heads, head_dim);
-  
+
 }
 
 __global__ void router_topk_softmax_batch_kernel(
@@ -2596,7 +2596,7 @@ __global__ void router_topk_softmax_batch_kernel(
 static inline void getp_router_topk_softmax_batch(
     const float *router_score, int n_experts, int experts_per_token,
     float *topk_v_out, int *topk_i_out, int batch_size, hipStream_t stream) {
-  
+
   const int BLK = 1024;
   const dim3 block(BLK);
   const dim3 grid(batch_size);
@@ -2605,7 +2605,7 @@ static inline void getp_router_topk_softmax_batch(
                        GETP_ROUTER_TOPK_MAXK * (sizeof(float) + sizeof(int));
   router_topk_softmax_batch_kernel<<<grid, block, shmem, stream>>>(
       router_score, n_experts, experts_per_token, topk_v_out, topk_i_out);
-  
+
 }
 
 __global__ void map_global_to_local_batch_kernel(
@@ -2638,12 +2638,12 @@ static inline void getp_map_global_to_local_batch(
     const int *topk_i, const float *topk_v, int *local_ids, float *local_wts,
     int *n_local, int K, int expert_start, int expert_end, int B,
     hipStream_t stream) {
-  
+
   const int BLK = 128, GRD = (B + BLK - 1) / BLK;
   map_global_to_local_batch_kernel<<<GRD, BLK, 0, stream>>>(
       topk_i, topk_v, local_ids, local_wts, n_local, K, expert_start,
       expert_end, B);
-  
+
 }
 
 __global__ void vecadd_kernel(float *x, float *y, int size) {
@@ -2657,11 +2657,11 @@ __global__ void vecadd_kernel(float *x, float *y, int size) {
 }
 void getp_vecadd(float *x, float *y, int size, int batch_size,
                  hipStream_t stream) {
-  
+
   dim3 blockDim(1024);
   dim3 gridDim((size + blockDim.x - 1) / blockDim.x, batch_size);
   vecadd_kernel<<<gridDim, blockDim, 0, stream>>>(x, y, size);
-  
+
 }
 
 // ============================================================================
@@ -2977,7 +2977,7 @@ flash_attn_decode_even_layer_bf16_matrix_core_kernel(
   const __hip_bfloat16 *__restrict__ value_cache, const float *__restrict__ q,
   const int *__restrict__ mask_on,
   const float *__restrict__ attn_sinks, int head_dim, int n_attn_heads,
-  int n_kv_heads, int pos, int batch_size, int kv_dim, int kv_mul, 
+  int n_kv_heads, int pos, int batch_size, int kv_dim, int kv_mul,
   int sliding_window, int cache_tcap, float inv_sqrt_d
 ) {
   /* Ignore sliding window mechanism, only consider odd layer */
@@ -3042,18 +3042,18 @@ flash_attn_decode_even_layer_bf16_matrix_core_kernel(
 
   const float *qptr =
       q + (size_t)b * n_attn_heads * head_dim;
-  
+
   Afloat q_values[HEAD_DIM / (MFMA_BLOCK * MFMA_K)];
   for (int i = 0; i < HEAD_DIM / (MFMA_BLOCK * MFMA_K); ++i) {
     for (int j = 0; j < MFMA_K; ++j) {
       // inv_sqrt_d gap vao day thay vi nhan vao tung diem so sau __shfl,
       // noi gia tri dong nhat ca wave nen 63/64 lane bi phi. Bit-exact vi
       // head_dim == 64 -> inv_sqrt_d = 2^-3.
-      q_values[i][j] = 
+      q_values[i][j] =
         f32_to_bf16bits(
           inv_sqrt_d *
-          qptr[(Ai + MFMA_M * waveIdx + kv_h * kv_mul) * head_dim + 
-                  i * (MFMA_BLOCK * MFMA_K) + 
+          qptr[(Ai + MFMA_M * waveIdx + kv_h * kv_mul) * head_dim +
+                  i * (MFMA_BLOCK * MFMA_K) +
                   Ablock * MFMA_K + j]);
     }
   }
@@ -3204,7 +3204,7 @@ flash_attn_decode_even_layer_bf16_matrix_core_kernel(
     out_values[i] = alpha * out_values[i] / l_values[i];
 
     float *obh =
-        tb + (size_t)b * n_attn_heads * head_dim + 
+        tb + (size_t)b * n_attn_heads * head_dim +
              (size_t)h * head_dim;
     obh[laneIdx] = out_values[i];
   }
@@ -3218,7 +3218,7 @@ flash_attn_decode_odd_layer_bf16_matrix_core_kernel(
   const __hip_bfloat16 *__restrict__ value_cache, const float *__restrict__ q,
   const int *__restrict__ mask_on,
   const float *__restrict__ attn_sinks, int head_dim, int n_attn_heads,
-  int n_kv_heads, int pos, int batch_size, int kv_dim, int kv_mul, 
+  int n_kv_heads, int pos, int batch_size, int kv_dim, int kv_mul,
   int cache_tcap, float inv_sqrt_d
 ) {
   /* Ignore sliding window mechanism, only consider odd layer */
@@ -3283,18 +3283,18 @@ flash_attn_decode_odd_layer_bf16_matrix_core_kernel(
 
   const float *qptr =
       q + (size_t)b * n_attn_heads * head_dim;
-  
+
   Afloat q_values[HEAD_DIM / (MFMA_BLOCK * MFMA_K)];
   for (int i = 0; i < HEAD_DIM / (MFMA_BLOCK * MFMA_K); ++i) {
     for (int j = 0; j < MFMA_K; ++j) {
       // inv_sqrt_d gap vao day thay vi nhan vao tung diem so sau __shfl,
       // noi gia tri dong nhat ca wave nen 63/64 lane bi phi. Bit-exact vi
       // head_dim == 64 -> inv_sqrt_d = 2^-3.
-      q_values[i][j] = 
+      q_values[i][j] =
         f32_to_bf16bits(
           inv_sqrt_d *
-          qptr[(Ai + MFMA_M * waveIdx + kv_h * kv_mul) * head_dim + 
-                  i * (MFMA_BLOCK * MFMA_K) + 
+          qptr[(Ai + MFMA_M * waveIdx + kv_h * kv_mul) * head_dim +
+                  i * (MFMA_BLOCK * MFMA_K) +
                   Ablock * MFMA_K + j]);
     }
   }
@@ -3445,7 +3445,7 @@ flash_attn_decode_odd_layer_bf16_matrix_core_kernel(
     out_values[i] = alpha * out_values[i] / l_values[i];
 
     float *obh =
-        tb + (size_t)b * n_attn_heads * head_dim + 
+        tb + (size_t)b * n_attn_heads * head_dim +
              (size_t)h * head_dim;
     obh[laneIdx] = out_values[i];
   }
@@ -3505,7 +3505,7 @@ static inline void getp_flash_attn_decode_bf16(
     const float *attn_sinks_layer, int head_dim, int n_attn_heads,
     int n_kv_heads, int pos, int seq_len, int sliding_window, int layer_id,
     int batch_size, int cache_tcap, hipStream_t stream) {
-  
+
   const int kv_dim = head_dim * n_kv_heads;
   const int kv_mul = n_attn_heads / n_kv_heads;
   const float invsd = 1.0f / sqrtf((float)head_dim);
@@ -3526,11 +3526,11 @@ static inline void getp_flash_attn_decode_bf16(
     dim3 block(128);
     dim3 grid(n_kv_heads, batch_size);
     flash_attn_decode_even_layer_bf16_matrix_core_kernel<FLASH_DECODE_TILE_T><<<grid, block, 0, stream>>>
-      (tb, key_cache_layer, 
-       value_cache_layer, q, 
-       mask_on, 
-       attn_sinks_layer, head_dim, n_attn_heads, 
-       n_kv_heads, pos, batch_size, kv_dim, kv_mul, 
+      (tb, key_cache_layer,
+       value_cache_layer, q,
+       mask_on,
+       attn_sinks_layer, head_dim, n_attn_heads,
+       n_kv_heads, pos, batch_size, kv_dim, kv_mul,
        sliding_window, cache_tcap, invsd);
     tensor_fp32_to_bf16(tb_bf16, tb,
                         batch_size * n_attn_heads * head_dim, stream);
@@ -3551,18 +3551,18 @@ static inline void getp_flash_attn_decode_bf16(
     dim3 block(128);
     dim3 grid(n_kv_heads, batch_size);
     flash_attn_decode_odd_layer_bf16_matrix_core_kernel<FLASH_DECODE_TILE_T><<<grid, block, 0, stream>>>
-      (tb, key_cache_layer, 
-      value_cache_layer, q, 
+      (tb, key_cache_layer,
+      value_cache_layer, q,
       mask_on,
-      attn_sinks_layer, head_dim, n_attn_heads, 
-      n_kv_heads, pos, batch_size, kv_dim, kv_mul, 
+      attn_sinks_layer, head_dim, n_attn_heads,
+      n_kv_heads, pos, batch_size, kv_dim, kv_mul,
       cache_tcap, invsd);
     tensor_fp32_to_bf16(tb_bf16, tb,
                         batch_size * n_attn_heads * head_dim, stream);
 #endif
     }
 
-  
+
 
 #if GETP_DUMP_ATTN
   getp_dump_attn(tb, batch_size, n_attn_heads, head_dim, layer_id, pos, stream);
@@ -3584,14 +3584,14 @@ static inline void getp_gather_embedding_bf16(float *x,
                                               const __hip_bfloat16 *table,
                                               const int *tok, int H, int B,
                                               hipStream_t stream) {
-  
+
   dim3 block(256), grid(B);
   gather_embedding_bf16_kernel<<<grid, block, 0, stream>>>(x, table, tok, H);
-  
+
 }
 
 static inline void getp_matmul_router_bf16(float *xout, float *x, __hip_bfloat16 *w, __hip_bfloat16 *b, int n, int d, int batch_size, hipStream_t stream) {
-  
+
   const int M = batch_size, N = d, K = n;
   constexpr int BM = 32, BN = 32, BK = 32;
   const int BNt = BN * GETP_BN_AGG;
@@ -3622,7 +3622,7 @@ static inline void getp_matmul_router_bf16(float *xout, float *x, __hip_bfloat16
     matmul_kernel_nosplit<<<grid, block, shmem, stream>>>(
         xout, x, reinterpret_cast<const __hip_bfloat16 *>(w),
         reinterpret_cast<const __hip_bfloat16 *>(b), M, N, K);
-    
+
     return;
   }
 
@@ -3644,7 +3644,7 @@ static inline void getp_matmul_router_bf16(float *xout, float *x, __hip_bfloat16
         GETP_BN_AGG, MATMUL_ROUTER_WAVES_PER_BLOCK>
       <<<grid, block, shmem, stream>>>(partial, x, w, M, N, K, splits);
   }
-  
+
 
   const int total = M * N;
   dim3 rBlock(256);
@@ -3653,7 +3653,7 @@ static inline void getp_matmul_router_bf16(float *xout, float *x, __hip_bfloat16
       xout, partial, reinterpret_cast<const __hip_bfloat16 *>(b), M, N, splits);
 
   HIP_CHECK(hipFreeAsync(partial, stream));
-  
+
 }
 
 #ifndef MATMUL_ATTN_O_BLOCK_ROWS
@@ -3864,7 +3864,7 @@ matmul_attn_o_bf16_kernel_tuned(
                 "loader X khong phu kin tile: BM*(BK/8) phai chia het THREADS");
   static_assert(nbLoadsW >= 1 && (BN * (BK / 8)) % THREADS == 0,
                 "loader W khong phu kin tile: BN*(BK/8) phai chia het THREADS");
-  
+
   #pragma unroll
   for (int i = 0; i < nbLoadsX8; ++i) {
     const int off = i * strideX8;
@@ -3872,7 +3872,7 @@ matmul_attn_o_bf16_kernel_tuned(
     if (row_tile >= BM) break;
     const int rg = BM * blockIdx.y + row_tile;
     const int kk = X_LOAD_VEC * loadX_x8;
-    
+
     if (rg < M && kk + 7 < K) {
       // Fast path: uint4 load (8 bf16 = 16 bytes)
       const uint4* p = reinterpret_cast<const uint4*>(x + (size_t)rg * K + kk);
@@ -3895,7 +3895,7 @@ matmul_attn_o_bf16_kernel_tuned(
     const int off = i * strideW;
     const int kk = 8 * loadWIdx_x;
     const int cy = BN * blockIdx.x + loadWIdx_y + off;
-    
+
     if (kk + 7 < K && cy < N) {
       // Fast path: vectorized uint4 load
       const uint4* p = reinterpret_cast<const uint4*>(&w[(size_t)cy * K + kk]);
@@ -3915,7 +3915,7 @@ matmul_attn_o_bf16_kernel_tuned(
   for (int bkIdx = 0; bkIdx < K; bkIdx += BK) {
     uint4 regX8[nbLoadsX8];
     uint4 regW[nbLoadsW];
-    
+
     // AGGRESSIVE prefetching: uint4 loads
     if (bkIdx < K - BK) {
       #pragma unroll
@@ -3924,7 +3924,7 @@ matmul_attn_o_bf16_kernel_tuned(
         const int row_tile = loadX_y8 + off;
         const int rg = BM * blockIdx.y + row_tile;
         const int kk = bkIdx + BK + X_LOAD_VEC * loadX_x8;
-        
+
         if (row_tile < BM && rg < M && kk + 7 < K) {
           // Fast path: uint4 load (8 bf16)
           const uint4* p = reinterpret_cast<const uint4*>(x + (size_t)rg * K + kk);
@@ -3933,13 +3933,13 @@ matmul_attn_o_bf16_kernel_tuned(
           regX8[i] = make_uint4(0,0,0,0);
         }
       }
-      
+
       #pragma unroll
       for (int i = 0; i < nbLoadsW; ++i) {
         const int off = i * strideW;
         const int kk = bkIdx + BK + 8 * loadWIdx_x;
         const int cy = BN * blockIdx.x + loadWIdx_y + off;
-        
+
         if (kk + 7 < K && cy < N) {
           const uint4* p = reinterpret_cast<const uint4*>(&w[(size_t)cy * K + kk]);
           regW[i] = *p;
@@ -3985,12 +3985,12 @@ matmul_attn_o_bf16_kernel_tuned(
         const int off = i * strideX8;
         const int row_tile = loadX_y8 + off;
         if (row_tile >= BM) break;
-        
+
         const uint4 v = regX8[i];
         xsT[loadX_k0 + 0][row_tile] = attn_o_pack2(v.x, v.y);
         xsT[loadX_k0 + 1][row_tile] = attn_o_pack2(v.z, v.w);
       }
-      
+
       #pragma unroll
       for (int i = 0; i < nbLoadsW; ++i) {
         const int off = i * strideW;
@@ -4008,14 +4008,14 @@ matmul_attn_o_bf16_kernel_tuned(
     #pragma unroll
     for (int in = 0; in < nIterWaveN; ++in) {
       const int acc_index = im * nIterWaveN + in;
-      
+
       #pragma unroll
       for (int i = 0; i < 4; ++i) {
         const int CDi = 4 * (laneIdx >> 4) + (i & 3);
         const int CDj = laneIdx & 15;
         const int gx = blockIdx.x * BN + WN * xInBlockTile + in * MFMA_N + CDj;
         const int gy = blockIdx.y * BM + WM * yInBlockTile + im * MFMA_M + CDi;
-        
+
         if (gx < N && gy < M) {
           float v = acc_local[acc_index][i];
           if (b) v += __bfloat162float(b[gx]);
@@ -4035,7 +4035,7 @@ static inline void getp_matmul_attn_o_bf16(
     float *xout, const __hip_bfloat16 *x_bf16,
     const __hip_bfloat16 *w, const __hip_bfloat16 *b,
     int n, int d, int batch_size, hipStream_t stream) {
-      
+
   const int M = batch_size, N = d, K = n;
 
   constexpr int BM = MATMUL_ATTN_O_BLOCK_ROWS;
@@ -4429,7 +4429,7 @@ matmul_logits_argmax_bf16_kernel_tuned(
 static inline void getp_matmul_logits_argmax_bf16(
     const float* x, const __hip_bfloat16* w, int d, int n, int batch_size,
     int* out, hipStream_t stream) {
-      
+
   const int M = batch_size, N = n, K = d;
 
   constexpr int BM = MATMUL_LOGITS_BLOCK_ROWS;
@@ -4459,7 +4459,7 @@ static inline void getp_matmul_logits_argmax_bf16(
 
   extract_argmax_pairs<<<gi, bi, 0, stream>>>(pairs, out, M);
   // (pairs duoc giu lai cho buoc sau)
-  
+
 }
 
 
@@ -4508,11 +4508,11 @@ __global__ void argmax_rows_kernel(const float *__restrict__ logits, int V,
 
 static inline void getp_argmax_rows(const float *logits, int V, int *out, int B,
                                     hipStream_t stream) {
-  
+
   dim3 grid(B), block(1024);
   argmax_rows_kernel<<<grid, block, 0, stream>>>(logits, V, out);
-  
-  
+
+
 }
 
 inline void sync_workers(hipStream_t stream, Barrier &sync_point) {
@@ -4566,7 +4566,7 @@ int *getp_forward_120b(Transformer * /*transformer*/,
       HIP_CHECK(hipEventCreateWithFlags(&events_e_agg[i], hipEventDisableTiming));
   }
 
-  HIP_CHECK(hipMemcpyAsync(ext->mask_on, mask_on, sizeof(int) * BATCH_SIZE, 
+  HIP_CHECK(hipMemcpyAsync(ext->mask_on, mask_on, sizeof(int) * BATCH_SIZE,
                            hipMemcpyHostToDevice, compute_stream));
   HIP_CHECK(hipMemcpyAsync(dev_s->topk_i, token, sizeof(int) * BATCH_SIZE,
                            hipMemcpyHostToDevice, compute_stream));
@@ -4758,26 +4758,26 @@ int *getp_forward_120b(Transformer * /*transformer*/,
     int total_blocks_mlp1 = build_moe_block_schedule(
       ext->e_offsets, experts_per_device, MATMUL_MLP1_BLOCK_ROWS,
       ext->blk_counts, ext->blk_offsets, compute_stream);
-  
+
   moe_scatter_acts_to_expert_frombf16(
       ext->a_in,
       ext->ext_t_bf16,
       ext->e_dev,
       total_pairs, hidden_dim, compute_stream);
-  
+
   // (memset 35,4 MB da bo: moe_gather_pairs gio ghi de toan bo vung nay)
-  
+
   __hip_bfloat16 *w1_base = dev_w->w_mlp1 + 1ll * l * experts_per_device * 2 * p->intermediate_dim * hidden_dim;
   __hip_bfloat16 *b1_base = dev_w->b_mlp1 + 1ll * l * experts_per_device * 2 * p->intermediate_dim;
-  
+
   launch_mlp1_swiglu_bf16_bucketed_outbf16(
       ext->gate_up_bf16, ext->a_in, w1_base, b1_base, ext->e_offsets,
       ext->blk_offsets, hidden_dim, p->intermediate_dim, experts_per_device,
       total_blocks_mlp1, p->swiglu_limit, compute_stream);
-  
+
   __hip_bfloat16 *w2_base = dev_w->w_mlp2 + 1ll * l * experts_per_device * hidden_dim * p->intermediate_dim;
   __hip_bfloat16 *b2_base = dev_w->b_mlp2 + 1ll * l * experts_per_device * hidden_dim;
-  
+
 #if MATMUL_MLP2_BLOCK_ROWS != MATMUL_MLP1_BLOCK_ROWS
   // mlp2 giai ma blk_offsets bang BM cua rieng no, nen khi hai BM khac nhau thi
   // phai co lich rieng. Ghi de cung buffer la an toan: moi thu tren compute_stream,
@@ -4788,12 +4788,12 @@ int *getp_forward_120b(Transformer * /*transformer*/,
 #else
   const int total_blocks_mlp2 = total_blocks_mlp1;
 #endif
-  
+
   launch_mlp2_partial_bf16_bucketed_frombf16(
       ext->z_partial, ext->gate_up_bf16, w2_base, b2_base, ext->w_dev,
       ext->e_offsets, ext->blk_offsets, ext->e_dev, p->intermediate_dim,
       hidden_dim, experts_per_device, total_blocks_mlp2, compute_stream);
-  
+
     // Lat cat own_slice di thang vao dev_x; cac lat cat khac van ra ext_e_agg
     // vi peer se keo chung. Bo han mot vecadd (doc 17,7 MB + ghi 17,7 MB).
     moe_gather_pairs_acc(ext->ext_e_agg, dev_x,
@@ -4853,8 +4853,8 @@ int *getp_forward_120b(Transformer * /*transformer*/,
 int *getp_forward_20b(Transformer * /*transformer*/,
                       DeviceTransformer **dev_transformeres, GPUWorker *worker,
                       int token[], int pos, int *mask_on, int batch_size) {
-  
-  
+
+
   int device_index = worker->device_index;
   RunStateExt *ext = ext_get(device_index);
 
@@ -4869,11 +4869,11 @@ int *getp_forward_20b(Transformer * /*transformer*/,
   int n_experts = p->n_experts;
 
   HIP_CHECK(hipSetDevice(device_index));
-  
+
   hipStream_t h2d_stream = dev_transformeres[device_index]->h2d_stream;
 
   // Use async copies for better performance
-  HIP_CHECK(hipMemcpyAsync(ext->mask_on, mask_on, sizeof(int) * batch_size, 
+  HIP_CHECK(hipMemcpyAsync(ext->mask_on, mask_on, sizeof(int) * batch_size,
                            hipMemcpyHostToDevice, h2d_stream));
   HIP_CHECK(hipMemcpyAsync(dev_s->topk_i, token, sizeof(int) * batch_size,
                            hipMemcpyHostToDevice, h2d_stream));
@@ -4982,7 +4982,7 @@ int *getp_forward_20b(Transformer * /*transformer*/,
     //                             nullptr);
     getp_matmul_router_bf16(dev_s->router_score, dev_s->t, dev_w_router,
       dev_b_router, hidden_dim, n_experts, batch_size, nullptr);
-    
+
 
     getp_router_topk_softmax_batch(dev_s->router_score, n_experts,
                                    p->experts_per_token, dev_s->topk_v,
@@ -5011,34 +5011,34 @@ int *getp_forward_20b(Transformer * /*transformer*/,
     int total_blocks_mlp = build_moe_block_schedule(
       ext->e_offsets, experts_per_device, MATMUL_MLP1_BLOCK_ROWS,
       ext->blk_counts, ext->blk_offsets, nullptr);
-  
+
   moe_scatter_acts_to_expert_bf16(
       ext->a_in, dev_s->t, ext->e_dev,
       total_pairs, hidden_dim, nullptr);
-  
+
   HIP_CHECK(hipMemset(dev_s->e_agg, 0,
                       (size_t)batch_size * hidden_dim * sizeof(float)));
-  
+
   __hip_bfloat16 *w1_base = dev_w->w_mlp1 + 1ll * l * experts_per_device * 2 * p->intermediate_dim * hidden_dim;
   __hip_bfloat16 *b1_base = dev_w->b_mlp1 + 1ll * l * experts_per_device * 2 * p->intermediate_dim;
-  
+
   launch_mlp1_swiglu_bf16_bucketed_outbf16(
       ext->gate_up_bf16, ext->a_in, w1_base, b1_base, ext->e_offsets,
       ext->blk_offsets, hidden_dim, p->intermediate_dim, experts_per_device,
       total_blocks_mlp, p->swiglu_limit, nullptr);
-  
+
   __hip_bfloat16 *w2_base = dev_w->w_mlp2 + 1ll * l * experts_per_device * hidden_dim * p->intermediate_dim;
   __hip_bfloat16 *b2_base = dev_w->b_mlp2 + 1ll * l * experts_per_device * hidden_dim;
-  
+
   // int total_blocks_mlp2 = build_moe_block_schedule(
   //     ext->e_offsets, experts_per_device, MATMUL_MLP2_BLOCK_ROWS,
   //     ext->blk_counts, ext->blk_offsets, nullptr);
-  
+
   launch_mlp2_partial_bf16_bucketed_frombf16(
       ext->z_partial, ext->gate_up_bf16, w2_base, b2_base, ext->w_dev,
       ext->e_offsets, ext->blk_offsets, ext->e_dev, p->intermediate_dim,
       hidden_dim, experts_per_device, total_blocks_mlp, nullptr);
-  
+
 
     moe_gather_pairs(dev_s->e_agg, ext->z_partial, ext->pair_pos, hidden_dim,
                      p->experts_per_token, batch_size, nullptr);
@@ -5058,6 +5058,6 @@ int *getp_forward_20b(Transformer * /*transformer*/,
   HIP_CHECK(hipMemcpyAsync(next_host, dev_s->topk_i, sizeof(int) * batch_size,
                            hipMemcpyDeviceToHost, d2h_stream));
   HIP_CHECK(hipStreamSynchronize(d2h_stream));
-                      
+
   return next_host;
 }

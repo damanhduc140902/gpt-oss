@@ -239,7 +239,7 @@ Where those numbers came from, one optimisation at a time on the 20B model:
 | Argmax made independent of block arrival order               |      57343 |  +0.6% |
 | mlp2 block 64 -> 96 with a matching register budget          |      58309 |  +1.7% |
 | Attention scratch LDS reused; five HBM round-trips removed   |      60850 |  +4.4% |
-| mlp2 block 96 -> 128 (64-row wave tile), split-K pinned off |  **62937** |  +3.4% |
+| mlp2 block 96 -> 128 (64-row wave tile), split-K pinned off  |  **62937** |  +3.4% |
 
 The 120B model went from 13,149 to 20,293 tok/s over the same work, with no
 changes specific to it - it runs the same kernels with the same defaults.

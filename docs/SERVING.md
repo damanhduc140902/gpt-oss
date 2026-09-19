@@ -528,14 +528,14 @@ host-side stream synchronisations plus a pageable device-to-host read. Exactly o
 three helpers it calls — `sync_workers`, `build_moe_buckets_local_pos` and
 `build_moe_block_schedule` ([`forward.hip`](../src/hip/forward.hip)). In order:
 
-| Site                                                                                | Why                                                                                                      |
-| ----------------------------------------------------------------------------------- | -------------------------------------------------------------------------------------------------------- |
-| `hipStreamSynchronize(memory_stream)`, after the hidden-state and top-k peer copies | the peer copies must land before the barrier                                                             |
-| `sync_workers`, before the barrier                                                  | compute-stream drain before the barrier                                                                  |
-| inside `build_moe_buckets_local_pos`                                                | reads the expert-offset array to compute `cap_pairs`                                                     |
-| the `hipMemcpyAsync` of `total_pairs` into a stack `int`                            | grid size for the scatter kernel                                                                         |
-| inside `build_moe_block_schedule`, called for MLP1                                  | reads `total_blocks` to size the bucketed MLP1 launch                                                    |
-| `sync_workers`, after the MoE aggregate                                             | compute-stream drain after the MoE aggregate                                                             |
+| Site                                                                                | Why                                                   |
+| ----------------------------------------------------------------------------------- | ----------------------------------------------------- |
+| `hipStreamSynchronize(memory_stream)`, after the hidden-state and top-k peer copies | the peer copies must land before the barrier          |
+| `sync_workers`, before the barrier                                                  | compute-stream drain before the barrier               |
+| inside `build_moe_buckets_local_pos`                                                | reads the expert-offset array to compute `cap_pairs`  |
+| the `hipMemcpyAsync` of `total_pairs` into a stack `int`                            | grid size for the scatter kernel                      |
+| inside `build_moe_block_schedule`, called for MLP1                                  | reads `total_blocks` to size the bucketed MLP1 launch |
+| `sync_workers`, after the MoE aggregate                                             | compute-stream drain after the MoE aggregate          |
 
 The MoE read-backs are not laziness. Block counts depend on data-dependent expert occupancy — how
 many of the `EXPERT_PARALLELISM × BATCH_SIZE × 4` (token, expert) pairs landed on each of this
