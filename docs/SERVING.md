@@ -4,7 +4,7 @@
 server: the whole workload is known before the first token is produced, every request is resident on
 a GPU for the entire run, and the schedule is frozen at start-up. There is no queue, no continuous
 batching, no eviction and no work stealing. That closed-world assumption is what makes 12288
-sequences advance in lockstep at 62937 tokens per second on eight MI250 GCDs, and it is also the
+sequences advance in lockstep at 63444 tokens per second on eight MI250 GCDs, and it is also the
 source of every limitation described on this page. The machinery lives in five places:
 [`src/getp/run.cpp`](../src/getp/run.cpp), [`src/getp/transformer.cpp`](../src/getp/transformer.cpp),
 [`src/getp/state_ext.cpp`](../src/getp/state_ext.cpp),
@@ -522,42 +522,23 @@ is part of why the 20B configuration scales so cleanly.
 
 ### Host synchronisations on the critical path
 
-Overlap is bounded by how often the host has to stop and look at the device. Per layer there are six
-host-side stream synchronisations plus a pageable device-to-host read. Exactly one of the six
-(`hipStreamSynchronize(memory_stream)`) sits in `getp_forward_120b` itself; the other five are in the
-three helpers it calls — `sync_workers`, `build_moe_buckets_local_pos` and
-`build_moe_block_schedule` ([`forward.hip`](../src/hip/forward.hip)). In order:
+Overlap is bounded by how often the host has to stop and look at the device. Per layer there are three
+host-side stream synchronisations. One (`hipStreamSynchronize(memory_stream)`) sits in
+`getp_forward_120b` itself; the other two are the `sync_workers` barriers
+([`forward.hip`](../src/hip/forward.hip)). In order:
 
-| Site                                                                                | Why                                                   |
-| ----------------------------------------------------------------------------------- | ----------------------------------------------------- |
-| `hipStreamSynchronize(memory_stream)`, after the hidden-state and top-k peer copies | the peer copies must land before the barrier          |
-| `sync_workers`, before the barrier                                                  | compute-stream drain before the barrier               |
-| inside `build_moe_buckets_local_pos`                                                | reads the expert-offset array to compute `cap_pairs`  |
-| the `hipMemcpyAsync` of `total_pairs` into a stack `int`                            | grid size for the scatter kernel                      |
-| inside `build_moe_block_schedule`, called for MLP1                                  | reads `total_blocks` to size the bucketed MLP1 launch |
-| `sync_workers`, after the MoE aggregate                                             | compute-stream drain after the MoE aggregate          |
+| Site                                                                                | Why                                          |
+| ----------------------------------------------------------------------------------- | -------------------------------------------- |
+| `hipStreamSynchronize(memory_stream)`, after the hidden-state and top-k peer copies | the peer copies must land before the barrier |
+| `sync_workers`, before the barrier                                                  | compute-stream drain before the barrier      |
+| `sync_workers`, after the MoE aggregate                                             | compute-stream drain after the MoE aggregate |
 
-The MoE read-backs are not laziness. Block counts depend on data-dependent expert occupancy — how
-many of the `EXPERT_PARALLELISM × BATCH_SIZE × 4` (token, expert) pairs landed on each of this
-device's 16 experts — and the launch geometry for the bucketed MLP kernels is sized from that count
-at `MATMUL_MLP1_BLOCK_ROWS = MATMUL_MLP2_BLOCK_ROWS = 128` rows per block, one schedule serving
-both MLP kernels. The code acknowledges the cost in place:
-
-```cpp
-// TODO: get rid of stream synchronize,
-// although the synchorization is not a big bottleneck
-```
-
-A device-side launch or a persistent kernel would remove them; neither is implemented.
-
-The `total_pairs` row is the odd one out and deserves a note, because it reads like a bug and is not
-one. The copy is asynchronous and has no synchronize of its own, yet `total_pairs` is consumed on
-the host a few lines later as the grid extent for
-`moe_scatter_acts_to_expert_frombf16`. What makes that safe is the call in between:
-`build_moe_block_schedule` is issued on the same `compute_stream` and ends in
-`hipStreamSynchronize(stream)` ([`forward.hip`](../src/hip/forward.hip)), which drains the
-earlier copy as well. The dependency is real but implicit — delete or reorder the schedule build and
-the scatter kernel silently gets a stale grid size.
+There used to be three more, all MoE read-backs — the expert-offset array for `cap_pairs`, `total_pairs`
+for the scatter grid and `total_blocks` for the bucketed GEMM grids. Block counts depend on
+data-dependent expert occupancy, but the grids no longer need the exact count: they are sized from the
+host-constant worst case (`EXPERT_PARALLELISM × BATCH_SIZE × 4` pairs, `(max_pairs + BM − 1)/BM + E`
+tiles) and the surplus workgroups exit on their first branch. The device queue no longer empties three
+times per layer, which measured as +1.0 % of throughput at 1024 steps with bit-identical output.
 
 ### Allocator round-trips
 
@@ -647,8 +628,8 @@ shipped one runs. Working backwards from the published figures:
 | ----------------------------------------------------- | ----------- | ----------- |
 | Sequences in flight                                   | 12288       | 6144        |
 | Forward passes (`-n 1024`, `while (pos + 1 < steps)`) | 1023        | 1023        |
-| Measured throughput                                   | 62937 tok/s | 20293 tok/s |
-| Implied token-step time                               | 190 ms      | 293 ms      |
+| Measured throughput                                   | 63444 tok/s | 20605 tok/s |
+| Implied token-step time                               | 188 ms      | 288 ms      |
 | Barrier crossings per step                            | 49          | 73          |
 | Host stream syncs per step                            | ≈ 145       | ≈ 217       |
 

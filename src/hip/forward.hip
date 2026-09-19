@@ -272,20 +272,19 @@ __global__ void moe_blocks_per_expert_kernel(const int *offsets, int E, int BM,
   blk_counts[e] = (n + BM - 1) / BM;
 }
 
+// Tra ve CAN TREN cua so block, tinh tren host tu hang so, thay cho viec doc
+// blk_offsets[E] ve (mot lan drain stream moi lop). Moi expert lam tron len
+// toi da 1 block, nen (max_pairs + BM - 1)/BM + E luon du. Ca hai kernel MoE
+// thoat ngay o `if (base_all >= n) return;` voi block vuot tong that.
 static inline int build_moe_block_schedule(const int *offsets, int E, int BM,
                                            int *blk_counts, int *blk_offsets,
-                                           hipStream_t stream) {
+                                           int max_pairs, hipStream_t stream) {
 
   dim3 b(256), g((E + b.x - 1) / b.x);
   moe_blocks_per_expert_kernel<<<g, b, 0, stream>>>(offsets, E, BM, blk_counts);
   exclusive_scan_small_kernel<<<dim3(1), dim3(256), sizeof(int) * 256,
                                 stream>>>(blk_counts, blk_offsets, E);
-  int total_blocks = 0;
-  HIP_CHECK(hipMemcpyAsync(&total_blocks, blk_offsets + E, sizeof(int),
-                           hipMemcpyDeviceToHost, stream));
-  HIP_CHECK(hipStreamSynchronize(stream));
-
-  return total_blocks;
+    return (max_pairs + BM - 1) / BM + E;
 }
 
 __global__ void moe_fill_local_pos_kernel(const int *local_ids,
@@ -321,21 +320,13 @@ static inline int build_moe_buckets_local_pos(
                                                             B, K, E, e_counts);
   exclusive_scan_small_kernel<<<dim3(1), dim3(256), sizeof(int) * 256,
                                 stream>>>(e_counts, e_offsets, E);
-  std::vector<int> h_off(E + 1);
-  HIP_CHECK(hipMemcpyAsync(h_off.data(), e_offsets, sizeof(int) * (E + 1),
-                           hipMemcpyDeviceToHost, stream));
-  // TODO: get rid of stream synchronize,
-  // although the synchorization is not a big bottleneck
-  HIP_CHECK(hipStreamSynchronize(stream));
-  int cap_pairs = 0;
-  for (int i = 0; i < E; ++i)
-    cap_pairs = MAX(cap_pairs, h_off[i + 1] - h_off[i]);
+    // Khong doc e_offsets ve host nua: gia tri duy nhat no phuc vu (cap_pairs)
+  // khong ai dung, ma moi lan doc la mot lan drain compute_stream giua lop.
   HIP_CHECK(hipMemsetAsync(e_counts, 0, sizeof(int) * E, stream));
   moe_fill_local_pos_kernel<<<dim3(B), dim3(128), 0, stream>>>(
       local_ids, local_wts, n_local, B, K, E, e_offsets, e_counts, tok_idx_out,
       w_out, pair_pos);
-
-  return cap_pairs;
+  return 0;
 }
 
 __device__ inline uint4 pack8_f32_to_bf16(float4 a, float4 b) {
@@ -384,9 +375,9 @@ static inline void moe_scatter_acts_to_expert_bf16(__hip_bfloat16 *a_in,
 
 __global__ void moe_scatter_acts_to_expert_frombf16_kernel(
   __hip_bfloat16 *a_in, const __hip_bfloat16 *x_bf16,
-  const int *tok_idx, int total_pairs, int H) {
+  const int *tok_idx, const int *total_pairs_dev, int H) {
 int pos = blockIdx.x;
-if (pos >= total_pairs) return;
+if (pos >= *total_pairs_dev) return;   // can doc tu device, khong drain host
 int b = tok_idx[pos];
 const __hip_bfloat16 *src = x_bf16 + (size_t)b * H;
 __hip_bfloat16 *dst = a_in + (size_t)pos * H;
@@ -404,10 +395,10 @@ for (int kk = H8 + t; kk < H; kk += blockDim.x)
 
 static inline void moe_scatter_acts_to_expert_frombf16(
   __hip_bfloat16 *a_in, const __hip_bfloat16 *x_bf16, const int *tok_idx,
-  int total_pairs, int H, hipStream_t stream) {
-dim3 block(256), grid(total_pairs);
+  const int *total_pairs_dev, int max_pairs, int H, hipStream_t stream) {
+dim3 block(256), grid(max_pairs);
 moe_scatter_acts_to_expert_frombf16_kernel<<<grid, block, 0, stream>>>(
-    a_in, x_bf16, tok_idx, total_pairs, H);
+    a_in, x_bf16, tok_idx, total_pairs_dev, H);
 }
 
 // Padding truc nhanh cua tile LDS trong hai kernel MoE. Truoc day hang so 8
@@ -4744,26 +4735,21 @@ int *getp_forward_120b(Transformer * /*transformer*/,
 
     int experts_per_device = worker->expert_end - worker->expert_start;
 
-    int cap_pairs = build_moe_buckets_local_pos(
+    build_moe_buckets_local_pos(
         ext->local_ids, ext->local_wts, ext->n_local,
         EXPERT_PARALLELISM * BATCH_SIZE, p->experts_per_token,
         experts_per_device, ext->e_counts, ext->e_offsets, ext->e_dev,
         ext->w_dev, ext->pair_pos, compute_stream);
 
-    int total_pairs = 0;
-    HIP_CHECK(hipMemcpyAsync(&total_pairs, ext->e_offsets + experts_per_device,
-                             sizeof(int), hipMemcpyDeviceToHost,
-                             compute_stream));
-
     int total_blocks_mlp1 = build_moe_block_schedule(
       ext->e_offsets, experts_per_device, MATMUL_MLP1_BLOCK_ROWS,
-      ext->blk_counts, ext->blk_offsets, compute_stream);
+      ext->blk_counts, ext->blk_offsets,
+      EXPERT_PARALLELISM * BATCH_SIZE * p->experts_per_token, compute_stream);
 
   moe_scatter_acts_to_expert_frombf16(
-      ext->a_in,
-      ext->ext_t_bf16,
-      ext->e_dev,
-      total_pairs, hidden_dim, compute_stream);
+      ext->a_in, ext->ext_t_bf16, ext->e_dev,
+      ext->e_offsets + experts_per_device, EXPERT_PARALLELISM * BATCH_SIZE * p->experts_per_token,
+      hidden_dim, compute_stream);
 
   // (memset 35,4 MB da bo: moe_gather_pairs gio ghi de toan bo vung nay)
 
@@ -4784,7 +4770,8 @@ int *getp_forward_120b(Transformer * /*transformer*/,
   // nen kernel nay khong the chay truoc khi mlp1 doc xong.
   int total_blocks_mlp2 = build_moe_block_schedule(
       ext->e_offsets, experts_per_device, MATMUL_MLP2_BLOCK_ROWS,
-      ext->blk_counts, ext->blk_offsets, compute_stream);
+      ext->blk_counts, ext->blk_offsets,
+      EXPERT_PARALLELISM * BATCH_SIZE * p->experts_per_token, compute_stream);
 #else
   const int total_blocks_mlp2 = total_blocks_mlp1;
 #endif
@@ -4995,7 +4982,7 @@ int *getp_forward_20b(Transformer * /*transformer*/,
 
     int experts_per_device = worker->expert_end - worker->expert_start;
 
-    int cap_pairs = build_moe_buckets_local_pos(
+    build_moe_buckets_local_pos(
         ext->local_ids, ext->local_wts, ext->n_local, batch_size,
         p->experts_per_token, experts_per_device, ext->e_counts, ext->e_offsets,
         ext->e_dev, ext->w_dev, ext->pair_pos, nullptr);
@@ -5010,7 +4997,8 @@ int *getp_forward_20b(Transformer * /*transformer*/,
     // Change because mlp1 and mlp2 have the same block rows
     int total_blocks_mlp = build_moe_block_schedule(
       ext->e_offsets, experts_per_device, MATMUL_MLP1_BLOCK_ROWS,
-      ext->blk_counts, ext->blk_offsets, nullptr);
+      ext->blk_counts, ext->blk_offsets,
+      EXPERT_PARALLELISM * BATCH_SIZE * p->experts_per_token, nullptr);
 
   moe_scatter_acts_to_expert_bf16(
       ext->a_in, dev_s->t, ext->e_dev,

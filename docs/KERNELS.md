@@ -618,11 +618,12 @@ EP = 8 — so there is headroom.
 ### One kernel for all experts
 
 `build_moe_block_schedule` computes `blk_counts[e] = ceil(n_e / BM)` for the caller's `BM` and
-exclusive-scans it, so `blk_offsets[E]` is the total number of BM-row tiles over all experts — 128-row
-tiles for MLP1, 96-row tiles for MLP2. Both expert GEMMs then launch
-exactly once, each with `grid.y` set to its own `total_blocks`. Inside the kernel, each workgroup
-recovers its own
-(expert, tile) pair by binary search:
+exclusive-scans it, so `blk_offsets[E]` is the total number of 128-row tiles over all experts. Both
+expert GEMMs then launch exactly once, with `grid.y` set not to that total — reading it back would
+drain the stream — but to the host-computable upper bound `(max_pairs + BM − 1) / BM + E`, which the
+per-expert rounding can at most reach; workgroups past the real total find `base_all >= n` and exit
+before touching memory. Inside the kernel, each workgroup recovers its own (expert, tile) pair by
+binary search:
 
 ```c
 int by = blockIdx.y;
@@ -682,26 +683,21 @@ above is the weight-row count, not this one — and MLP2 covers its 2880 in exac
 
 The design is not free, and the costs concentrate in two places.
 
-**Host synchronization.** Each MoE layer pays four device-to-host reads: `h_off` inside
-`build_moe_buckets_local_pos` (which carries its own `TODO: get rid of stream synchronize`),
-`total_pairs` before the activation scatter, and `total_blocks` inside `build_moe_block_schedule` —
-which now runs twice per layer, once for MLP1's 128-row tiling and once for MLP2's 96-row tiling. Three
-of the four are explicitly blocking. The bucket sizes have to reach the host because the grid extents
-depend on them, which is the price of a data-dependent schedule. The first read is currently free to
-delete: its only product is `cap_pairs`, the largest bucket size, which is assigned and never read on
-any live path.
-
-The `total_pairs` read is not a cost but a hazard, and belongs in a different column. It is copied
-with `hipMemcpyAsync` on `compute_stream` and read on the host a dozen lines later as the grid extent of
-`moe_scatter_acts_to_expert_frombf16`, with nothing waiting on
-that copy in between. It is correct today only by accident of ordering: the `build_moe_block_schedule`
-call sitting between the two ends in `hipStreamSynchronize(compute_stream)`, which drains the copy as a
-side effect. Move the scatter above that call, or make the block schedule non-blocking, and the scatter
-launches with an uninitialised grid size — a silent wrong answer, not a crash. The same pattern without
-the accidental rescue is in `launch_mlp2_partial_bf16_bucketed_frombf16`, where `total_pairs` is
-copied and used on the very next line to size a `hipMemsetAsync`; that branch needs `splits > 1`, which
-the shipped batch sizes never produce, which is why it has never bitten. The dead `getp_forward_20b`
-uses the blocking `hipMemcpy` at the same place and is, on this one point, the sounder code.
+**Host synchronization.** Each MoE layer used to pay three device-to-host reads: `h_off` inside
+`build_moe_buckets_local_pos`, `total_pairs` before the activation scatter, and `total_blocks` inside
+`build_moe_block_schedule` — each a drain of `compute_stream` in the middle of the layer. None remains.
+The first only ever produced `cap_pairs`, which was assigned and never read on any live path. The other
+two sized launch grids from data-dependent bucket counts; both grids are now sized from the
+host-constant worst case `EXPERT_PARALLELISM × BATCH_SIZE × experts_per_token` — the scatter reads
+`e_offsets[E]` on the device and returns for `pos` beyond it, and the block schedule returns
+`(max_pairs + BM − 1) / BM + E` (see above). The surplus workgroups exit at their first branch; what
+the device gains is a queue that never empties between kernels, measured at +1.0 % of throughput at
+1024 steps (63 444 against 62 793 tok/s, two interleaved pairs) with bit-identical output. It also
+retires a hazard: the old `total_pairs` copy was `hipMemcpyAsync` into a stack `int` with nothing
+waiting on it, correct only because the block-schedule call in between happened to end in a
+`hipStreamSynchronize`. The one read of that shape left is in
+`launch_mlp2_partial_bf16_bucketed_frombf16`, now a synchronous `hipMemcpy`, on a branch that needs
+`splits > 1` and that `MATMUL_MLP2_MAX_SPLITS = 1` never takes.
 
 **Worst-case allocation.** All pair-indexed buffers are sized for
 `EXPERT_PARALLELISM × BATCH_SIZE × experts_per_token`, the case where every token routes all four of its
