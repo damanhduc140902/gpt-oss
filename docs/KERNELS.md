@@ -106,6 +106,20 @@ for most of this work; the split-K section below records why it does not. The ro
 32 × 32 × 32 with a 16 × 16 wave tile because its $\text{N}$ is only the expert count — 32 for 20b, 128
 for 120b — and a wider tile would mask off most of its own output.
 
+Inside the k-loop MLP2 now reads its LDS fragments one 16-wide k step ahead into a second register
+set, and pins the order the scheduler emits with `__builtin_amdgcn_sched_group_barrier`: the six
+fragment reads of the first sub-step, then one `ds_read` after every three MFMAs for the second, then the
+remaining MFMAs, closed by `__builtin_amdgcn_sched_barrier(0)` so nothing sinks below the barrier. Left
+to itself the compiler placed each second-sub-step read directly before the MFMA that consumed it, and the
+ISA read `s_waitcnt, mfma, s_waitcnt, mfma` eight times per k step — each MFMA paying a full LDS latency.
+Pinned, the same arithmetic in the same order runs 1 272 → 1 172 µs per call at 1024 steps (−7.9 %),
+bit-exact. The identical treatment on MLP1 did not help — every variant landed within ±3 % of the
+unpinned kernel — so MLP1 keeps the compiler's schedule. The epilogue was also rewritten to load its
+six bias values and sixteen row weights once, up front: the old form compiled to 8 100 instructions
+(192 `atomic_cmpswap` loops for a split-K branch that never runs, 400 scalar loads behind per-row
+`continue`s), the new one to 1 569 — no measurable speed change, since that code never executed, but a
+kernel one can read.
+
 The logits GEMM is the extreme case in the other direction. At $\text{N}=201088$ its grid is
 $\lceil 201088/128 \rceil = 1571$ column tiles wide, so occupancy is never in question and the design
 question is purely how to avoid writing the result (see [Fused epilogues](#fused-epilogues)).

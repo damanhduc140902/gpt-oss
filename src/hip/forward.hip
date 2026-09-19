@@ -1287,46 +1287,58 @@ mlp2_partial_bf16_bucketed_splitk_kernel_inbf16_tuned(
       }
     }
 
-    // MFMA ILP optimization for MLP2: Pre-load all vectors
+    // ---- Tinh: doc frag LDS cua substep k+16 TRUOC chuoi MFMA cua substep k ----
+    // Xem ghi chu cung ten trong mlp1: do tre ds_read -> s_waitcnt -> MFMA chay
+    // noi tiep la phan lon thoi gian kernel; hai bo dem frag trong thanh ghi de
+    // ds_read cua substep sau phat truoc MFMA cua substep truoc. Bit-exact.
+    bf16x4 fa[2][nIterM];
+    bf16x4 fb[2][BN_AGG][nIterN];
+    auto load_frags = [&](int k, int buf) {
+      const int kslot = (k >> 2) + yMF;
+      #pragma unroll
+      for (int im = 0; im < nIterM; ++im)
+        fa[buf][im] = sxs[kslot * SM + yTile * WM + im * 16 + xMF];          // ds_read_b64
+      #pragma unroll
+      for (int g = 0; g < BN_AGG; ++g) {
+        #pragma unroll
+        for (int in = 0; in < nIterN; ++in)
+          fb[buf][g][in] = sws[kslot * SN + xTile * WN + xMF + g * BN + in * 16]; // ds_read_b64
+      }
+    };
+    load_frags(0, 0);
     #pragma unroll
     for (int k = 0; k < BK; k += 16) {
-      // basek = k + 4*yMF luon chia het 4 -> plane k0 = basek/4 = (k>>2) + yMF;
-      // 4 phan tu mot lane can (k..k+3 cua CUNG mot hang) nam gon trong mot o.
-      const int kslot = (k >> 2) + yMF;
-
-      // Pre-load all activation vectors
-      bf16x4 av_array[nIterM];
+      const int cur = (k / 16) & 1;
+      if (k + 16 < BK) load_frags(k + 16, cur ^ 1);
       #pragma unroll
       for (int im = 0; im < nIterM; ++im) {
-        const int row = yTile * WM + im * 16 + xMF;
-        av_array[im] = sxs[kslot * SM + row];              // 1 x ds_read_b64
-      }
-
-      // Compute with improved ILP
-      #pragma unroll
-      for (int im = 0; im < nIterM; ++im) {
-        const bf16x4 av = av_array[im];
-
         #pragma unroll
         for (int g = 0; g < BN_AGG; ++g) {
-          const int col_base = xTile * WN + xMF + g * BN;
-
-          // Pre-load all weight vectors
-          bf16x4 bv_array[nIterN];
           #pragma unroll
-          for (int in = 0; in < nIterN; ++in) {
-            const int c = col_base + in * 16;
-            bv_array[in] = sws[kslot * SN + c];                // 1 x ds_read_b64
-          }
-
-          // Execute MFMAs with all data in registers
-          #pragma unroll
-          for (int in = 0; in < nIterN; ++in) {
-            d_acc[g][im][in] = __builtin_amdgcn_mfma_f32_16x16x16bf16_1k(av, bv_array[in], d_acc[g][im][in], 0, 0, 0);
-          }
+          for (int in = 0; in < nIterN; ++in)
+            d_acc[g][im][in] = __builtin_amdgcn_mfma_f32_16x16x16bf16_1k(fa[cur][im], fb[cur][g][in], d_acc[g][im][in], 0, 0, 0);
         }
       }
     }
+    // Ep lich cho scheduler cua vung nay: doc 6 frag substep 0 truoc, roi cu 3 MFMA xen 1
+    // ds_read cua substep 1, MFMA con lai don cuoi. Khong ep thi compiler keo ds_read sat
+    // cho dung -> moi MFMA sau do cho tron mot luot tre LDS (ISA: W M W M ...). Do: mlp2
+    // 1.272 -> 1.172 us/goi (-7,9 %), bit-exact. Rao lich cuoi de MFMA khong chim qua barrier.
+    __builtin_amdgcn_sched_group_barrier(0x0100, 6, 0);
+    __builtin_amdgcn_sched_group_barrier(0x0008, 3, 0);
+    __builtin_amdgcn_sched_group_barrier(0x0100, 1, 0);
+    __builtin_amdgcn_sched_group_barrier(0x0008, 3, 0);
+    __builtin_amdgcn_sched_group_barrier(0x0100, 1, 0);
+    __builtin_amdgcn_sched_group_barrier(0x0008, 3, 0);
+    __builtin_amdgcn_sched_group_barrier(0x0100, 1, 0);
+    __builtin_amdgcn_sched_group_barrier(0x0008, 3, 0);
+    __builtin_amdgcn_sched_group_barrier(0x0100, 1, 0);
+    __builtin_amdgcn_sched_group_barrier(0x0008, 3, 0);
+    __builtin_amdgcn_sched_group_barrier(0x0100, 1, 0);
+    __builtin_amdgcn_sched_group_barrier(0x0008, 3, 0);
+    __builtin_amdgcn_sched_group_barrier(0x0100, 1, 0);
+    __builtin_amdgcn_sched_group_barrier(0x0008, 30, 0);
+    __builtin_amdgcn_sched_barrier(0);
     __syncthreads();
 
     if (bk + BK < kEnd) {
@@ -1365,37 +1377,80 @@ mlp2_partial_bf16_bucketed_splitk_kernel_inbf16_tuned(
     __syncthreads();
   }
 
+  // ---- Epilogue -------------------------------------------------------------
+  // Ban cu nap bias va w_by_bucket NGAY trong vong ghi, sau cac nhanh `continue`
+  // theo hang: ISA ra 208 global_load_dword + 192 global_load_ushort + 784
+  // s_waitcnt noi tiep, cong 192 vong CAS cua atomicAdd float cho nhanh split-K
+  // - 8.102 lenh chay mot lan moi block, dai hon ca vong chinh. O day moi lane
+  // nap 6 bias va 16 trong so hang MOT LAN, roi chi con phep tinh va ghi.
+  // Thu tu so hoc giu nguyen ((acc + bias) * w) nen ket qua bit-exact.
   const int xD = lane & 15;
   const int yD = 4 * (lane >> 4);
+  const int colBaseLane = blockIdx.x * (BN * BN_AGG) + xTile * WN + xD;
 
-  // Optimized output with full unroll
+  float bia[BN_AGG][nIterN];
+  #pragma unroll
+  for (int g = 0; g < BN_AGG; ++g) {
+    #pragma unroll
+    for (int in = 0; in < nIterN; ++in) {
+      const int col = colBaseLane + in * 16 + g * BN;
+      bia[g][in] = (B2 && col < H) ? __bfloat162float(B2[b2_e + col]) : 0.f;
+    }
+  }
+  float wrow[nIterM][4];
+  #pragma unroll
+  for (int im = 0; im < nIterM; ++im) {
+    #pragma unroll
+    for (int i = 0; i < 4; ++i) {
+      const int row = yTile * WM + im * 16 + (yD + i);
+      wrow[im][i] = (row < tcnt) ? w_by_bucket[base + row] : 0.f;
+    }
+  }
+
+#if MATMUL_MLP2_MAX_SPLITS > 1
+  if (splits > 1) {
+    // Split-K: cong don bang atomic; bias chi cong o lat cat z = 0.
+    #pragma unroll
+    for (int im = 0; im < nIterM; ++im) {
+      #pragma unroll
+      for (int i = 0; i < 4; ++i) {
+        const int row = yTile * WM + im * 16 + (yD + i);
+        if (row >= tcnt) continue;
+        float* output_row = z_partial + (size_t)(base + row) * (size_t)H;
+        const float w = wrow[im][i];
+        #pragma unroll
+        for (int g = 0; g < BN_AGG; ++g) {
+          #pragma unroll
+          for (int in = 0; in < nIterN; ++in) {
+            const int col = colBaseLane + in * 16 + g * BN;
+            if (col >= H) continue;
+            const float b = (blockIdx.z == 0) ? bia[g][in] : 0.f;
+            atomicAdd(output_row + col, (d_acc[g][im][in][i] + b) * w);
+          }
+        }
+      }
+    }
+    return;
+  }
+#else
+  (void)splits;
+#endif
+
   #pragma unroll
   for (int im = 0; im < nIterM; ++im) {
     #pragma unroll
     for (int i = 0; i < 4; ++i) {
       const int row = yTile * WM + im * 16 + (yD + i);
       if (row >= tcnt) continue;
-
-      const int pos = base + row;
-      const float w = w_by_bucket[pos];
-      float* output_row = z_partial + (size_t)pos * (size_t)H;
-
+      float* output_row = z_partial + (size_t)(base + row) * (size_t)H;
+      const float w = wrow[im][i];
       #pragma unroll
       for (int g = 0; g < BN_AGG; ++g) {
         #pragma unroll
         for (int in = 0; in < nIterN; ++in) {
-          const int col = blockIdx.x * (BN * BN_AGG) + xTile * WN + in * 16 + xD + g * BN;
+          const int col = colBaseLane + in * 16 + g * BN;
           if (col >= H) continue;
-
-          const float bia = (B2 && splits == 1) ? __bfloat162float(B2[b2_e + col]) : 0.f;
-          float* dst = output_row + col;
-
-          if (splits == 1) {
-            *dst = (d_acc[g][im][in][i] + bia) * w;
-          } else {
-            atomicAdd(dst, d_acc[g][im][in][i] * w);
-            if (blockIdx.z == 0 && B2) atomicAdd(dst, __bfloat162float(B2[b2_e + col]) * w);
-          }
+          output_row[col] = (d_acc[g][im][in][i] + bia[g][in]) * w;
         }
       }
     }
