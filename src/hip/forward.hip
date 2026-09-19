@@ -4561,6 +4561,41 @@ static inline void getp_argmax_rows(const float *logits, int V, int *out, int B,
 
 }
 
+// Bat mac dinh: do 8 GPU / 1024 buoc, hai luot xen ke -> 64.143 vs 62.894 tok/s (+2,0 %),
+// dau ra bit-exact. Dat -DGETP_DEVSYNC=0 de quay lai hang rao cu.
+#ifndef GETP_DEVSYNC
+#define GETP_DEVSYNC 1
+#endif
+
+#if GETP_DEVSYNC
+// Event "da toi diem nay" cua tung thiet bi, mot khe cho moi (lop, pha). Thiet bi khac cho tren
+// event nay bang hipStreamWaitEvent thay vi doi host vat can hang doi.
+#define GETP_SYNC_SLOTS 128
+static hipEvent_t g_ev_sync[MAXIMUM_GPU][GETP_SYNC_SLOTS];
+static bool g_ev_sync_ready[MAXIMUM_GPU] = {false};
+
+// rec_stream: stream da GHI du lieu ma peer sap doc. wait_stream: stream se DOC du lieu cua peer
+// (o day la memory_stream, noi cac hipMemcpyPeerAsync chay) - cho tren dung stream do moi dung.
+static inline void sync_workers_dev(hipStream_t rec_stream, hipStream_t wait_stream,
+                                    Barrier &sync_point,
+                                    int dev, int n_dev, int base_dev, int slot) {
+  if (!g_ev_sync_ready[dev]) {
+    for (int i = 0; i < GETP_SYNC_SLOTS; ++i)
+      HIP_CHECK(hipEventCreateWithFlags(&g_ev_sync[dev][i], hipEventDisableTiming));
+    g_ev_sync_ready[dev] = true;
+    HIP_CHECK(hipStreamSynchronize(rec_stream));
+    sync_point.wait();          // moi thiet bi da tao xong event cua minh
+  }
+  const int k = slot % GETP_SYNC_SLOTS;
+  HIP_CHECK(hipEventRecord(g_ev_sync[dev][k], rec_stream));
+  sync_point.wait();            // chi dong bo HOST: moi thread da phat event cua no
+  for (int i = 0; i < n_dev; ++i) {
+    const int pd = base_dev + i;
+    if (pd != dev) HIP_CHECK(hipStreamWaitEvent(wait_stream, g_ev_sync[pd][k], 0));
+  }
+}
+#endif
+
 inline void sync_workers(hipStream_t stream, Barrier &sync_point) {
   /**
     This implement makes sure that threads are synchronized to this point,
@@ -4747,7 +4782,12 @@ int *getp_forward_120b(Transformer * /*transformer*/,
     // dau tien o a_in sau scatter trong khi topk va attention cua chinh no khop. Acquire
     // phia nhan (wait event cua peer) va bo nho fine-grained deu khong chua. Pull tren
     // queue cua thiet bi nhan + event la mau ma duong e_agg dung va do sach.
+#if GETP_DEVSYNC
+    sync_workers_dev(compute_stream, memory_stream, sync_point, device_index,
+                     EXPERT_PARALLELISM, base_device_index, 2 * (int)l + 0);
+#else
     sync_workers(compute_stream, sync_point);
+#endif
     HIP_CHECK(hipSetDevice(device_index));
     for (int delta = 1, j = 0; delta < EXPERT_PARALLELISM; ++delta) {
       int i = (device_index + delta) % EXPERT_PARALLELISM;
@@ -4843,7 +4883,12 @@ int *getp_forward_120b(Transformer * /*transformer*/,
                          p->experts_per_token, EXPERT_PARALLELISM * BATCH_SIZE,
                          compute_stream);
 
+#if GETP_DEVSYNC
+    sync_workers_dev(compute_stream, memory_stream, sync_point, device_index,
+                     EXPERT_PARALLELISM, base_device_index, 2 * (int)l + 1);
+#else
     sync_workers(compute_stream, sync_point);
+#endif
 
     for (int delta = 1, j = 0; delta < EXPERT_PARALLELISM; ++delta) {
       int i = (device_index + delta) % EXPERT_PARALLELISM;

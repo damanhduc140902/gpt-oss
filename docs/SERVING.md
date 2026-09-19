@@ -4,7 +4,7 @@
 server: the whole workload is known before the first token is produced, every request is resident on
 a GPU for the entire run, and the schedule is frozen at start-up. There is no queue, no continuous
 batching, no eviction and no work stealing. That closed-world assumption is what makes 12288
-sequences advance in lockstep at 62841 tokens per second on eight MI250 GCDs, and it is also the
+sequences advance in lockstep at 64143 tokens per second on eight MI250 GCDs, and it is also the
 source of every limitation described on this page. The machinery lives in five places:
 [`src/getp/run.cpp`](../src/getp/run.cpp), [`src/getp/transformer.cpp`](../src/getp/transformer.cpp),
 [`src/getp/state_ext.cpp`](../src/getp/state_ext.cpp),
@@ -542,8 +542,13 @@ is part of why the 20B configuration scales so cleanly.
 
 ### Host synchronisations on the critical path
 
-Overlap is bounded by how often the host has to stop and look at the device. Per layer there are two
-host-side stream synchronisations, the two `sync_workers` barriers
+Overlap is bounded by how often the host has to stop and look at the device. Per layer there are two host-side rendezvous, the two `sync_workers` barriers. Neither drains the
+queue any more: each device records an event on the stream that wrote the data, the barrier only
+establishes that every thread has issued its event, and the stream that will read a peer's buffer
+waits on that peer's event (`GETP_DEVSYNC`, on by default). The wait belongs on the reading stream -
+the peer pulls run on `memory_stream`, and putting it on `compute_stream` instead lets them read
+stale data, which showed up as every one of the 6144 output lines differing. Removing the drains was
+worth 2.0 % of throughput with bit-identical output. The two remaining entries
 ([`forward.hip`](../src/hip/forward.hip)). In order:
 
 | Site                                    | Why                                          |
@@ -646,8 +651,8 @@ shipped one runs. Working backwards from the published figures:
 | ----------------------------------------------------- | ----------- | ----------- |
 | Sequences in flight                                   | 12288       | 6144        |
 | Forward passes (`-n 1024`, `while (pos + 1 < steps)`) | 1023        | 1023        |
-| Measured throughput                                   | 62841 tok/s | 19904 tok/s |
-| Implied token-step time                               | 190 ms      | 298 ms      |
+| Measured throughput                                   | 64143 tok/s | 19904 tok/s |
+| Implied token-step time                               | 186 ms      | 298 ms      |
 | Barrier crossings per step                            | 49          | 73          |
 | Host stream syncs per step                            | ≈ 145       | ≈ 217       |
 
