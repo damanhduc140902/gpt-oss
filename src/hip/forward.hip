@@ -459,12 +459,14 @@ moe_scatter_acts_to_expert_frombf16_kernel<<<grid, block, 0, stream>>>(
 #endif
 
 #ifndef MATMUL_MLP2_BLOCK_ROWS
-// 96, not 64 and not 128. mlp2 packs 1.78x less MFMA into each LDS read than
-// mlp1 does (1.50 against 2.67 per ds_read_b64), which is the whole of why it
-// reached 34% of MFMA peak where mlp1 reaches 55%. A taller block raises that
-// ratio. 128 is measurably faster still (+6.9%) but produces WRONG output -
-// see the note on NUM_CTA_MLP2 - so 96 is the tallest block that is bit-exact.
-#define MATMUL_MLP2_BLOCK_ROWS 96
+// 128, not 96. At the old 32 x 32 wave tile mlp2 packed 1.78x less MFMA into
+// each LDS read than mlp1 (1.50 against 2.67 per ds_read_b64) - the whole of
+// why it reached 34% of MFMA peak where mlp1 reaches 55%. The 64 x 32 wave tile
+// that BM=128 allows lifts that to 2.40 (4 A + 6 B reads per 24 MFMA). 128 was
+// long believed to give WRONG output; it does not - the difference was split-K
+// (see MATMUL_MLP2_MAX_SPLITS). With that pinned, 128 is bit-exact with 96 and
+// 3.4% faster end to end (62.9k against 60.8k tok/s, 8 GPU, 1024 steps).
+#define MATMUL_MLP2_BLOCK_ROWS 128
 #endif
 #ifndef MATMUL_MLP2_BLOCK_COLS
 #define MATMUL_MLP2_BLOCK_COLS 64
@@ -473,7 +475,9 @@ moe_scatter_acts_to_expert_frombf16_kernel<<<grid, block, 0, stream>>>(
 #define MATMUL_MLP2_BLOCK_DEPTH 32
 #endif
 #ifndef MATMUL_MLP2_WARP_TILE_M
-#define MATMUL_MLP2_WARP_TILE_M 32
+// 64 with BM=128 keeps 4 waves per block (2x2), so TILE_N stays 256 and the
+// loader strides do not change; each wave then owns 4 MFMA row tiles (nIterM).
+#define MATMUL_MLP2_WARP_TILE_M 64
 #endif
 #ifndef MATMUL_MLP2_WARP_TILE_N
 #define MATMUL_MLP2_WARP_TILE_N 32
@@ -484,22 +488,20 @@ moe_scatter_acts_to_expert_frombf16_kernel<<<grid, block, 0, stream>>>(
 #define MATMUL_MLP2_WAVES_PER_BLOCK (((MATMUL_MLP2_BLOCK_ROWS) / (MATMUL_MLP2_WARP_TILE_M)) * ((MATMUL_MLP2_BLOCK_COLS) / (MATMUL_MLP2_WARP_TILE_N)))
 #endif
 #ifndef NUM_CTA_MLP2
-// The second argument of __launch_bounds__ is a MINIMUM waves-per-SIMD promise,
-// and it does not set occupancy - it DIVIDES THE REGISTER BUDGET. gfx90a has
-// 512 VGPR per lane per SIMD, so promising N waves caps each wave at 512/N.
-//
-// The old value of 4 promised an occupancy LDS can never deliver: this tile
-// needs 16,640 B of LDS, so a CU holds floor(65536/16640) = 3 blocks = 3 waves
-// per SIMD. Occupancy stayed at 3 either way; the only effect of the 4 was to
-// cut the budget from 512/3 = 168 registers down to 128, for nothing. mlp1 has
-// no such mismatch - its LDS allows 2 blocks and NUM_CTA_MLP1 is exactly 2.
-//
-// The previous sweep could not have found this: it tried 2, 4 and 8 only. 8
-// cuts the budget to 64 and spills; 2 lets the compiler take 256 registers,
-// which drops real occupancy to 2 blocks per CU. Both lose, for opposite
-// reasons, and the optimum is 3 - which is not a power of two and so was never
-// on the grid. The rule is floor(65536 / LDS_bytes) * WARPS / 4.
-#define NUM_CTA_MLP2 3
+// SECOND argument of __launch_bounds__ = minimum WAVES PER SIMD, not blocks
+// per CU. 2 leaves 512/2 = 256 VGPRs per lane for the 128x192 tile, whose
+// 3x4x2 f32x4 accumulators alone take 96. 3 (170 VGPRs) measured the same
+// at 128 steps; 2 is what the 8 GPU / 1024 step number was measured with.
+#define NUM_CTA_MLP2 2
+#endif
+// So lat cat split-K toi da cua mlp2. 1 = khong bao gio split. Voi BM=128 co
+// 4/360 launch (cac lop it cap) roi duoi nguong target_cta va se split; khi do
+// z_partial duoc cong bang atomicAdd nen thu tu cong doi theo lich block, sai
+// lech muc lam tron nay khuech dai qua bf16 den lop 23 thi doi routing. Do o
+// 8 GPU / 1024 buoc: split (62.865 tok/s) va khong split (62.899) nhanh nhu
+// nhau, nen chon khong split: dau ra bit-exact voi ban BM=96 va tat dinh.
+#ifndef MATMUL_MLP2_MAX_SPLITS
+#define MATMUL_MLP2_MAX_SPLITS 1
 #endif
 
 
@@ -1477,10 +1479,15 @@ static inline void launch_mlp2_partial_bf16_bucketed_frombf16(
   splits = min(8, max(1, splits));
   const int max_splits_by_K = max(1, (I + BK - 1) / BK);
   splits = min(splits, max_splits_by_K);
+  splits = min(splits, MATMUL_MLP2_MAX_SPLITS);
 
   if (splits > 1) {
     int total_pairs = 0;
-    HIP_CHECK(hipMemcpyAsync(&total_pairs, offsets + E, sizeof(int), hipMemcpyDeviceToHost, stream));
+    // hipMemcpy DONG BO, khong phai Async: total_pairs duoc dung ngay dong sau
+    // tren host de tinh kich co memset. Ban cu dung Async va chi chay dung vi
+    // ROCm sao chep dong bo khi bo nho host la pageable - dua vao dieu do la sai.
+    HIP_CHECK(hipStreamSynchronize(stream));
+    HIP_CHECK(hipMemcpy(&total_pairs, offsets + E, sizeof(int), hipMemcpyDeviceToHost));
     HIP_CHECK(hipMemsetAsync(z_partial, 0, (size_t)total_pairs * (size_t)H * sizeof(float), stream));
   }
 
@@ -1488,13 +1495,9 @@ static inline void launch_mlp2_partial_bf16_bucketed_frombf16(
   using LdsPlan = Mlp2LdsPlan<BM, BNt, BK, MATMUL_MLP2_LDS_PAD_SLOTS>;
   dim3 block(THREADS);
   dim3 grid(max(1, gx), max(1, gy), splits);
-  // __launch_bounds__(TILE_N, NUM_CTA_MLP2): doi so thu hai cua HIP la SO
-  // WAVE TOI THIEU TREN MOI SIMD, khong phai so block tren CU. Voi 256
-  // thread (4 wave/block) va NUM_CTA_MLP2 = 4 thi so block 'hua' la
-  // 4*CTA/WARPS = 4, can 4*16640 = 66560 B > 64 KB, nen LDS van chan o
-  // 3 block/CU (3*16640 = 49920 B) - dung nhu ban cu (3*17408 = 52224 B).
-  // Occupancy KHONG doi, chi du them 2304 B. Ghi ro de lan sau doi tile
-  // khong ai tuong doi so CTA la so block tren CU.
+  // NUM_CTA_MLP2 la so WAVE toi thieu tren moi SIMD (doi so 2 cua
+  // __launch_bounds__), KHONG phai so block tren CU: 2 -> 256 VGPR/lane cho tile
+  // 128x192. LDS lay tu LdsPlan::bytes nen launcher va kernel khong the lech nhau.
   size_t shmem = LdsPlan::bytes;
 
   mlp2_partial_bf16_bucketed_splitk_kernel_inbf16_tuned<BM,BN,BK,WM,WN,BN_AGG,NUM_CTA_MLP2>

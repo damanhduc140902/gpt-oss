@@ -4,7 +4,7 @@
 server: the whole workload is known before the first token is produced, every request is resident on
 a GPU for the entire run, and the schedule is frozen at start-up. There is no queue, no continuous
 batching, no eviction and no work stealing. That closed-world assumption is what makes 12288
-sequences advance in lockstep at 60850 tokens per second on eight MI250 GCDs, and it is also the
+sequences advance in lockstep at 62937 tokens per second on eight MI250 GCDs, and it is also the
 source of every limitation described on this page. The machinery lives in five places:
 [`src/getp/run.cpp`](../src/getp/run.cpp), [`src/getp/transformer.cpp`](../src/getp/transformer.cpp),
 [`src/getp/state_ext.cpp`](../src/getp/state_ext.cpp),
@@ -535,14 +535,13 @@ three helpers it calls — `sync_workers`, `build_moe_buckets_local_pos` and
 | inside `build_moe_buckets_local_pos`                                                | reads the expert-offset array to compute `cap_pairs`                                                     |
 | the `hipMemcpyAsync` of `total_pairs` into a stack `int`                            | grid size for the scatter kernel                                                                         |
 | inside `build_moe_block_schedule`, called for MLP1                                  | reads `total_blocks` to size the bucketed MLP1 launch                                                    |
-| inside `build_moe_block_schedule` a second time, called for MLP2                    | a schedule of its own, because `MATMUL_MLP2_BLOCK_ROWS` (96) differs from `MATMUL_MLP1_BLOCK_ROWS` (128) |
 | `sync_workers`, after the MoE aggregate                                             | compute-stream drain after the MoE aggregate                                                             |
 
 The MoE read-backs are not laziness. Block counts depend on data-dependent expert occupancy — how
 many of the `EXPERT_PARALLELISM × BATCH_SIZE × 4` (token, expert) pairs landed on each of this
 device's 16 experts — and the launch geometry for the bucketed MLP kernels is sized from that count
-at `MATMUL_MLP1_BLOCK_ROWS = 128` rows per block for MLP1 and `MATMUL_MLP2_BLOCK_ROWS = 96` for
-MLP2. The code acknowledges the cost in place:
+at `MATMUL_MLP1_BLOCK_ROWS = MATMUL_MLP2_BLOCK_ROWS = 128` rows per block, one schedule serving
+both MLP kernels. The code acknowledges the cost in place:
 
 ```cpp
 // TODO: get rid of stream synchronize,
@@ -648,8 +647,8 @@ shipped one runs. Working backwards from the published figures:
 | ----------------------------------------------------- | ----------- | ----------- |
 | Sequences in flight                                   | 12288       | 6144        |
 | Forward passes (`-n 1024`, `while (pos + 1 < steps)`) | 1023        | 1023        |
-| Measured throughput                                   | 60850 tok/s | 19837 tok/s |
-| Implied token-step time                               | 202 ms      | 310 ms      |
+| Measured throughput                                   | 62937 tok/s | 20293 tok/s |
+| Implied token-step time                               | 190 ms      | 293 ms      |
 | Barrier crossings per step                            | 49          | 73          |
 | Host stream syncs per step                            | ≈ 145       | ≈ 217       |
 

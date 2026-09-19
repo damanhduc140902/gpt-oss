@@ -92,17 +92,17 @@ in the kernel body. Retuning means editing that struct and recompiling; the LDS 
 
 The pattern is the one blocktiling predicts. Where $\text{M}$, $\text{N}$ and $\text{K}$ are all in the
 thousands, a 128 × 128 block tile with a 64 × 64 wave tile gives the best ratio of matrix-core work to
-LDS traffic. The two MoE kernels no longer share a shape. MLP1 keeps BM = 128 over a 64 × 32 wave tile;
-MLP2 runs BM = 96 over a 32 × 32 wave tile at `BN_AGG = 3`, and it packs 1.78× less matrix-core work
-into each LDS read than MLP1 does — 1.50 against 2.67 MFMA per `ds_read_b64` — which the comment at
-`MATMUL_MLP2_BLOCK_ROWS` ties to its reaching 34 % of MFMA peak where MLP1 reaches 55 %. That ratio is
-fixed by the wave tile and `BN_AGG`, not by the block height: with `nIterM = WM/16 = 2` and
-`nIterN = WN/16 = 2`, one 16-wide k step in MLP2 costs 2 A reads and 6 B reads for
-2 × 3 × 2 = 12 matrix-core instructions, and BM appears in none of those counts. Moving BM from 64 to 96
-changes the wave count per workgroup (4 to 6) and spreads each staged weight tile over more rows; it
-does not move the MFMA-per-`ds_read_b64` figure, whatever the same comment says about taller blocks.
-128 is measurably faster still, by 6.9 %, but produces wrong output, so 96 is the tallest block that is
-bit-exact. The router drops all the way to
+LDS traffic. The two MoE kernels share a block height again. MLP1 keeps BM = 128 over a 64 × 32 wave tile;
+MLP2 runs BM = 128 over a 64 × 32 wave tile at `BN_AGG = 3`. The figure that matters for both is
+matrix-core work per LDS read, and it is fixed by the wave tile and `BN_AGG`, not by the block height:
+one 16-wide k step costs `nIterM = WM/16` A reads and `BN_AGG × nIterN` B reads for
+`nIterM × BN_AGG × nIterN` matrix-core instructions, and BM appears in none of those counts. At the
+32 × 32 wave tile MLP2 shipped with until this pass that was 2 A + 6 B reads for 12 MFMA, 1.50 per
+`ds_read_b64` against MLP1's 2.67 — the whole of why it reached 34 % of MFMA peak where MLP1 reaches
+55 %. Moving BM from 64 to 96 changed the wave count per workgroup (4 to 6) and nothing in that ratio.
+What BM = 128 buys is the 64 × 32 wave tile — 128 divides by 64, 96 does not — and with `nIterM = 4`
+the same k step costs 4 A + 6 B reads for 24 MFMA, 2.40 per read. 128 was held to produce wrong output
+for most of this work; the split-K section below records why it does not. The router drops all the way to
 32 × 32 × 32 with a 16 × 16 wave tile because its $\text{N}$ is only the expert count — 32 for 20b, 128
 for 120b — and a wider tile would mask off most of its own output.
 
@@ -286,16 +286,12 @@ SIMD, not CUDA's blocks per multiprocessor — and it does not grant occupancy, 
 register budget_, capping each wave at 512/N VGPRs. The conversion to workgroups per CU is the one the
 file states next to the logits kernel, `4 * CTA / WARPS_PER_BLOCK`. `NUM_CTA_MLP1 = 2` asks for two
 waves per SIMD — eight per CU, that is two 4-wave workgroups — which is exactly what 24 960 B of LDS
-permits on a 64 KB CU. `NUM_CTA_MLP2` was 4 and is now 3, and the units have to be kept straight to see
-what that did. MLP2's workgroup is six waves, so a CTA of 3 asks for `4 * 3 / 6 = 2` workgroups per CU
-and a CTA of 4 asks for 2.67, while 18 688 B of LDS allows `floor(65536 / 18688) = 3` workgroups — that
-is 18 waves per CU, 4.5 per SIMD, above either promise. LDS is therefore not what rules the old 4 out;
-what the 3 buys is the register cap, 512/3 per lane (168, by the source comment's reckoning) instead of
-512/4 = 128. The comment at `#define NUM_CTA_MLP2` still argues from the retired 16 640 B, 4-wave
-workgroup and concludes that 4 promised an occupancy LDS could never deliver; that conclusion does not
-carry over to the shipped 96 × 192 × 32 `Mlp2LdsPlan` tile, even though the value it lands on is the one
-that ships. The old sweep could not have found 3 in any case, because it tried 2, 4 and 8 and the
-optimum is not a power of two.
+permits on a 64 KB CU. `NUM_CTA_MLP2` is 2 for the 128 × 192 × 32 `Mlp2LdsPlan` tile. The workgroup is four waves, so a CTA of 2
+asks for `4 * 2 / 4 = 2` workgroups per CU, and what it buys is the register cap: 512/2 = 256 VGPRs per
+lane, of which the `3 × 4 × 2` f32x4 accumulators alone take 96. A CTA of 3 (170 VGPRs) measured the same
+at 128 steps; 2 is the value the shipped 1024-step number was taken with. The history is worth one
+sentence: the 96-row, six-wave tile shipped before this ran best at 3, which is not a power of two and so
+was never on the grid of the sweep that tried 2, 4 and 8.
 
 ### The only runtime decision is split-K
 
@@ -321,12 +317,16 @@ $\text{M} \times \text{N} \times \text{splits}$ fp32 scratch with `hipMallocAsyn
 MLP2's split-K is a different mechanism despite the shared heuristic: no scratch allocation and no
 reduction kernel. Partials go straight into the pre-allocated `z_partial`, zeroed by a `hipMemsetAsync`
 when `splits > 1`, the epilogue does an `atomicAdd` into it, and the `blockIdx.z == 0` slice contributes
-the bias exactly once. At shipped batch sizes MLP2's grid is 15 column tiles by roughly 64 (20b) or 32
-(120b) row tiles — 960 and 480 workgroups against the 416 threshold — so `splits` stays 1 and the plain
-store path runs. Split-K there is a small-batch fallback, and whether it engages depends on routing
-rather than on anything static. The 120b margin is thin now that the row tile is 96 rather than 64 rows
-high: 480 against 416, so a routing skew that empties enough experts can tip MLP2 into split-K where the
-old block height could not.
+the bias exactly once. It no longer engages: `MATMUL_MLP2_MAX_SPLITS = 1` pins `splits` to 1, and the
+reason is the one story in this file that took the longest to find. With BM = 128 the row-tile count
+is about 48 on 20b, and a layer whose experts hold only 3072 pairs has 24 tiles × 15 = 360 workgroups,
+under the 416 threshold — so 4 of the 360 MLP2 launches in a step went split-K while the 96-row build
+never did. Their `atomicAdd` partial sums land in whatever order the blocks were scheduled, the
+rounding drift crosses a bf16 boundary a few layers later, and the argmax token flips in about 3 % of
+positions at 16 steps — which read as "BM = 128 is wrong" for days. Pinned, the kernel is bit-exact
+with the 96-row build, and split-K had no speed to sell: 62 865 tok/s with it against 62 899 without.
+The `total_pairs` read that sizes the memset is a synchronous `hipMemcpy` now; the old
+`hipMemcpyAsync` into a stack `int` only worked because ROCm copies synchronously into pageable memory.
 
 One constraint worth recording: both split-K paths compute `kChunk = ceil(K / splits)` without forcing
 any alignment, while the loads are 16-byte vectors guarded by `kk + 7 < kEnd`. At the shipped
@@ -637,13 +637,13 @@ and the grid does not depend on how skewed the routing is. An expert with zero t
 blocks, so `blk_offsets[e] == blk_offsets[e+1]`, and the search — which advances `lo` whenever
 `by >= offs[mid]` — maintains `blk_offs[lo] <= by < blk_offs[lo+1]` and therefore can never land on an
 empty expert. Load imbalance costs at most one partially filled tile per non-empty expert — 128 rows for
-MLP1, 96 for MLP2 — instead of a serialized launch per expert.
+MLP1 and 128 for MLP2 — instead of a serialized launch per expert.
 
-MLP1 and MLP2 need separate schedules now that their block heights differ, 128 against 96: MLP2 decodes
-`blk_offsets` with its own `BM`, so a shared scan would hand it the wrong (expert, tile) pair. A
-`#if MATMUL_MLP2_BLOCK_ROWS != MATMUL_MLP1_BLOCK_ROWS` at the call site builds the second schedule into
-the same buffers, which is safe because everything is on `compute_stream` and MLP1's launch has already
-read them; the `#else` arm reuses one schedule if the two heights are ever made equal again.
+MLP2 decodes `blk_offsets` with its own `BM`, so the two kernels can share a schedule only while their
+block heights agree. They do again, 128 and 128, so the `#else` arm of
+`#if MATMUL_MLP2_BLOCK_ROWS != MATMUL_MLP1_BLOCK_ROWS` runs and one scan serves both launches. Change
+either height and the `#if` arm builds MLP2 a second schedule into the same buffers, which is safe
+because everything is on `compute_stream` and MLP1's launch has already read them.
 
 ### The fused expert GEMMs
 
