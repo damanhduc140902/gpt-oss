@@ -22,6 +22,12 @@ struct RunStateExt {
   // float *ext_gate_up;
   float *ext_t;
   float *ext_e_agg;
+  // Ban thu hai cua ext_e_agg, dung xen ke theo parity lop. Peer keo lat cat
+  // cua no tu buffer nay bang hipMemcpyPeerAsync tren memory_stream, va khong
+  // co gi chan gather cua lop ke tiep ghi de len khi ban sao chua xong. Hai
+  // buffer + barrier moi lop la du: gather(L+2) chi chay sau khi moi peer da
+  // qua barrier cua lop L+1, tuc sau khi ban sao cua lop L da hoan tat.
+  float *ext_e_agg2;
   float *peer_e_agg;
 
   int *blk_counts;
@@ -38,6 +44,7 @@ struct RunStateExt {
 };
 
 void ext_create(int n_devices);
-void ext_alloc_device(int device_index, int batch_size, int expert_parallelism, Config *p);
+void ext_alloc_device(int device_index, int batch_size, int expert_parallelism,
+                      Config *p);
 void ext_free_all(int n_devices);
 RunStateExt *ext_get(int device_index);

@@ -4,7 +4,7 @@
 server: the whole workload is known before the first token is produced, every request is resident on
 a GPU for the entire run, and the schedule is frozen at start-up. There is no queue, no continuous
 batching, no eviction and no work stealing. That closed-world assumption is what makes 12288
-sequences advance in lockstep at 63444 tokens per second on eight MI250 GCDs, and it is also the
+sequences advance in lockstep at 62841 tokens per second on eight MI250 GCDs, and it is also the
 source of every limitation described on this page. The machinery lives in five places:
 [`src/getp/run.cpp`](../src/getp/run.cpp), [`src/getp/transformer.cpp`](../src/getp/transformer.cpp),
 [`src/getp/state_ext.cpp`](../src/getp/state_ext.cpp),
@@ -464,8 +464,29 @@ inline void sync_workers(hipStream_t stream, Barrier &sync_point) {
 
 Synchronize this thread's compute stream, then wait on the barrier. After it returns, this device's
 work is complete _and_ every peer has reached the same point — which is exactly the precondition for
-reading a buffer a peer just wrote by `hipMemcpyPeerAsync`. It runs twice per layer: once after the
-hidden-state and router all-gather, once after the MoE aggregate.
+reading a buffer a peer just wrote by `hipMemcpyPeerAsync`. It runs twice per layer: once before the
+hidden-state and top-k exchange, once after the MoE aggregate.
+
+That precondition is also where the engine's only nondeterminism lived, and it took a hash trace to
+find. Two 8-GPU runs of 12288 sequences for 1024 steps used to agree on somewhere between 50 % and
+95 % of output lines, run pair by run pair. Hashing `dev_x` after every kernel stage of every layer
+in both runs showed six of eight devices bit-identical for the whole run and the divergences arriving
+in EP pairs at the same (step, layer): one device's `a_in` — the activations the scatter kernel
+gathers from the peer's hidden state and top-k — differed while its own attention and its own top-k
+matched, and its partner then diverged one stage later through the aggregate it pulled back. The
+hidden state and top-k were _pushed_: each device copied its slice into the peer's buffer on its own
+`memory_stream` before the barrier. Two receiver-side remedies changed nothing — waiting on the
+sender's event from `compute_stream`, and fine-grained allocation of the target buffers — so the
+exchange now works the way the aggregate always has: after the barrier, each device _pulls_ the
+peer's slice on its own `memory_stream`, records `events_pull[j]`, and `compute_stream` waits on it
+before `getp_map_global_to_local_batch`. With that, the hash trace shows no divergence at any stage
+and two full runs agree on 100.00 % of lines. The price is the lost overlap: 63 342 against 62 841 tok/s on 20B over two interleaved pairs, 0.8 %.
+
+`ext_e_agg`, the buffer the aggregate is pulled from, is additionally two buffers used alternately by
+layer parity (`ext_e_agg2` in `RunStateExt`). Nothing forbids a peer's next-layer
+`moe_gather_pairs_acc` from rewriting the slice a copy is still pulling, so the second buffer closes
+that window by construction; it was not the source of the measured disagreement and had no measured
+effect on throughput.
 
 | Model | Layers | `sync_workers` per layer | Barrier crossings per token step |
 | ----- | ------ | ------------------------ | -------------------------------- |
@@ -493,11 +514,12 @@ Each `DeviceTransformer` creates four non-blocking streams
 Overlap is real but narrow, and it is event-driven rather than stream-priority driven. Two places
 in the layer body actually hide work:
 
-1. **Hidden-state all-gather behind the router GEMM.** `hipEventRecord(event_rmsnorm,
-compute_stream)` is issued right after the FFN rmsnorm; `memory_stream` waits on it and then
-   peer-copies the bf16 hidden state the rmsnorm has already produced, while `compute_stream`
-   proceeds into the router GEMM and top-k (`getp_rmsnorm_f32_bf16`, then the `ext_t_bf16` peer copy
-   in `getp_forward_120b`, [`forward.hip`](../src/hip/forward.hip)). This is the one substantial win.
+1. **Hidden-state and top-k exchange.** These used to be pushed behind the router GEMM — the one
+   substantial overlap in the layer — and are now pulled after the barrier on `memory_stream`, with
+   `compute_stream` waiting on `events_pull[j]` before the bucket build (the loop following the first
+   `sync_workers` in `getp_forward_120b`, [`forward.hip`](../src/hip/forward.hip)). The copy still
+   overlaps nothing else, but it is short: 8.8 MB of bf16 plus two 24 KB top-k arrays per peer. The
+   overlap was given up for determinism; see the barrier section above for why.
 2. **Expert-aggregate reduction interleaved with its copies.** Each peer copy records its own
    `events_e_agg[j]`, and the matching `getp_vecadd` waits only on that one event (the two peer
    loops following `moe_gather_pairs_acc` in `getp_forward_120b`,
@@ -510,10 +532,8 @@ accumulating into it, and this device's own slice is added straight into the res
 `moe_gather_pairs_acc` — which also removed one `getp_vecadd` per layer. There are no zeros left to
 hide.
 
-Against that, the top-k tensors are a missed opportunity: their peer copies are issued on
-`memory_stream` but behind `hipStreamWaitEvent(memory_stream, event_router_topk)`
-([`forward.hip`](../src/hip/forward.hip)), and `event_router_topk` is the last thing the compute
-stream records before the sync. Those copies overlap nothing and sit on the critical path.
+The top-k tensors travel in the same pull, one `hipMemcpyPeerAsync` each for indices and weights,
+behind the same event.
 
 The ordering of the peer copies themselves — `for (delta = 1; delta < EXPERT_PARALLELISM; ++delta)`,
 target `(device_index + delta) % EXPERT_PARALLELISM` — is the full-duplex-friendly ring described in
@@ -522,16 +542,14 @@ is part of why the 20B configuration scales so cleanly.
 
 ### Host synchronisations on the critical path
 
-Overlap is bounded by how often the host has to stop and look at the device. Per layer there are three
-host-side stream synchronisations. One (`hipStreamSynchronize(memory_stream)`) sits in
-`getp_forward_120b` itself; the other two are the `sync_workers` barriers
+Overlap is bounded by how often the host has to stop and look at the device. Per layer there are two
+host-side stream synchronisations, the two `sync_workers` barriers
 ([`forward.hip`](../src/hip/forward.hip)). In order:
 
-| Site                                                                                | Why                                          |
-| ----------------------------------------------------------------------------------- | -------------------------------------------- |
-| `hipStreamSynchronize(memory_stream)`, after the hidden-state and top-k peer copies | the peer copies must land before the barrier |
-| `sync_workers`, before the barrier                                                  | compute-stream drain before the barrier      |
-| `sync_workers`, after the MoE aggregate                                             | compute-stream drain after the MoE aggregate |
+| Site                                    | Why                                          |
+| --------------------------------------- | -------------------------------------------- |
+| `sync_workers`, before the barrier      | compute-stream drain before the barrier      |
+| `sync_workers`, after the MoE aggregate | compute-stream drain after the MoE aggregate |
 
 There used to be three more, all MoE read-backs — the expert-offset array for `cap_pairs`, `total_pairs`
 for the scatter grid and `total_blocks` for the bucketed GEMM grids. Block counts depend on
@@ -628,8 +646,8 @@ shipped one runs. Working backwards from the published figures:
 | ----------------------------------------------------- | ----------- | ----------- |
 | Sequences in flight                                   | 12288       | 6144        |
 | Forward passes (`-n 1024`, `while (pos + 1 < steps)`) | 1023        | 1023        |
-| Measured throughput                                   | 63444 tok/s | 20605 tok/s |
-| Implied token-step time                               | 188 ms      | 288 ms      |
+| Measured throughput                                   | 62841 tok/s | 19904 tok/s |
+| Implied token-step time                               | 190 ms      | 298 ms      |
 | Barrier crossings per step                            | 49          | 73          |
 | Host stream syncs per step                            | ≈ 145       | ≈ 217       |
 

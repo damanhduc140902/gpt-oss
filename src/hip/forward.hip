@@ -4550,11 +4550,14 @@ int *getp_forward_120b(Transformer * /*transformer*/,
   static thread_local hipEvent_t event_rmsnorm = nullptr;
   static thread_local hipEvent_t event_router_topk = nullptr;
   static thread_local hipEvent_t events_e_agg[MAXIMUM_GPU] = {};
+  static thread_local hipEvent_t events_pull[MAXIMUM_GPU] = {};
   if (!event_rmsnorm) {
     HIP_CHECK(hipEventCreateWithFlags(&event_rmsnorm, hipEventDisableTiming));
     HIP_CHECK(hipEventCreateWithFlags(&event_router_topk, hipEventDisableTiming));
-    for (int i = 0; i < EXPERT_PARALLELISM; ++i)
+    for (int i = 0; i < EXPERT_PARALLELISM; ++i) {
       HIP_CHECK(hipEventCreateWithFlags(&events_e_agg[i], hipEventDisableTiming));
+      HIP_CHECK(hipEventCreateWithFlags(&events_pull[i], hipEventDisableTiming));
+    }
   }
 
   HIP_CHECK(hipMemcpyAsync(ext->mask_on, mask_on, sizeof(int) * BATCH_SIZE,
@@ -4682,52 +4685,43 @@ int *getp_forward_120b(Transformer * /*transformer*/,
     HIP_CHECK(hipEventRecord(event_router_topk, compute_stream));
 
     // ext_t_bf16 da duoc rmsnorm ghi trong compute_stream truoc event_rmsnorm.
-    HIP_CHECK(hipStreamWaitEvent(memory_stream, event_rmsnorm));
-
-    for (int delta = 1; delta < EXPERT_PARALLELISM; ++delta) {
-      int i = (device_index + delta) % EXPERT_PARALLELISM;
-      GPUWorker *peer_worker = &workers[i];
-      int peer_device_index = peer_worker->device_index;
-      RunStateExt *peer_ext = ext_get(peer_device_index);
-      if (peer_device_index != device_index) {
-        HIP_CHECK(hipMemcpyPeerAsync(
-            peer_ext->ext_t_bf16 + (size_t)(device_index - base_device_index) * BATCH_SIZE * hidden_dim,
-            peer_device_index,
-            ext->ext_t_bf16 + (size_t)(device_index - base_device_index) * BATCH_SIZE * hidden_dim,
-            device_index,
-            sizeof(__hip_bfloat16) * (size_t)BATCH_SIZE * (size_t)hidden_dim,
-            memory_stream));
-      }
-    }
-
-    HIP_CHECK(hipStreamWaitEvent(memory_stream, event_router_topk));
-    for (int delta = 1; delta < EXPERT_PARALLELISM; ++delta) {
-      int i = (device_index + delta) % EXPERT_PARALLELISM;
-      GPUWorker *peer_worker = &workers[i];
-      int peer_device_index = peer_worker->device_index;
-      RunStateExt *peer_ext = ext_get(peer_device_index);
-      if (peer_device_index != device_index) {
-        HIP_CHECK(hipMemcpyPeerAsync(
-            peer_ext->ext_topk_i + (size_t)(device_index - base_device_index) * BATCH_SIZE * p->experts_per_token,
-            peer_device_index,
-            ext->ext_topk_i + (size_t)(device_index - base_device_index) * BATCH_SIZE * p->experts_per_token,
-            device_index,
-            sizeof(int) * (size_t)BATCH_SIZE * (size_t)p->experts_per_token,
-            memory_stream));
-        HIP_CHECK(hipMemcpyPeerAsync(
-            peer_ext->ext_topk_v + (size_t)(device_index - base_device_index) * BATCH_SIZE * p->experts_per_token,
-            peer_device_index,
-            ext->ext_topk_v + (size_t)(device_index - base_device_index) * BATCH_SIZE * p->experts_per_token,
-            device_index,
-            sizeof(float) * (size_t)BATCH_SIZE * (size_t)p->experts_per_token,
-            memory_stream));
-      }
-    }
-
-    HIP_CHECK(hipStreamSynchronize(memory_stream));
+    // Trao doi hidden-state va top-k bang PULL sau barrier, khong PUSH truoc barrier.
+    // Push (peer copy vao buffer cua ta tren memory_stream cua PEER, roi barrier host)
+    // de lai mot cua so hiem trong do ta doc ext_t_bf16/topk cu: do bang hash 11 moc/lop
+    // tren 2 lan chay 8 GPU, moi lan ~4 su kien, luon theo cap EP cung (buoc, lop), lech
+    // dau tien o a_in sau scatter trong khi topk va attention cua chinh no khop. Acquire
+    // phia nhan (wait event cua peer) va bo nho fine-grained deu khong chua. Pull tren
+    // queue cua thiet bi nhan + event la mau ma duong e_agg dung va do sach.
     sync_workers(compute_stream, sync_point);
     HIP_CHECK(hipSetDevice(device_index));
-
+    for (int delta = 1, j = 0; delta < EXPERT_PARALLELISM; ++delta) {
+      int i = (device_index + delta) % EXPERT_PARALLELISM;
+      GPUWorker *peer_worker = &workers[i];
+      int peer_device_index = peer_worker->device_index;
+      RunStateExt *peer_ext = ext_get(peer_device_index);
+      if (peer_device_index == device_index) continue;
+      const size_t ps = (size_t)(peer_device_index - base_device_index);
+      HIP_CHECK(hipMemcpyPeerAsync(
+          ext->ext_t_bf16 + ps * BATCH_SIZE * hidden_dim, device_index,
+          peer_ext->ext_t_bf16 + ps * BATCH_SIZE * hidden_dim, peer_device_index,
+          sizeof(__hip_bfloat16) * (size_t)BATCH_SIZE * (size_t)hidden_dim, memory_stream));
+      HIP_CHECK(hipMemcpyPeerAsync(
+          ext->ext_topk_i + ps * BATCH_SIZE * p->experts_per_token, device_index,
+          peer_ext->ext_topk_i + ps * BATCH_SIZE * p->experts_per_token, peer_device_index,
+          sizeof(int) * (size_t)BATCH_SIZE * (size_t)p->experts_per_token, memory_stream));
+      HIP_CHECK(hipMemcpyPeerAsync(
+          ext->ext_topk_v + ps * BATCH_SIZE * p->experts_per_token, device_index,
+          peer_ext->ext_topk_v + ps * BATCH_SIZE * p->experts_per_token, peer_device_index,
+          sizeof(float) * (size_t)BATCH_SIZE * (size_t)p->experts_per_token, memory_stream));
+      HIP_CHECK(hipEventRecord(events_pull[j], memory_stream));
+      ++j;
+    }
+    for (int delta = 1, j = 0; delta < EXPERT_PARALLELISM; ++delta) {
+      int i = (device_index + delta) % EXPERT_PARALLELISM;
+      if (workers[i].device_index == device_index) continue;
+      HIP_CHECK(hipStreamWaitEvent(compute_stream, events_pull[j], 0));
+      ++j;
+    }
     getp_map_global_to_local_batch(
         ext->ext_topk_i, ext->ext_topk_v, ext->local_ids, ext->local_wts,
         ext->n_local, p->experts_per_token, worker->expert_start,
@@ -4783,7 +4777,11 @@ int *getp_forward_120b(Transformer * /*transformer*/,
 
     // Lat cat own_slice di thang vao dev_x; cac lat cat khac van ra ext_e_agg
     // vi peer se keo chung. Bo han mot vecadd (doc 17,7 MB + ghi 17,7 MB).
-    moe_gather_pairs_acc(ext->ext_e_agg, dev_x,
+    // Xen ke hai buffer theo parity lop - xem ghi chu o RunStateExt::ext_e_agg2.
+    // Do o 8 GPU / 1024 buoc: cung mot binary chay hai lan tu-khop 49,5 % dong
+    // voi mot buffer, 89,8 % voi hai; throughput khong doi.
+    float *eagg_out = (l & 1) ? ext->ext_e_agg2 : ext->ext_e_agg;
+    moe_gather_pairs_acc(eagg_out, dev_x,
                          own_slice * BATCH_SIZE,
                          own_slice * BATCH_SIZE + BATCH_SIZE,
                          ext->z_partial, ext->pair_pos, hidden_dim,
@@ -4800,7 +4798,8 @@ int *getp_forward_120b(Transformer * /*transformer*/,
       if (peer_device_index != device_index) {
         HIP_CHECK(hipMemcpyPeerAsync(
             ext->peer_e_agg + (size_t)j * BATCH_SIZE * hidden_dim, device_index,
-            peer_ext->ext_e_agg + (size_t)(device_index - base_device_index) * BATCH_SIZE * hidden_dim,
+            ((l & 1) ? peer_ext->ext_e_agg2 : peer_ext->ext_e_agg)
+                + (size_t)(device_index - base_device_index) * BATCH_SIZE * hidden_dim,
             peer_device_index,
             sizeof(float) * BATCH_SIZE * hidden_dim, memory_stream));
         HIP_CHECK(hipEventRecord(events_e_agg[j], memory_stream));
