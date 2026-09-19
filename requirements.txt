@@ -1,4 +1,4 @@
-torch==2.8.0
+torch==2.13.0
 safetensors==0.6.2
 numpy==2.2.6
 tqdm==4.67.1
