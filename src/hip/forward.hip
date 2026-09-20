@@ -4469,10 +4469,17 @@ __global__ void extract_argmax_pairs(const unsigned long long* pairs, int* out, 
 #define GETP_LOGITS_SWZ 1   // mac dinh BAT; dat 0 de A/B
 #endif
 #ifndef GETP_LOGITS_SWZ_G
-// G da quet het, don dieu va dat dinh o 2 (logits us moi buoc, doi chung 21.521):
-//   G=2 -> 20.783 | G=3 -> 21.071 | G=4 -> 21.455 | G=6 -> 22.467
-// Tap X cua mot nhom la G x BM x K x 4 = G x 1,47 MB va no phinh ra khoi L2 8 MB.
-#define GETP_LOGITS_SWZ_G 2
+// Tap X cua mot nhom la G x BM x K x (4 hay 2) byte, va G toi uu la cho no vua L2 8 MB.
+// Voi X fp32 (1,47 MB/tile) dinh o G=2; doi X sang bf16 (737 KB/tile) thi dinh doi sang G=6.
+//   X fp32:  G=2 20.783 | G=3 21.071 | G=4 21.455 | G=6 22.467   (doi chung 21.521)
+//   X bf16:  G=0 18.125 | G=2 15.903 | G=3 15.487 | G=4 15.312 | G=6 15.178 | G=12 15.182
+#define GETP_LOGITS_SWZ_G 6
+#endif
+
+// Doi X cua logits sang bf16 mot lan moi buoc thay vi doc fp32 roi vut nua so bit trong
+// kernel. Xem dau file lgxbf16: no la dieu kien de swizzle nhom di xa hon.
+#ifndef GETP_LOGITS_XBF16
+#define GETP_LOGITS_XBF16 1   // mac dinh BAT; dat 0 de A/B
 #endif
 
 #ifndef MATMUL_LOGITS_BLOCK_ROWS
@@ -4559,6 +4566,29 @@ __device__ __forceinline__ void logits_lds_store4(unsigned short* dst, const flo
   *reinterpret_cast<bf16x4*>(dst) = p;
 }
 
+#if GETP_LOGITS_XBF16
+// 4 fp32 -> 4 bf16 lien tiep. Cung ham chuyen doi ma kernel logits van goi, nen tung bit trung.
+__global__ void logits_x_to_bf16_kernel(bf16x4* __restrict__ out,
+                                        const float4* __restrict__ in, size_t n4) {
+  const size_t i = (size_t)blockIdx.x * blockDim.x + threadIdx.x;
+  if (i >= n4) return;
+  const float4 v = in[i];
+  const bf16x4 p = { f32_to_bf16bits(v.x), f32_to_bf16bits(v.y),
+                     f32_to_bf16bits(v.z), f32_to_bf16bits(v.w) };
+  out[i] = p;
+}
+// 4 bf16 = 8 byte = dung mot ds_write_b64, y het duong fp32 nhung khong ton lenh VALU nao.
+__device__ __forceinline__ void logits_lds_storeX(unsigned short* dst, const uint2 v) {
+  *reinterpret_cast<uint2*>(dst) = v;
+}
+typedef uint2 getp_xload_t;
+#else
+__device__ __forceinline__ void logits_lds_storeX(unsigned short* dst, const float4 v) {
+  logits_lds_store4(dst, v);
+}
+typedef float4 getp_xload_t;
+#endif
+
 template<
   int BM, int BN, int BK,
   int WM, int WN,
@@ -4571,6 +4601,7 @@ template<
 __global__ void __launch_bounds__(THREADS)
 matmul_logits_argmax_bf16_kernel_tuned(
     const float* __restrict__ x,
+    const unsigned short* __restrict__ xb,   // ban bf16 cua x; chi dung khi GETP_LOGITS_XBF16
     const __hip_bfloat16* __restrict__ w,
     int M, int N, int K,
     unsigned long long* __restrict__ pairs) {
@@ -4690,10 +4721,15 @@ matmul_logits_argmax_bf16_kernel_tuned(
     if (ry >= BM) break;
     const int rg = BM * blk_row + ry;
     const int kk = 4 * loadXIdx_x;
+#if GETP_LOGITS_XBF16
+    getp_xload_t tmp = (kk < K && rg < M)
+        ? *reinterpret_cast<const uint2 *>(&xb[(size_t)rg * K + kk]) : make_uint2(0, 0);
+#else
     float4 tmp = (kk < K && rg < M) ? *reinterpret_cast<const float4 *>(&x[(size_t)rg * K + kk]) : make_float4(0,0,0,0);
+#endif
     // dia chi = 2*(ry*KPAD + 4*loadXIdx_x) byte: KPAD boi 4 va chunk boi 4
     // => boi 8 => hop le cho ds_write_b64.
-    logits_lds_store4(&xsT[ry][4 * loadXIdx_x], tmp);
+    logits_lds_storeX(&xsT[ry][4 * loadXIdx_x], tmp);
   }
   for (int i = 0; i < nbLoadsW; ++i) {
     int off = i * strideW;
@@ -4705,7 +4741,7 @@ matmul_logits_argmax_bf16_kernel_tuned(
   __syncthreads();
 
   for (int bkIdx = 0; bkIdx < K; bkIdx += BK) {
-    float4 regX[nbLoadsX];
+    getp_xload_t regX[nbLoadsX];
     uint4  regW[nbLoadsW];
     if (bkIdx < K - BK) {
       for (int i = 0; i < nbLoadsX; ++i) {
@@ -4713,7 +4749,12 @@ matmul_logits_argmax_bf16_kernel_tuned(
         int ry = loadXIdx_y + off;
         int rg = BM * blk_row + ry;
         int kk = bkIdx + BK + 4 * loadXIdx_x;
+#if GETP_LOGITS_XBF16
+        regX[i] = (kk < K && rg < M)
+            ? *reinterpret_cast<const uint2 *>(&xb[(size_t)rg * K + kk]) : make_uint2(0, 0);
+#else
         regX[i] = (kk < K && rg < M) ? *reinterpret_cast<const float4 *>(&x[(size_t)rg * K + kk]) : make_float4(0,0,0,0);
+#endif
       }
       for (int i = 0; i < nbLoadsW; ++i) {
         int off = i * strideW;
@@ -4745,8 +4786,8 @@ matmul_logits_argmax_bf16_kernel_tuned(
         int off = i * strideX;
         int ry = loadXIdx_y + off;
         if (ry >= BM) break;
-        float4 v = regX[i];
-        logits_lds_store4(&xsT[ry][4 * loadXIdx_x], v);
+        getp_xload_t v = regX[i];
+        logits_lds_storeX(&xsT[ry][4 * loadXIdx_x], v);
       }
       for (int i = 0; i < nbLoadsW; ++i) {
         int off = i * strideW;
@@ -4934,8 +4975,29 @@ static inline void getp_matmul_logits_argmax_bf16(
   dim3 gi((M + 255) / 256), bi(256);
   init_argmax_pairs<<<gi, bi, 0, stream>>>(pairs, M, N);
 
+#if GETP_LOGITS_XBF16
+  // Cung ly do voi `pairs` o tren: hipFree dong bo ca thiet bi nen bo dem nay giu lai.
+  static thread_local unsigned short *xb = nullptr;
+  static thread_local size_t xb_cap = 0;
+  const size_t xn = (size_t)M * (size_t)K;
+  // xn = M*K luon chia het 4 vi K (hidden_dim) chia het 4; khong can chot chay.
+  if (xb_cap < xn) {
+    if (xb) HIP_CHECK(hipFree(xb));
+    HIP_CHECK(hipMalloc(&xb, sizeof(unsigned short) * xn));
+    xb_cap = xn;
+  }
+  {
+    const size_t n4 = xn / 4;
+    dim3 bx(256), gx((unsigned)((n4 + 255) / 256));
+    logits_x_to_bf16_kernel<<<gx, bx, 0, stream>>>(
+        reinterpret_cast<bf16x4 *>(xb), reinterpret_cast<const float4 *>(x), n4);
+  }
+#else
+  const unsigned short *xb = nullptr;
+#endif
+
   matmul_logits_argmax_bf16_kernel_tuned<BM,BN,BK,WM,WN,WARPS>
-      <<<grid, block, 0, stream>>>(x, w, M, N, K, pairs);
+      <<<grid, block, 0, stream>>>(x, xb, w, M, N, K, pairs);
 
   extract_argmax_pairs<<<gi, bi, 0, stream>>>(pairs, out, M);
   // (pairs duoc giu lai cho buoc sau)
