@@ -1803,6 +1803,8 @@ new_matmul_qkv_fused_kernel(
   // Chi doc khi GETP_ROPE_FUSED_KV: khe KV cache cua buoc nay.
   , __hip_bfloat16 *__restrict__ k_slot_bf16
   , __hip_bfloat16 *__restrict__ v_slot_bf16
+  // 1/sqrt(head_dim); chi doc khi GETP_Q_BF16. Xem qbf16.
+  , float q_scale
 #endif
 ) {
   constexpr int BLOCK_SIZE = 256;
@@ -2053,9 +2055,18 @@ new_matmul_qkv_fused_kernel(
             float o1 = x1 * c - x2 * s;
             float o2 = x2 * c + x1 * s;
             if (in_q) {
+#if GETP_Q_BF16
+              // q_scale la 2^-3 nen nhan truoc hay sau khi lam tron deu cho cung tung bit.
+              unsigned short *dst =
+                  reinterpret_cast<unsigned short *>(q_out) + (size_t)global_y * q_len;
+              dst[gx1] = f32_to_bf16bits(q_scale * o1);
+              dst[gx2] = f32_to_bf16bits(q_scale * o2);
+#else
+              (void)q_scale;
               float *dst = q_out + (size_t)global_y * q_len;
               dst[gx1] = o1;
               dst[gx2] = o2;
+#endif
             } else {
 #if GETP_ROPE_FUSED_KV
               // kv_store_pair_fp32_to_bf16 da bi go: ghi thang bf16 bang DUNG
@@ -2217,7 +2228,7 @@ static inline void getp_matmul_qkv_fused_bf16(
   new_matmul_qkv_fused_kernel<<<grid, block, 0, stream>>>(
       q, k, v, x_bf16, w_qkv_bf16, b_qkv_bf16, n, q_len, k_len, v_len,
       batch_size, rope_ok ? rope_cos : nullptr, rope_sin, head_dim,
-      k_slot, v_slot);
+      k_slot, v_slot, 1.0f / sqrtf((float)head_dim));
 #else
   new_matmul_qkv_fused_kernel<<<grid, block, 0, stream>>>(
       q, k, v, x_bf16, w_qkv_bf16, b_qkv_bf16, n, q_len, k_len, v_len, batch_size);
@@ -3105,6 +3116,20 @@ flash_attn_decode_mfma16_kernel(
   const int hg_self = kv_h * KV_MUL + waveIdx * HPW + (ln < HPW ? ln : 0);
   bf16x4 qB[NCHUNK];
   {
+#if GETP_Q_BF16
+    // Epilogue qkv da ghi san bf16 DA NHAN inv_sqrt_d. Phep ba ngoi phai GIU: bo no thi cac
+    // cot don (ln >= HPW) nhan phai q that cua dau 0 thay vi so 0.
+    (void)inv_sqrt_d;
+    const unsigned short *qrow =
+        reinterpret_cast<const unsigned short *>(q) +
+        (size_t)b * n_attn_heads * head_dim + (size_t)hg_self * head_dim;
+    #pragma unroll
+    for (int c = 0; c < NCHUNK; ++c) {
+      #pragma unroll
+      for (int kk = 0; kk < 4; ++kk)
+        qB[c][kk] = (ln < HPW) ? qrow[c * TILE + 4 * g + kk] : (unsigned short)0;
+    }
+#else
     const float *qrow =
         q + (size_t)b * n_attn_heads * head_dim + (size_t)hg_self * head_dim;
     #pragma unroll
@@ -3115,6 +3140,7 @@ flash_attn_decode_mfma16_kernel(
             ? f32_to_bf16bits(inv_sqrt_d * qrow[c * TILE + 4 * g + kk])
             : (unsigned short)0;
     }
+#endif
   }
 
   constexpr int nbLoadsKV = TILE * (HEAD_DIM / 8) / BLOCK_SIZE;
@@ -3783,6 +3809,15 @@ flash_attn_decode_odd_layer_bf16_matrix_core_kernel(
   }
 
 }
+
+// Ghi Q san o bf16 da nhan 1/sqrt(d): attention doi no sang bf16 o lan dung dau tien roi,
+// va he so la 2^-3 nen phep nhan khong doi mantissa. Xem dau file qbf16.
+#ifndef GETP_Q_BF16
+#define GETP_Q_BF16 1   // mac dinh BAT (attention 445 -> 355 us/goi); dat 0 de A/B
+#endif
+#if GETP_Q_BF16 && !GETP_ROPE_FUSED
+#error "GETP_Q_BF16 can GETP_ROPE_FUSED: epilogue khong-rope ghi q o cho khac"
+#endif
 
 #ifndef FLASH_DECODE_TILE_T
 #define FLASH_DECODE_TILE_T 16
