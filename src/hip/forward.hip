@@ -30,6 +30,29 @@
 #define GETP_QKV_LDS_PAD_SLOTS (-1)
 #endif
 
+// Gap phep xoay RoPE vao epilogue cua kernel QKV. Xem ghi chu dai ngay tren
+// epilogue: ban doi dim+head_dim/2 nam cung lane nen khong ton shuffle nao.
+#ifndef GETP_ROPE_FUSED
+#define GETP_ROPE_FUSED 1   // mac dinh BAT (do e2e: -0,73 ms/buoc); dat 0 de A/B
+#endif
+// Them mot bac: ghi thang khe KV cache o bf16 tu epilogue va bo kv_store_pair.
+// Tach co rieng vi no danh doi hieu suat ghi (2 byte/lane) lay 12,6 MB/lop.
+#ifndef GETP_ROPE_FUSED_KV
+#define GETP_ROPE_FUSED_KV 1   // mac dinh BAT (cung mot phep quay cho K); dat 0 de A/B
+#endif
+#if GETP_ROPE_FUSED_KV && !GETP_ROPE_FUSED
+#error "GETP_ROPE_FUSED_KV=1 doi hoi GETP_ROPE_FUSED=1"
+#endif
+
+// --- smallfuse: hai cong tac doc lap, mac dinh TAT ---------------------------
+#ifndef GETP_SMALL_TOPK
+#define GETP_SMALL_TOPK 1   // mac dinh BAT (do e2e: -2,09 ms/buoc); dat 0 de A/B
+#endif
+#ifndef GETP_SMALL_NOSCATTER
+#define GETP_SMALL_NOSCATTER 0   // DA DO va THUA: bo kernel scatter (-1,42 ms/buoc)
+                                 // nhung mlp1 phai tu gom hang nen +1,66 ms/buoc.
+#endif
+
 #ifndef GETP_ROUTER_TOPK_MAXK
 #define GETP_ROUTER_TOPK_MAXK 4
 #endif
@@ -590,10 +613,13 @@ __device__ __forceinline__ bf16x4 mlp1_pack2(unsigned int lo, unsigned int hi) {
   return cvt.h;
 }
 
+// GATHER: khi bat, A_in KHONG con la bang [pair][H] da chep san ma la chinh
+// ext_t_bf16 [token][H]; hang cua tile lay qua tok_idx[pos]. Xem ghi chu o cho
+// tinh `arow`. GATHER = false sinh ma y het ban cu (tok_idx bi loai sach).
 template<
   int BM, int BN, int BK,
   int WM, int WN,
-  int BN_AGG, int CTA,
+  int BN_AGG, int CTA, bool GATHER,
   int TILE_N = 64 * ((BM/WM)*(BN/WN)),
   int WARPS_PER_BLOCK = (BM/WM)*(BN/WN)
 >
@@ -605,7 +631,8 @@ mlp1_swiglu_bf16_bucketed_kernel_outbf16_tuned(
   const __hip_bfloat16* __restrict__ B1,
   const int* __restrict__ offsets,
   const int* __restrict__ blk_offs,
-  int H, int I, int E, float swiglu_limit
+  int H, int I, int E, float swiglu_limit,
+  const int* __restrict__ tok_idx
 ) {
   // BM = BN = 64, BK = 32
   // WM = WN = 32
@@ -693,6 +720,34 @@ mlp1_swiglu_bf16_bucketed_kernel_outbf16_tuned(
   constexpr int nbLoadsX = BM / strideX8;
   constexpr int nbLoadsW = BNt / strideW;
 
+  // --- Hang cua tile A ------------------------------------------------------
+  // Ban cu: mot kernel rieng chep a_in[pos][:] = ext_t_bf16[tok_idx[pos]][:]
+  // cho ca 6144 cap (20b, EP=2) roi mlp1 doc lai. Do la 35,4 MB doc + 35,4 MB
+  // ghi moi lop chi de sap xep lai hang - va a_in khong co consumer nao khac
+  // ngoai mlp1. Gio mlp1 tu gom: A_in tro thang vao ext_t_bf16, hang la
+  // tok_idx[pos]. Them mot loi: bang nguon con 17,7 MB thay vi 35,4 MB (moi
+  // token xuat hien MOT lan thay vi mot lan tren moi expert cuc bo cua no),
+  // nen 23 khoi cot cung by dung chung L2 tot hon.
+  // Chi so nay khong phu thuoc k nen tinh MOT lan o day (nbLoadsX = 2 voi
+  // BM = 128, strideX8 = 64) chu khong phai trong vong k: gia la +2 VGPR song
+  // suot vong k - xem canh bao ve chiem dung trong bao cao.
+  // `base` KHONG chet o duong GATHER: no van la goc cua tok_idx[base + rr] va
+  // van la hang ra cua epilogue (`pos = base + row` ghi gate_up_bf16 theo chi
+  // so CAP, khong phai theo token) - do la ly do epilogue khong doi gi.
+  // Hang r >= tcnt khong bao gio duoc nap (ca ba cho nap deu co dieu kien
+  // `r < tcnt`), nen o do lay 0 cho co gia tri hop le: vua khong doc qua duoi
+  // e_dev (cap phat dung max_pairs phan tu), vua khong them nhanh re nao.
+  // Mang khai bao du nbLoadsX phan tu o CA hai duong: voi GATHER = false vong
+  // nap khong chay va `arow[i]` nam o nhanh chet cua toan tu ba ngoi, nhung
+  // neu mang chi co 1 phan tu thi nhanh chet do la mot chi so hang so VUOT
+  // bien (i = 1) - dung de trinh bien dich phai suy luan ra dieu do.
+  int arow[nbLoadsX];
+  #pragma unroll
+  for (int i = 0; i < (GATHER ? nbLoadsX : 0); ++i) {
+    const int rr = loadX_y8 + i * strideX8;
+    arow[i] = (rr < tcnt) ? tok_idx[base + rr] : 0;
+  }
+
   // Fast/Slow Path Split optimization: Separate boundary-safe and boundary-check loads
   constexpr int safe_iters = (BM >= strideX8) ? (BM - strideX8) / strideX8 : 0;
 
@@ -702,7 +757,7 @@ mlp1_swiglu_bf16_bucketed_kernel_outbf16_tuned(
     const int off = i * strideX8;
     const int kk = 0 + LOAD_VEC * loadX_x8;
     const int r = loadX_y8 + off;
-    const int pos = base + r;
+    const int pos = GATHER ? arow[i] : (base + r);
 
     // 8 short lien tiep theo k cua mot hang = 2 o ke nhau theo truc plane k0.
     bf16x4* dst = &sxs[(size_t)((LOAD_VEC * loadX_x8) / KP) * SM + r];
@@ -725,7 +780,7 @@ mlp1_swiglu_bf16_bucketed_kernel_outbf16_tuned(
     const int off = i * strideX8;
     const int kk = 0 + LOAD_VEC * loadX_x8;
     const int r = loadX_y8 + off;
-    const int pos = base + r;
+    const int pos = GATHER ? arow[i] : (base + r);
 
     // 8 short lien tiep theo k cua mot hang = 2 o ke nhau theo truc plane k0.
     bf16x4* dst = &sxs[(size_t)((LOAD_VEC * loadX_x8) / KP) * SM + r];
@@ -783,7 +838,7 @@ mlp1_swiglu_bf16_bucketed_kernel_outbf16_tuned(
         int off = i * strideX8;
         const int kk = bk + BK + LOAD_VEC * loadX_x8;
         const int r = loadX_y8 + off;
-        const int pos = base + r;
+        const int pos = GATHER ? arow[i] : (base + r);
 
         if (r < tcnt && kk + 7 < H) {
           const uint4* p = reinterpret_cast<const uint4*>(A_in + (size_t)pos * H + kk);
@@ -1472,7 +1527,10 @@ static inline void launch_mlp1_swiglu_bf16_bucketed_outbf16(
   __hip_bfloat16* gate_up_bf16, const __hip_bfloat16* a_in,
   const __hip_bfloat16* w1_layer, const __hip_bfloat16* b1_layer,
   const int* offsets, const int* blk_offs, int H, int I, int E,
-  int total_blocks, float swiglu_limit, hipStream_t stream
+  int total_blocks, float swiglu_limit, hipStream_t stream,
+  // tok_idx != nullptr: a_in la ext_t_bf16 [token][H], hang lay qua tok_idx.
+  // nullptr (mac dinh): a_in la bang [pair][H] da chep san - duong cu.
+  const int* tok_idx = nullptr
 ) {
 
   constexpr int BM = MATMUL_MLP1_BLOCK_ROWS;
@@ -1495,8 +1553,17 @@ static inline void launch_mlp1_swiglu_bf16_bucketed_outbf16(
   dim3 grid((I + BNt - 1) / BNt, total_blocks);
   // MOT nguon su that cho kich thuoc LDS - dung ke hoach ma than kernel dung.
   size_t shmem = LdsPlan::bytes;
-  mlp1_swiglu_bf16_bucketed_kernel_outbf16_tuned<BM,BN,BK,WM,WN,BN_AGG,CTA>
-    <<<grid, block, shmem, stream>>>(gate_up_bf16, a_in, w1_layer, b1_layer, offsets, blk_offs, H, I, E, swiglu_limit);
+#if GETP_SMALL_NOSCATTER
+  if (tok_idx) {
+    mlp1_swiglu_bf16_bucketed_kernel_outbf16_tuned<BM,BN,BK,WM,WN,BN_AGG,CTA,true>
+      <<<grid, block, shmem, stream>>>(gate_up_bf16, a_in, w1_layer, b1_layer, offsets, blk_offs, H, I, E, swiglu_limit, tok_idx);
+    return;
+  }
+#else
+  (void)tok_idx;
+#endif
+  mlp1_swiglu_bf16_bucketed_kernel_outbf16_tuned<BM,BN,BK,WM,WN,BN_AGG,CTA,false>
+    <<<grid, block, shmem, stream>>>(gate_up_bf16, a_in, w1_layer, b1_layer, offsets, blk_offs, H, I, E, swiglu_limit, nullptr);
 
 }
 
@@ -1728,6 +1795,15 @@ new_matmul_qkv_fused_kernel(
   float *__restrict__ v_out, const __hip_bfloat16 *__restrict__ x,
   const __hip_bfloat16 *__restrict__ w, const __hip_bfloat16 *__restrict__ b,
   int n, int q_len, int k_len, int v_len, int batch_size
+#if GETP_ROPE_FUSED
+  // Bang cos/sin do getp_compute_cos_sin sinh MOT lan moi buoc (head_dim/2
+  // phan tu, vai tram byte - nam gon trong L1 sau lan cham dau).
+  // rope_cos == nullptr => tat hoan toan, epilogue chay y nhu duong cu.
+  , const float *rope_cos, const float *rope_sin, int head_dim
+  // Chi doc khi GETP_ROPE_FUSED_KV: khe KV cache cua buoc nay.
+  , __hip_bfloat16 *__restrict__ k_slot_bf16
+  , __hip_bfloat16 *__restrict__ v_slot_bf16
+#endif
 ) {
   constexpr int BLOCK_SIZE = 256;
 
@@ -1922,6 +1998,115 @@ new_matmul_qkv_fused_kernel(
     __syncthreads();
   }
 
+#if GETP_ROPE_FUSED
+  // ===================== RoPE gap vao epilogue ==========================
+  // waveN0 la goc N cua CA wave: blockIdx.x*BN + WN*xInBlockTile -> boi cua
+  // 64. WN = 64 = head_dim va cac moc vung (0, q_len, q_len+k_len) cung la
+  // boi cua 64 (launcher kiem lai truoc khi bat), nen mot wave nam TRON trong
+  // MOT dau cua MOT vung: nhanh duoi day dong nhat tren toan wave, va ban doi
+  // dim+half luon o cung lane. Cung vi the khong can kiem global_x < N nua:
+  // wave hoac nam tron trong N, hoac ra ngoai han - khi do waveN0 >= N >=
+  // q_len+k_len nen no roi xuong duong cu, noi van con kiem bien day du.
+  const int waveN0 = blockIdx.x * BN + WN * xInBlockTile;
+  constexpr int nPairN = nIterWaveN / 2;
+  static_assert(nIterWaveN % 2 == 0,
+                "nua thap/nua cao cua mot dau phai la so tile MFMA chan");
+  if (rope_cos != nullptr && waveN0 < q_len + k_len) {
+    const int half = head_dim >> 1;            // 32
+    const int CDj = (laneIdx % 16);
+    // cos/sin chi phu thuoc (iterWaveN, CDj) - bat bien trong ca hai vong
+    // duoi - nen nap mot lan ra thanh ghi thay vi doc lai 32 lan.
+    float cs[nPairN], sn[nPairN];
+    #pragma unroll
+    for (int p = 0; p < nPairN; ++p) {
+      const int d = MFMA_N * p + CDj;          // 0..half-1
+      cs[p] = rope_cos[d];
+      sn[p] = rope_sin[d];
+    }
+    const bool in_q = (waveN0 < q_len);        // dong nhat tren wave
+    #pragma unroll
+    for (int iterWaveM = 0; iterWaveM < nIterWaveM; ++iterWaveM) {
+      #pragma unroll
+      for (int p = 0; p < nPairN; ++p) {
+        // Ban doi o dim+half la tile N thu (p + nPairN): CUNG lane, CUNG i.
+        const int accLo = iterWaveM * nIterWaveN + p;
+        const int accHi = iterWaveM * nIterWaveN + p + nPairN;
+        #pragma unroll
+        for (int i = 0; i < GPRs_CD; ++i) {
+          const int CDi = 4 * (laneIdx / 16) + (i % 4);
+          const int global_y =
+              blockIdx.y * BM + WM * yInBlockTile + iterWaveM * MFMA_M + CDi;
+          const int gx1 = waveN0 + p * MFMA_N + CDj;   // dim thap
+          const int gx2 = gx1 + half;                  // ban doi
+          if (global_y < M) {
+            float x1 = acc_local[accLo][i];
+            float x2 = acc_local[accHi][i];
+            if (b) {
+              x1 += __bfloat162float(b[gx1]);
+              x2 += __bfloat162float(b[gx2]);
+            }
+            const float c = cs[p];
+            const float s = sn[p];
+            // Chep NGUYEN VAN tu apply_rotary_emb_kernel: cung thu tu toan
+            // hang, cung thu tu phep tinh -> trinh bien dich gap fma y het.
+            // Doi mot ky tu o hai dong nay la doi ket qua o bit cuoi.
+            float o1 = x1 * c - x2 * s;
+            float o2 = x2 * c + x1 * s;
+            if (in_q) {
+              float *dst = q_out + (size_t)global_y * q_len;
+              dst[gx1] = o1;
+              dst[gx2] = o2;
+            } else {
+#if GETP_ROPE_FUSED_KV
+              // kv_store_pair_fp32_to_bf16 da bi go: ghi thang bf16 bang DUNG
+              // ham lam tron cu nen gia tri trung tung bit.
+              unsigned short *dst =
+                  reinterpret_cast<unsigned short *>(k_slot_bf16) +
+                  (size_t)global_y * k_len;
+              dst[gx1 - q_len] = f32_to_bf16bits(o1);
+              dst[gx2 - q_len] = f32_to_bf16bits(o2);
+#else
+              float *dst = k_out + (size_t)global_y * k_len;
+              dst[gx1 - q_len] = o1;
+              dst[gx2 - q_len] = o2;
+#endif
+            }
+          }
+        }
+      }
+    }
+  }
+#if GETP_ROPE_FUSED_KV
+  else if (rope_cos != nullptr && waveN0 < N) {
+    // Vung v: khong xoay, nhung vi kv_store_pair da bi go nen phai tu doi
+    // bf16 va ghi thang khe cache. v_len == kv_dim nen buoc hang giong het.
+    #pragma unroll
+    for (int iterWaveM = 0; iterWaveM < nIterWaveM; ++iterWaveM) {
+      #pragma unroll
+      for (int iterWaveN = 0; iterWaveN < nIterWaveN; ++iterWaveN) {
+        const int acc_index = iterWaveM * nIterWaveN + iterWaveN;
+        #pragma unroll
+        for (int i = 0; i < GPRs_CD; ++i) {
+          const int CDi = 4 * (laneIdx / 16) + (i % 4);
+          const int CDj = (laneIdx % 16);
+          const int global_x = waveN0 + iterWaveN * MFMA_N + CDj;
+          const int global_y =
+              blockIdx.y * BM + WM * yInBlockTile + iterWaveM * MFMA_M + CDi;
+          float result = acc_local[acc_index][i];
+          if (global_y < M) {
+            if (b) result += __bfloat162float(b[global_x]);
+            reinterpret_cast<unsigned short *>(v_slot_bf16)
+                [(size_t)global_y * v_len + (global_x - q_len - k_len)] =
+                    f32_to_bf16bits(result);
+          }
+        }
+      }
+    }
+  }
+#endif
+  else
+#endif
+  {
   #pragma unroll
   for (int iterWaveM = 0; iterWaveM < nIterWaveM; ++iterWaveM) {
     #pragma unroll
@@ -1953,6 +2138,13 @@ new_matmul_qkv_fused_kernel(
       }
     }
   }
+  }
+#if GETP_ROPE_FUSED
+  // Khi chi bat RoPE (khong bat _KV) hai con tro nay khong duoc dung - noi ro
+  // voi trinh bien dich thay vi de mot canh bao troi noi.
+  (void)k_slot_bf16;
+  (void)v_slot_bf16;
+#endif
 }
 
 static inline void getp_matmul_qkv_fused_bf16(
@@ -1961,7 +2153,14 @@ static inline void getp_matmul_qkv_fused_bf16(
     const __hip_bfloat16 *w_qkv_bf16,
     const __hip_bfloat16 *b_qkv_bf16,
     int n, int head_dim, int n_attn_heads, int n_kv_heads, int batch_size,
-    hipStream_t stream) {
+    hipStream_t stream
+#if GETP_ROPE_FUSED
+    // Khong dat gia tri mac dinh: neu con cho goi nao chua duoc sua thi day
+    // phai la LOI BIEN DICH, chu khong phai im lang chay duong cu.
+    , const float *rope_cos, const float *rope_sin,
+    __hip_bfloat16 *k_slot, __hip_bfloat16 *v_slot
+#endif
+    ) {
 
   const int q_len = head_dim * n_attn_heads;
   const int k_len = head_dim * n_kv_heads;
@@ -1981,8 +2180,48 @@ static inline void getp_matmul_qkv_fused_bf16(
   dim3 block(GetpQkvTile::THREADS);
   dim3 grid((N + BN - 1) / BN, (M + BM - 1) / BM);
 
+#if GETP_ROPE_FUSED
+  // Dieu kien de "mot wave = mot dau" thanh su that. head_dim == WN cho tile N
+  // cua wave trung dung mot dau; q_len/k_len chia het head_dim cho moc dau moi
+  // vung roi vao ranh 64 (nen wave khong bao gio cat qua bien q|k|v); N chia
+  // het head_dim cho mot wave hoac nam tron trong N hoac ra ngoai han. Khong
+  // thoa -> rope_cos = nullptr va epilogue chay nguyen ven duong cu.
+  const bool rope_ok = (rope_cos != nullptr) && (rope_sin != nullptr) &&
+                       (head_dim == GetpQkvTile::WN) && (head_dim % 2 == 0) &&
+                       (q_len % head_dim == 0) && (k_len % head_dim == 0) &&
+                       (N % head_dim == 0);
+  // KHONG CO DUONG LUI. Khi GETP_ROPE_FUSED=1 thi hai loi goi
+  // getp_apply_rotary_emb da bi go khoi CA HAI vong lop (cho goi duy nhat cua
+  // chung), nen "rope_cos = nullptr -> chay duong cu" KHONG con nghia la "rope
+  // van duoc lam o kernel rieng" - no co nghia la KHONG AI xoay q/k nua. Mot
+  // hinh dang khong thoa dieu kien vi the phai dung han o day, chu khong duoc
+  // tra ve so sai mot cach im lang. (Voi cau hinh hien tai head_dim=64=WN,
+  // q_len=4096, k_len=512, N=5120 thi rope_ok luon dung; kiem tra nay la de
+  // chan mot model tuong lai co head_dim khac lot qua ma khong ai biet.)
+  if (!rope_ok) {
+    std::cerr << "GETP_ROPE_FUSED: hinh dang qkv khong thoa dieu kien "
+                 "mot-wave-mot-dau (head_dim=" << head_dim
+              << ", WN=" << GetpQkvTile::WN << ", q_len=" << q_len
+              << ", k_len=" << k_len << ", N=" << N
+              << ") - rope se khong duoc ap dung o dau ca." << std::endl;
+    std::abort();
+  }
+#if GETP_ROPE_FUSED_KV
+  // Them mot dieu kien rieng cho bac _KV: kv_store_pair_fp32_to_bf16 cung da
+  // bi go, nen khe KV chi duoc ghi neu hai con tro nay co that.
+  if (k_slot == nullptr || v_slot == nullptr) {
+    std::cerr << "GETP_ROPE_FUSED_KV: thieu con tro khe KV" << std::endl;
+    std::abort();
+  }
+#endif
+  new_matmul_qkv_fused_kernel<<<grid, block, 0, stream>>>(
+      q, k, v, x_bf16, w_qkv_bf16, b_qkv_bf16, n, q_len, k_len, v_len,
+      batch_size, rope_ok ? rope_cos : nullptr, rope_sin, head_dim,
+      k_slot, v_slot);
+#else
   new_matmul_qkv_fused_kernel<<<grid, block, 0, stream>>>(
       q, k, v, x_bf16, w_qkv_bf16, b_qkv_bf16, n, q_len, k_len, v_len, batch_size);
+#endif
 
 }
 
@@ -2653,8 +2892,45 @@ static inline void getp_router_topk_softmax_batch(
     const float *router_score, int n_experts, int experts_per_token,
     float *topk_v_out, int *topk_i_out, int batch_size, hipStream_t stream) {
 
+#if GETP_SMALL_TOPK
+  // n_experts = 32 (20b) / 128 (120b) nhung khoi van la 1024 thread = 16 wave.
+  // Hai hau qua, ca hai deu la thoi gian chet:
+  //   * chiem dung: 16 wave/khoi, tran 8 wave/SIMD -> 2 khoi/CU -> 208 khoi
+  //     thuong tru tren 1536 -> 7,4 lan chay noi tiep;
+  //   * vong rut gon chay log2(1024) = 10 chang, MOI chang mot __syncthreads
+  //     cua 16 wave, lam lai K = 4 lan -> ~44 hang rao nang moi khoi.
+  // Do duoc 2,5 ms/buoc cho 250 KB luu luong (san bang 0,2 us): gan nhu toan
+  // bo la hang rao va lan chay noi tiep, khong phai bo nho.
+  //
+  // VI SAO BIT-EXACT khi thu khoi ve BLK = 2^ceil(log2(n_experts)) >= 64:
+  //   (a) Pha rieng tung thread: vong `for (i = tid; i < n_experts; i += blockDim.x)`
+  //       chay DUNG mot vong voi moi BLK >= n_experts -> thread tid giu
+  //       (scores[tid], tid) neu tid < n_experts, nguoc lai giu (-INF, n_experts).
+  //       Khong phu thuoc BLK.
+  //   (b) Cay rut gon: chang stride s ghep trai (vl, il) voi phai (vr, ir).
+  //       Voi MOI chang co stride >= n_experts, ben phai chac chan la o nhan
+  //       roi (vr = -INF, ir = n_experts), va luat chon la
+  //           take_r = (vr > vl + thr) || (|vr - vl| <= thr && ir < il),
+  //           thr = eps * max(|vr|, |vl|) = eps * INF = INF.
+  //       Nhanh dau: -INF > vl + INF sai voi vl huu han; voi vl = -INF thi
+  //       vl + INF = NaN nen so sanh cung sai. Nhanh sau: |vr - vl| <= INF
+  //       dung, NHUNG ir = n_experts con il <= n_experts nen `ir < il` luon
+  //       SAI. => luon giu ben trai. Moi chang stride >= n_experts la phep
+  //       dong nhat, voi MOI du lieu (lap luan khong gia dinh gi ve vl, nen
+  //       van dung khi scores chua NaN hay +INF).
+  //   Ban 1024 chay chang 512,256,...,1; ban BLK chay BLK/2,...,1. Phan khac
+  //   nhau chi gom cac chang >= n_experts ma (b) vua chung minh la dong nhat;
+  //   cac chang < n_experts trung nhau tung doi mot, cung toan hang, cung thu
+  //   tu, cung phep lam tron -> cung bit.
+  //   Dieu kien can: BLK la luy thua 2 (vong `s = blockDim.x >> 1` moi phu het)
+  //   va BLK >= n_experts. n_experts > 1024 thi giu nguyen 1024 = duong cu.
+  int BLK = 64;
+  while (BLK < n_experts && BLK < 1024) BLK <<= 1;
+  const dim3 block(BLK);
+#else
   const int BLK = 1024;
   const dim3 block(BLK);
+#endif
   const dim3 grid(batch_size);
   const size_t shmem = (size_t)n_experts * sizeof(float) +
                        (size_t)BLK * (sizeof(float) + sizeof(int)) +
@@ -4241,6 +4517,12 @@ __global__ void extract_argmax_pairs(const unsigned long long* pairs, int* out, 
 #define MATMUL_LOGITS_LDS_KPAD 4
 #endif
 
+// Epilogue argmax gom trong thanh ghi truoc khi cham LDS (xem dau file logitsx.py).
+// 0 = duong cu, bit-identical. Bat bang -DGETP_LOGITS_EPI=1.
+#ifndef GETP_LOGITS_EPI
+#define GETP_LOGITS_EPI 1   // mac dinh BAT (do e2e: -0,35 ms/buoc); dat 0 de A/B
+#endif
+
 // Mot nguon su that duy nhat cho hinh hoc tile logits.
 constexpr int logits_lds_kpad(int BK, int PAD) { return BK + PAD; }
 constexpr size_t logits_lds_shorts(int BM, int BN, int BK, int PAD) {
@@ -4440,6 +4722,105 @@ matmul_logits_argmax_bf16_kernel_tuned(
     __syncthreads();
   }
 
+#if GETP_LOGITS_EPI
+  // ---- Epilogue argmax: gom trong THANH GHI truoc khi cham vao LDS -----------------
+  //
+  // Hang cua mot phan tu acc,
+  //     ly = WM*yInBlockTile + MFMA_M*im + 4*(laneIdx>>4) + i,
+  // KHONG phu thuoc `in` va KHONG phu thuoc (laneIdx & 15). Nen ban cu doi 4 gia tri
+  // `in` cua cung mot (im,i) vao DUNG MOT o smax[ly], va ca 16 lane cua cung mot nhom
+  // (laneIdx>>4) cung doi vao chinh o do: moi ds_cmpst_rtn_b32 cua vong CAS trong
+  // atomicMaxFloat (:4162) la xung dot 16-way tren MOT dia chi - LDS tuan tu hoa 16 lan,
+  // va vong while con quay lai vi ke thua cuoc phai thu lai. 64 chuoi phu thuoc
+  // doc->CAS->nhanh moi thread, nam sau vong k nen khong MFMA nao che duoc.
+  //
+  // Rut gon theo dung hai truc do truoc khi cham LDS:
+  //   (1) theo `in`: thuan thanh ghi, 3 v_max_f32;
+  //   (2) theo 16 lane trong nhom: 4 lan __shfl_xor mask 1,2,4,8 - mask < 16 nen phep
+  //       xor khong bao gio ra khoi nhom 16 lane, khong can tham so width (cung cach
+  //       flash attn dung o :2923).
+  // Chi lane (laneIdx&15)==0 ghi LDS: 16 atomic moi thread thay vi 64, va moi atomic con
+  // 4 lane tren 4 dia chi KHAC nhau -> het xung dot, vong CAS xong ngay vong dau.
+  //
+  // Bit-exact: max/min ket hop + giao hoan nen thu tu gop khong doi ket qua; o bi che
+  // duoc thay bang phan tu don vi (-INFINITY / INT_MAX) nen khong bao gio thang, dung
+  // nhu ban cu bo qua chung. Khong them thanh ghi song: acc_local da phai song qua ca
+  // hai pha o ca hai ban, nen 3 block/CU giu nguyen.
+  //
+  // Cho ho duy nhat la cap (+0,-0): `val > oldf` cua vong CAS giu o khong DEN TRUOC,
+  // con v_max_f32 giu o khong o mot vi tri co dinh - va khac biet do KHONG bi nuot vi
+  // order_preserving_bits(+0)=0x80000000 khac order_preserving_bits(-0)=0x7FFFFFFF.
+  // Cho ho nay khong dat toi duoc: acc_local khoi tao +0.0 va MFMA tich luy o RN, ma
+  // trong RN `a + b = -0.0` chi khi a = b = -0.0; bat dau tu +0.0 thi khong bao gio
+  // ra -0.0. Vay acc_local khong bao gio chua -0.0.
+  {
+    const int lane16 = laneIdx & 15;
+    const int gbase  = blockIdx.x * BN + WN * xInBlockTile;
+    #pragma unroll
+    for (int im = 0; im < nIterWaveM; ++im) {
+      #pragma unroll
+      for (int i = 0; i < 4; ++i) {
+        const int CDi = 4 * (laneIdx >> 4) + (i & 3);
+        const int ly  = WM * yInBlockTile + MFMA_M * im + CDi;
+        const int gy  = blockIdx.y * BM + ly;
+        float v = -INFINITY;
+        #pragma unroll
+        for (int in = 0; in < nIterWaveN; ++in) {
+          const int gx = gbase + in * MFMA_N + lane16;
+          const bool ok = (gx < N) && (gy < M);
+          // fmaxf -> v_max_f32 (IEEE maxNum): toan tu NaN thua toan tu khong-NaN, dung
+          // nhu `val > oldf` cua vong CAS cu khong bao gio cho NaN thang.
+          v = fmaxf(v, ok ? acc_local[im * nIterWaveN + in][i] : -INFINITY);
+        }
+        // Butterfly trong nhom 16 lane: sau 4 buoc moi lane giu max cua ca nhom.
+        v = fmaxf(v, __shfl_xor(v, 1));
+        v = fmaxf(v, __shfl_xor(v, 2));
+        v = fmaxf(v, __shfl_xor(v, 4));
+        v = fmaxf(v, __shfl_xor(v, 8));
+        // v == -INFINITY <=> khong o hop le nao (hoac tat ca deu -INFINITY). Ca hai
+        // truong hop atomicMaxFloat cu cung la khong-lam-gi vi `val > oldf` sai, nen bo
+        // qua la TUONG DUONG chu khong phai xap xi.
+        if (lane16 == 0 && v > -INFINITY) atomicMaxFloat(&smax[ly], v);
+      }
+    }
+  }
+  __syncthreads();
+  {
+    const int lane16 = laneIdx & 15;
+    const int gbase  = blockIdx.x * BN + WN * xInBlockTile;
+    #pragma unroll
+    for (int im = 0; im < nIterWaveM; ++im) {
+      #pragma unroll
+      for (int i = 0; i < 4; ++i) {
+        const int CDi = 4 * (laneIdx >> 4) + (i & 3);
+        const int ly  = WM * yInBlockTile + MFMA_M * im + CDi;
+        const int gy  = blockIdx.y * BM + ly;
+        // Hoist: smax[ly] khong phu thuoc `in`, nen 64 ds_read_b32 -> 16. Doc vo dieu
+        // kien la an toan (ly < BM luon dung, smax da khoi tao -INFINITY); khi gy >= M
+        // khong lane nao dong gop nen gia tri doc ra khong bao gio duoc dung den.
+        const float mv = smax[ly];
+        int cand = INT_MAX;
+        #pragma unroll
+        for (int in = 0; in < nIterWaveN; ++in) {
+          const int gx = gbase + in * MFMA_N + lane16;
+          const float v = acc_local[im * nIterWaveN + in][i];
+          const float thr = 1e-6f * fmaxf(fabsf(v), fabsf(mv));
+          const bool hit = (gx < N) && (gy < M) && (fabsf(v - mv) <= thr);
+          if (hit && gx < cand) cand = gx;
+        }
+        // Cung butterfly, phep min. Tach ra bien tam de moi mask chi mot ds_bpermute.
+        int o;
+        o = __shfl_xor(cand, 1); cand = (o < cand) ? o : cand;
+        o = __shfl_xor(cand, 2); cand = (o < cand) ? o : cand;
+        o = __shfl_xor(cand, 4); cand = (o < cand) ? o : cand;
+        o = __shfl_xor(cand, 8); cand = (o < cand) ? o : cand;
+        // sidx khoi tao INT_MAX nen atomicMin(INT_MAX) la khong-lam-gi: bo qua = tuong duong.
+        if (lane16 == 0 && cand != INT_MAX) atomicMin(&sidx[ly], cand);
+      }
+    }
+  }
+  __syncthreads();
+#else
   for (int im = 0; im < nIterWaveM; ++im) {
     for (int in = 0; in < nIterWaveN; ++in) {
       int acc_index = im * nIterWaveN + in;
@@ -4476,6 +4857,7 @@ matmul_logits_argmax_bf16_kernel_tuned(
     }
   }
   __syncthreads();
+#endif
   for (int r = threadIdx.x; r < BM; r += blockDim.x) {
     int gy = blockIdx.y * BM + r;
     if (gy < M) atomic_update_max_pair(&pairs[gy], smax[r], (unsigned)sidx[r]);
@@ -4733,6 +5115,22 @@ int *getp_forward_120b(Transformer * /*transformer*/,
     __hip_bfloat16 *dev_b_qkv =
         dev_w->b_qkv_bf16 +
         1ll * l * (head_dim * p->n_attn_heads + 2 * head_dim * p->n_kv_heads);
+#if GETP_ROPE_FUSED
+    // RoPE da nam trong epilogue cua qkv (va voi GETP_ROPE_FUSED_KV thi ca
+    // buoc doi bf16 xuong khe cache). dev_cos_vals/dev_sin_vals duoc sinh
+    // truoc vong lop lop tren CUNG stream nen thu tu van dung; pham vi song
+    // cua hai bang khong doi - truoc day apply_rotary_emb doc chung o DUNG
+    // cho nay, ngay sau qkv va truoc MoE cua lop.
+    getp_matmul_qkv_fused_bf16(dev_s->q, k_step, v_step, ext->pre_qkv_bf16,
+                               dev_w_qkv, dev_b_qkv, hidden_dim, head_dim,
+                               p->n_attn_heads, p->n_kv_heads, BATCH_SIZE,
+                               compute_stream, dev_cos_vals, dev_sin_vals,
+                               k_slot, v_slot);
+#if !GETP_ROPE_FUSED_KV
+    kv_store_pair_fp32_to_bf16(k_slot, v_slot, k_step, v_step,
+                               BATCH_SIZE * kv_dim, compute_stream);
+#endif
+#else
     getp_matmul_qkv_fused_bf16(dev_s->q, k_step, v_step, ext->pre_qkv_bf16,
                                dev_w_qkv, dev_b_qkv, hidden_dim, head_dim,
                                p->n_attn_heads, p->n_kv_heads, BATCH_SIZE,
@@ -4746,6 +5144,7 @@ int *getp_forward_120b(Transformer * /*transformer*/,
 
     kv_store_pair_fp32_to_bf16(k_slot, v_slot, k_step, v_step,
                                BATCH_SIZE * kv_dim, compute_stream);
+#endif
 
     {
       const __hip_bfloat16 *k_layer = key_cache + base_off;
@@ -4854,20 +5253,48 @@ int *getp_forward_120b(Transformer * /*transformer*/,
       ext->blk_counts, ext->blk_offsets,
       EXPERT_PARALLELISM * BATCH_SIZE * p->experts_per_token, compute_stream);
 
+#if !GETP_SMALL_NOSCATTER
   moe_scatter_acts_to_expert_frombf16(
       ext->a_in, ext->ext_t_bf16, ext->e_dev,
       ext->e_offsets + experts_per_device, EXPERT_PARALLELISM * BATCH_SIZE * p->experts_per_token,
       hidden_dim, compute_stream);
+#endif
 
   // (memset 35,4 MB da bo: moe_gather_pairs gio ghi de toan bo vung nay)
 
   __hip_bfloat16 *w1_base = dev_w->w_mlp1 + 1ll * l * experts_per_device * 2 * p->intermediate_dim * hidden_dim;
   __hip_bfloat16 *b1_base = dev_w->b_mlp1 + 1ll * l * experts_per_device * 2 * p->intermediate_dim;
 
+#if GETP_SMALL_NOSCATTER
+  // RAW: hipMemcpyPeerAsync keo ext_t_bf16 ve tren memory_stream da duoc
+  // hipStreamWaitEvent dua vao compute_stream TRUOC map_global_to_local o tren;
+  // lat cat cua chinh minh do rmsnorm(l) ghi truoc do tren compute_stream.
+  // Kernel chep (ban vua bo) doc dung vung nho nay, ngay tai cho nay.
+  //
+  // WAR - day moi la cho thay doi that su, va no KHONG hien nhien: mlp1 doc
+  // ext_t_bf16 muon hon kernel chep rat nhieu (49 ms sau, thay vi 1,4 ms), con
+  // pull cua LOP l+1 thi GHI de len cac lat cat peer cua chinh buffer nay, tren
+  // memory_stream, ma memory_stream khong he cho tren compute_stream cua ta
+  // (sync_workers_dev chi cho tren event cua PEER). An toan la nho mot day
+  // bac cau, voi EXPERT_PARALLELISM = 2:
+  //   pullT(l+1) [memory_D]  sau  E_P(2l+2)            (hipStreamWaitEvent)
+  //   E_P(2l+2)              sau  vecadd_P(l)          (cung compute_P)
+  //   vecadd_P(l)            sau  event e_agg_P(l)     (hipStreamWaitEvent)
+  //   e_agg copy [memory_P]  sau  E_D(2l+1)            (hipStreamWaitEvent)
+  //   E_D(2l+1)              sau  gather_D(l) va mlp1_D(l)  (cung compute_D)
+  // => mlp1(l) xong han truoc khi pull(l+1) bat dau ghi. Voi n_dev > 2 va voi
+  // GETP_DEVSYNC=0, sync_workers* goi hipStreamSynchronize(compute_stream)
+  // ngay tai diem dong bo nen ket luan con manh hon.
+  launch_mlp1_swiglu_bf16_bucketed_outbf16(
+      ext->gate_up_bf16, ext->ext_t_bf16, w1_base, b1_base, ext->e_offsets,
+      ext->blk_offsets, hidden_dim, p->intermediate_dim, experts_per_device,
+      total_blocks_mlp1, p->swiglu_limit, compute_stream, ext->e_dev);
+#else
   launch_mlp1_swiglu_bf16_bucketed_outbf16(
       ext->gate_up_bf16, ext->a_in, w1_base, b1_base, ext->e_offsets,
       ext->blk_offsets, hidden_dim, p->intermediate_dim, experts_per_device,
       total_blocks_mlp1, p->swiglu_limit, compute_stream);
+#endif
 
   __hip_bfloat16 *w2_base = dev_w->w_mlp2 + 1ll * l * experts_per_device * hidden_dim * p->intermediate_dim;
   __hip_bfloat16 *b2_base = dev_w->b_mlp2 + 1ll * l * experts_per_device * hidden_dim;
@@ -5040,6 +5467,22 @@ int *getp_forward_20b(Transformer * /*transformer*/,
         1ll * l * (head_dim * p->n_attn_heads + 2 * head_dim * p->n_kv_heads);
     tensor_fp32_to_bf16(ext->pre_qkv_bf16, dev_s->t,
                         batch_size * hidden_dim, nullptr);
+#if GETP_ROPE_FUSED
+    // RoPE da nam trong epilogue cua qkv (va voi GETP_ROPE_FUSED_KV thi ca
+    // buoc doi bf16 xuong khe cache). dev_cos_vals/dev_sin_vals duoc sinh
+    // truoc vong lop lop tren CUNG stream nen thu tu van dung; pham vi song
+    // cua hai bang khong doi - truoc day apply_rotary_emb doc chung o DUNG
+    // cho nay, ngay sau qkv va truoc MoE cua lop.
+    getp_matmul_qkv_fused_bf16(dev_s->q, k_step, v_step, ext->pre_qkv_bf16,
+                               dev_w_qkv, dev_b_qkv, hidden_dim, head_dim,
+                               p->n_attn_heads, p->n_kv_heads, batch_size,
+                               nullptr, dev_cos_vals, dev_sin_vals,
+                               k_slot, v_slot);
+#if !GETP_ROPE_FUSED_KV
+    kv_store_pair_fp32_to_bf16(k_slot, v_slot, k_step, v_step,
+                               batch_size * kv_dim, nullptr);
+#endif
+#else
     getp_matmul_qkv_fused_bf16(dev_s->q, k_step, v_step, ext->pre_qkv_bf16,
                                dev_w_qkv, dev_b_qkv, hidden_dim, head_dim,
                                p->n_attn_heads, p->n_kv_heads, batch_size,
@@ -5052,6 +5495,7 @@ int *getp_forward_20b(Transformer * /*transformer*/,
 
     kv_store_pair_fp32_to_bf16(k_slot, v_slot, k_step, v_step,
                                batch_size * kv_dim, nullptr);
+#endif
 
     {
       const __hip_bfloat16 *k_layer = key_cache + base_off;
