@@ -4561,8 +4561,8 @@ static inline void getp_argmax_rows(const float *logits, int V, int *out, int B,
 
 }
 
-// Bat mac dinh: do 8 GPU / 1024 buoc, hai luot xen ke -> 64.143 vs 62.894 tok/s (+2,0 %),
-// dau ra bit-exact. Dat -DGETP_DEVSYNC=0 de quay lai hang rao cu.
+// Bat mac dinh, nhung chi co tac dung khi EXPERT_PARALLELISM <= 2 - xem ghi chu trong
+// sync_workers_dev. Dat -DGETP_DEVSYNC=0 de quay lai hang rao cu o moi cau hinh.
 #ifndef GETP_DEVSYNC
 #define GETP_DEVSYNC 1
 #endif
@@ -4585,6 +4585,15 @@ static inline void sync_workers_dev(hipStream_t rec_stream, hipStream_t wait_str
     g_ev_sync_ready[dev] = true;
     HIP_CHECK(hipStreamSynchronize(rec_stream));
     sync_point.wait();          // moi thiet bi da tao xong event cua minh
+  }
+  // Chi dung duong event khi IT peer. Do 8 GPU / 1024 buoc: voi EXPERT_PARALLELISM = 2 (20b)
+  // no nhanh hon 0,7 % (63.788 -> 64.361); voi EXPERT_PARALLELISM = 8 (120b) no CHAM 15 %
+  // (20.003 -> 16.931), vi moi diem dong bo xep 7 hipStreamWaitEvent len memory_stream va
+  // host khong con vat can nen hang doi cua no sau dan. Nhieu peer thi vat can lai re hon.
+  if (n_dev > 2) {
+    HIP_CHECK(hipStreamSynchronize(rec_stream));
+    sync_point.wait();
+    return;
   }
   const int k = slot % GETP_SYNC_SLOTS;
   HIP_CHECK(hipEventRecord(g_ev_sync[dev][k], rec_stream));
