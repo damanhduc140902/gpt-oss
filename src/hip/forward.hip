@@ -4463,6 +4463,18 @@ __global__ void extract_argmax_pairs(const unsigned long long* pairs, int* out, 
   if (i < B) out[i] = static_cast<int>(unpack_idx(pairs[i]));
 }
 
+// Swizzle theo nhom cho logits: G khoi HANG chay nhanh nhat trong moi nhom, de G block dung
+// chung mot tile trong so trong L2. G phai du nho de G tile X con vua L2 (xem lgswzg).
+#ifndef GETP_LOGITS_SWZ
+#define GETP_LOGITS_SWZ 1   // mac dinh BAT; dat 0 de A/B
+#endif
+#ifndef GETP_LOGITS_SWZ_G
+// G da quet het, don dieu va dat dinh o 2 (logits us moi buoc, doi chung 21.521):
+//   G=2 -> 20.783 | G=3 -> 21.071 | G=4 -> 21.455 | G=6 -> 22.467
+// Tap X cua mot nhom la G x BM x K x 4 = G x 1,47 MB va no phinh ra khoi L2 8 MB.
+#define GETP_LOGITS_SWZ_G 2
+#endif
+
 #ifndef MATMUL_LOGITS_BLOCK_ROWS
 #define MATMUL_LOGITS_BLOCK_ROWS 128
 #endif
@@ -4563,6 +4575,28 @@ matmul_logits_argmax_bf16_kernel_tuned(
     int M, int N, int K,
     unsigned long long* __restrict__ pairs) {
 
+  // Anh xa block -> (khoi hang, khoi cot). Mac dinh giu nguyen thu tu cu.
+  const int nrow_blk = (M + BM - 1) / BM;
+#if GETP_LOGITS_SWZ
+  // Luoi mot chieu, tach lai: trong moi nhom GZ khoi hang, khoi HANG chay nhanh nhat. GZ block
+  // ke nhau doc CUNG mot tile trong so nen no ve tu HBM mot lan roi nam trong L2 cho ca nhom.
+  constexpr int GZ = GETP_LOGITS_SWZ_G;
+  static_assert(GZ >= 1, "G phai duong");
+  const int ncol_blk = (N + BN - 1) / BN;
+  const int perg = GZ * ncol_blk;
+  const int gz = (int)blockIdx.x / perg;
+  const int tz = (int)blockIdx.x - gz * perg;
+  const int blk_row = gz * GZ + (tz % GZ);
+  const int blk_col = tz / GZ;
+  // Khoi thua khi nrow_blk khong chia het GZ. blk_row dong deu trong block nen ca block cung
+  // thoat, va cho nay nam truoc moi __syncthreads.
+  if (blk_row >= nrow_blk) return;
+#else
+  const int blk_row = (int)blockIdx.y;
+  const int blk_col = (int)blockIdx.x;
+  (void)nrow_blk;
+#endif
+
   constexpr int MFMA_M = 16;
   constexpr int MFMA_N = 16;
   constexpr int MFMA_K = 16;
@@ -4654,7 +4688,7 @@ matmul_logits_argmax_bf16_kernel_tuned(
     int off = i * strideX;
     int ry = loadXIdx_y + off;
     if (ry >= BM) break;
-    const int rg = BM * blockIdx.y + ry;
+    const int rg = BM * blk_row + ry;
     const int kk = 4 * loadXIdx_x;
     float4 tmp = (kk < K && rg < M) ? *reinterpret_cast<const float4 *>(&x[(size_t)rg * K + kk]) : make_float4(0,0,0,0);
     // dia chi = 2*(ry*KPAD + 4*loadXIdx_x) byte: KPAD boi 4 va chunk boi 4
@@ -4664,7 +4698,7 @@ matmul_logits_argmax_bf16_kernel_tuned(
   for (int i = 0; i < nbLoadsW; ++i) {
     int off = i * strideW;
     int kk = 0 + 8 * loadWIdx_x;
-    int cy = BN * blockIdx.x + loadWIdx_y + off;
+    int cy = BN * blk_col + loadWIdx_y + off;
     uint4 t = (kk < K && cy < N) ? *reinterpret_cast<const uint4 *>(&w[(size_t)cy * K + kk]) : make_uint4(0,0,0,0);
     logits_lds_store8(&wsT[loadWIdx_y + off][8 * loadWIdx_x], t);
   }
@@ -4677,14 +4711,14 @@ matmul_logits_argmax_bf16_kernel_tuned(
       for (int i = 0; i < nbLoadsX; ++i) {
         int off = i * strideX;
         int ry = loadXIdx_y + off;
-        int rg = BM * blockIdx.y + ry;
+        int rg = BM * blk_row + ry;
         int kk = bkIdx + BK + 4 * loadXIdx_x;
         regX[i] = (kk < K && rg < M) ? *reinterpret_cast<const float4 *>(&x[(size_t)rg * K + kk]) : make_float4(0,0,0,0);
       }
       for (int i = 0; i < nbLoadsW; ++i) {
         int off = i * strideW;
         int kk = bkIdx + BK + 8 * loadWIdx_x;
-        int cy = BN * blockIdx.x + loadWIdx_y + off;
+        int cy = BN * blk_col + loadWIdx_y + off;
         regW[i] = (kk < K && cy < N) ? *reinterpret_cast<const uint4 *>(&w[(size_t)cy * K + kk]) : make_uint4(0,0,0,0);
       }
     }
@@ -4755,14 +4789,14 @@ matmul_logits_argmax_bf16_kernel_tuned(
   // ra -0.0. Vay acc_local khong bao gio chua -0.0.
   {
     const int lane16 = laneIdx & 15;
-    const int gbase  = blockIdx.x * BN + WN * xInBlockTile;
+    const int gbase  = blk_col * BN + WN * xInBlockTile;
     #pragma unroll
     for (int im = 0; im < nIterWaveM; ++im) {
       #pragma unroll
       for (int i = 0; i < 4; ++i) {
         const int CDi = 4 * (laneIdx >> 4) + (i & 3);
         const int ly  = WM * yInBlockTile + MFMA_M * im + CDi;
-        const int gy  = blockIdx.y * BM + ly;
+        const int gy  = blk_row * BM + ly;
         float v = -INFINITY;
         #pragma unroll
         for (int in = 0; in < nIterWaveN; ++in) {
@@ -4787,14 +4821,14 @@ matmul_logits_argmax_bf16_kernel_tuned(
   __syncthreads();
   {
     const int lane16 = laneIdx & 15;
-    const int gbase  = blockIdx.x * BN + WN * xInBlockTile;
+    const int gbase  = blk_col * BN + WN * xInBlockTile;
     #pragma unroll
     for (int im = 0; im < nIterWaveM; ++im) {
       #pragma unroll
       for (int i = 0; i < 4; ++i) {
         const int CDi = 4 * (laneIdx >> 4) + (i & 3);
         const int ly  = WM * yInBlockTile + MFMA_M * im + CDi;
-        const int gy  = blockIdx.y * BM + ly;
+        const int gy  = blk_row * BM + ly;
         // Hoist: smax[ly] khong phu thuoc `in`, nen 64 ds_read_b32 -> 16. Doc vo dieu
         // kien la an toan (ly < BM luon dung, smax da khoi tao -INFINITY); khi gy >= M
         // khong lane nao dong gop nen gia tri doc ra khong bao gio duoc dung den.
@@ -4827,9 +4861,9 @@ matmul_logits_argmax_bf16_kernel_tuned(
       for (int i = 0; i < 4; ++i) {
         int CDi = 4 * (laneIdx >> 4) + (i & 3);
         int CDj = laneIdx & 15;
-        int gx = blockIdx.x * BN + WN * xInBlockTile + in * MFMA_N + CDj;
+        int gx = blk_col * BN + WN * xInBlockTile + in * MFMA_N + CDj;
         int ly = WM * yInBlockTile + MFMA_M * im + CDi;
-        int gy = blockIdx.y * BM + ly;
+        int gy = blk_row * BM + ly;
         float v = acc_local[acc_index][i];
         if (gx < N && gy < M) {
           float mv = atomicMaxFloat(&smax[ly], v);
@@ -4844,9 +4878,9 @@ matmul_logits_argmax_bf16_kernel_tuned(
       for (int i = 0; i < 4; ++i) {
         int CDi = 4 * (laneIdx >> 4) + (i & 3);
         int CDj = laneIdx & 15;
-        int gx = blockIdx.x * BN + WN * xInBlockTile + in * MFMA_N + CDj;
+        int gx = blk_col * BN + WN * xInBlockTile + in * MFMA_N + CDj;
         int ly = WM * yInBlockTile + MFMA_M * im + CDi;
-        int gy = blockIdx.y * BM + ly;
+        int gy = blk_row * BM + ly;
         float v = acc_local[acc_index][i];
         if (gx < N && gy < M) {
           float mv = smax[ly];
@@ -4859,7 +4893,7 @@ matmul_logits_argmax_bf16_kernel_tuned(
   __syncthreads();
 #endif
   for (int r = threadIdx.x; r < BM; r += blockDim.x) {
-    int gy = blockIdx.y * BM + r;
+    int gy = blk_row * BM + r;
     if (gy < M) atomic_update_max_pair(&pairs[gy], smax[r], (unsigned)sidx[r]);
   }
 }
@@ -4878,7 +4912,15 @@ static inline void getp_matmul_logits_argmax_bf16(
   constexpr int WARPS = MATMUL_LOGITS_WAVES_PER_BLOCK;
 
   dim3 block(64 * WARPS);
+#if GETP_LOGITS_SWZ
+  // Luoi mot chieu; kernel tach lai thanh (hang, cot). So khoi hang lam tron len boi cua G
+  // thi phep tach moi la song anh - phan thua la block rong, thoat ngay.
+  const int nrow_up = (((M + BM - 1) / BM + GETP_LOGITS_SWZ_G - 1) / GETP_LOGITS_SWZ_G)
+                      * GETP_LOGITS_SWZ_G;
+  dim3 grid(((N + BN - 1) / BN) * nrow_up);
+#else
   dim3 grid((N + BN - 1) / BN, (M + BM - 1) / BM);
+#endif
 
   // hipFree dong bo ca thiet bi, nen cap phat/giai phong moi buoc la mot lan
   // dung hoan toan moi buoc cho mot buffer 12 KB co kich thuoc khong doi.
