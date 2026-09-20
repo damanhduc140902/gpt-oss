@@ -45,6 +45,15 @@
 #endif
 
 // --- smallfuse: hai cong tac doc lap, mac dinh TAT ---------------------------
+// Ghi Q san o bf16 da nhan 1/sqrt(d): attention doi no sang bf16 o lan dung dau tien roi,
+// va he so la 2^-3 nen phep nhan khong doi mantissa. Xem dau file qbf16.
+#ifndef GETP_Q_BF16
+#define GETP_Q_BF16 1   // mac dinh BAT (attention 445 -> 355 us/goi); dat 0 de A/B
+#endif
+#if GETP_Q_BF16 && !GETP_ROPE_FUSED
+#error "GETP_Q_BF16 can GETP_ROPE_FUSED: epilogue khong-rope ghi q o cho khac"
+#endif
+
 #ifndef GETP_SMALL_TOPK
 #define GETP_SMALL_TOPK 1   // mac dinh BAT (do e2e: -2,09 ms/buoc); dat 0 de A/B
 #endif
@@ -3809,15 +3818,6 @@ flash_attn_decode_odd_layer_bf16_matrix_core_kernel(
   }
 
 }
-
-// Ghi Q san o bf16 da nhan 1/sqrt(d): attention doi no sang bf16 o lan dung dau tien roi,
-// va he so la 2^-3 nen phep nhan khong doi mantissa. Xem dau file qbf16.
-#ifndef GETP_Q_BF16
-#define GETP_Q_BF16 1   // mac dinh BAT (attention 445 -> 355 us/goi); dat 0 de A/B
-#endif
-#if GETP_Q_BF16 && !GETP_ROPE_FUSED
-#error "GETP_Q_BF16 can GETP_ROPE_FUSED: epilogue khong-rope ghi q o cho khac"
-#endif
 
 #ifndef FLASH_DECODE_TILE_T
 #define FLASH_DECODE_TILE_T 16
