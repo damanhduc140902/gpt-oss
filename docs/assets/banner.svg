@@ -10,9 +10,9 @@
 
   <g font-family="ui-monospace, SFMono-Regular, Menlo, Consolas, monospace" font-size="13">
     <text x="72"  y="182" fill="#6E7781">20b</text>
-    <text x="122" y="182" fill="#1F2328">64,143 tok/s</text>
+    <text x="122" y="182" fill="#1F2328">64,509 tok/s</text>
     <text x="288" y="182" fill="#6E7781">120b</text>
-    <text x="346" y="182" fill="#1F2328">19,904 tok/s</text>
+    <text x="346" y="182" fill="#1F2328">20,168 tok/s</text>
     <text x="512" y="182" fill="#6E7781">8 x AMD MI250</text>
   </g>
 </svg>

@@ -858,6 +858,16 @@ mlp1_swiglu_bf16_bucketed_kernel_outbf16_tuned(
       }
     }
 
+    // Ghim lich cho vung tinh cua mlp1, co tinh ca lenh nap HBM: mask 0x0020 = VMEM read,
+    // 0x0100 = doc LDS, 0x0008 = MFMA. Phat het lenh nap truoc, roi doc LDS, roi MFMA.
+    // Cac vong ghim truoc chi ghim MFMA va doc LDS, nen 12 lenh nap van bi compiler rai xen
+    // giua chuoi MFMA va moi lan nhu vay keo theo mot s_waitcnt vmcnt. Do 8 GPU / 1024 buoc,
+    // hai cap xen ke: 64.505 / 64.512 so voi 64.299 / 64.248 (+0,4 %), dau ra bit-exact.
+    // Mau "xen 1 doc LDS sau moi 4 MFMA" da thu va CHAM hon (mlp1 1.797 so voi 1.688 us/goi).
+    __builtin_amdgcn_sched_group_barrier(0x0020, 12, 0);
+    __builtin_amdgcn_sched_group_barrier(0x0100, 20, 0);
+    __builtin_amdgcn_sched_group_barrier(0x0008, 64, 0);
+    __builtin_amdgcn_sched_barrier(0);
     __syncthreads();
 
     if (bk + BK < H) {

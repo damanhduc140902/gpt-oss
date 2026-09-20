@@ -23,7 +23,7 @@ hipBLAS, no RCCL, no MPI. Every kernel, every collective and the tokenizer are w
 this repository. The only dependency is the HIP runtime itself.
 
 It began from [llama2.c](https://github.com/karpathy/llama2.c) and grew into a complete inference system.
-On a single node of 8 AMD MI250 GPUs it serves **64,143 tokens per second on the 20B model and 19,904 on
+On a single node of 8 AMD MI250 GPUs it serves **64,509 tokens per second on the 20B model and 20,168 on
 the 120B model**, while keeping the generated text faithful to a CPU reference.
 
 Two things are measured, and both have to hold:
@@ -224,8 +224,8 @@ Measured on one node of 8× AMD MI250 in batch (`getp`) mode.
 
 | Model          | Requests | Warm-up (s) | Inference (s) | Throughput (TPS) | METEOR | BERTScore |
 | -------------- | -------: | ----------: | ------------: | ---------------: | -----: | --------: |
-| `gpt-oss-20b`  |    12288 |          23 |           191 |        **64143** |  0.535 |     0.978 |
-| `gpt-oss-120b` |     6144 |         176 |           305 |        **19904** |  0.561 |     0.981 |
+| `gpt-oss-20b`  |    12288 |          23 |           189 |        **64509** |  0.535 |     0.978 |
+| `gpt-oss-120b` |     6144 |         176 |           301 |        **20168** |  0.561 |     0.981 |
 
 Where those numbers came from, one optimisation at a time on the 20B model:
 
@@ -242,9 +242,10 @@ Where those numbers came from, one optimisation at a time on the 20B model:
 | mlp2 block 96 -> 128 (64-row wave tile), split-K pinned off            |      62937 |  +3.4% |
 | MoE host read-backs removed; grids sized from the worst case           |      63444 |  +0.8% |
 | Expert exchange made pull-based; two runs now agree on 100 % of output |      62841 |  -1.0% |
-| mlp2 k-loop schedule pinned; per-layer queue drains removed            |  **64143** |  +2.1% |
+| mlp2 k-loop schedule pinned; per-layer queue drains removed            |      64143 |  +2.1% |
+| mlp1 k-loop schedule pinned, including the HBM loads                   |  **64509** |  +0.6% |
 
-The 120B model went from 13,149 to 19,904 tok/s over the same work, with no
+The 120B model went from 13,149 to 20,168 tok/s over the same work, with no
 changes specific to it - it runs the same kernels with the same defaults.
 
 Warm-up is dominated by reading the checkpoint off disk, so it depends on whether the file is still in
