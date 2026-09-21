@@ -103,7 +103,7 @@ resident weights come to 32.9 GB per device. The
 `EP × BATCH_SIZE × hidden_dim` ([`src/getp/state_ext.cpp`](../src/getp/state_ext.cpp)) and so grow
 linearly with EP. At EP = 8 that is 6144 tokens in flight per replica with a per-device activation
 footprint that stays bounded; at 1536 rows per device the same buffers would be twice the size —
-~496 MB instead of the ~248 MB tabulated below, not four times, since only `BATCH_SIZE` changes.
+~637 MB instead of the ~319 MB tabulated below, not four times, since only `BATCH_SIZE` changes.
 
 With EP fixed, the node layout follows. `n_parallel_models = n_devices / EXPERT_PARALLELISM`
 ([`src/getp/run.cpp`](../src/getp/run.cpp)), so an 8-GPU node runs one 8-way replica for 120B and four
@@ -184,35 +184,45 @@ phase two. `peer_e_agg` is indexed by fetch order `j`, not by slice.
 
 The FFN RMSNorm writes its own slice twice in a single pass on the compute stream — fp32 into `ext_t`
 for the router, bf16 into `ext_t_bf16` for the wire. The rank then records `event_rmsnorm` on the
-compute stream, has the memory stream wait on it, and pushes that bf16 slice into the identical
-offset of every peer's buffer:
+compute stream — `event_rmsnorm` and `event_router_topk` are still recorded there, but nothing waits on
+them any more. The exchange is ordered by the per-layer barrier instead, and it runs in the opposite
+direction: after the barrier each rank *pulls* every peer's bf16 slice, together with that peer's top-k
+ids and weights, into the identical offset of its own buffers:
 
 ```c
-for (int delta = 1; delta < EXPERT_PARALLELISM; ++delta) {
+for (int delta = 1, j = 0; delta < EXPERT_PARALLELISM; ++delta) {
   int i = (device_index + delta) % EXPERT_PARALLELISM;
   GPUWorker *peer_worker = &workers[i];
   int peer_device_index = peer_worker->device_index;
   RunStateExt *peer_ext = ext_get(peer_device_index);
-  if (peer_device_index != device_index) {
-    HIP_CHECK(hipMemcpyPeerAsync(
-        peer_ext->ext_t_bf16 + (size_t)(device_index - base_device_index) * BATCH_SIZE * hidden_dim,
-        peer_device_index,
-        ext->ext_t_bf16 + (size_t)(device_index - base_device_index) * BATCH_SIZE * hidden_dim,
-        device_index,
-        sizeof(__hip_bfloat16) * (size_t)BATCH_SIZE * (size_t)hidden_dim,
-        memory_stream));
-  }
+  if (peer_device_index == device_index) continue;
+  const size_t ps = (size_t)(peer_device_index - base_device_index);
+  HIP_CHECK(hipMemcpyPeerAsync(
+      ext->ext_t_bf16 + ps * BATCH_SIZE * hidden_dim, device_index,
+      peer_ext->ext_t_bf16 + ps * BATCH_SIZE * hidden_dim, peer_device_index,
+      sizeof(__hip_bfloat16) * (size_t)BATCH_SIZE * (size_t)hidden_dim, memory_stream));
+  // ext_topk_i and ext_topk_v are pulled in the same iteration, same shape.
+  HIP_CHECK(hipEventRecord(events_pull[j], memory_stream));
+  ++j;
 }
 ```
 
-A second loop with the same structure, gated on `event_router_topk`, pushes `ext_topk_i` and
-`ext_topk_v` — the chosen expert ids and their weights. Those are small, 4 values per token, but they
-must arrive before the receiving rank can decide which tokens are its business.
+The expert ids and their weights therefore ride in this one loop rather than a second one. Those are
+small, 4 values per token, but they must arrive before the receiving rank can decide which tokens are
+its business, so a second loop over the same peers makes the compute stream wait on each
+`events_pull[j]` before `getp_map_global_to_local_batch` runs.
 
-The activations are sent as **bf16**, not fp32. `getp_rmsnorm_f32_bf16` emits both forms in one pass —
-fp32 into `ext_t`, which only the router reads, and bf16 into `ext_t_bf16`, which is what goes on the
-wire — so halving the wire cost of the outbound phase costs no separate cast kernel and no extra HBM
-round trip, at no accuracy cost the MoE MLPs would notice: they consume bf16 anyway.
+The direction was a push before, and the push was wrong. Copying into the peer's buffer on the peer's
+memory stream and then synchronising on the host left a rare window in which a rank read the previous
+step's `ext_t_bf16`/top-k: hashing 11 points per layer across two 8-GPU runs caught about four events
+per run, always on a matching (step, layer) pair of EP ranks, with the first divergence at `a_in` after
+the scatter while that rank's own top-k and attention still matched. Acquiring on the receiving side
+and fine-grained memory both failed to close it. Pulling on the receiving device's queue is the pattern
+the `e_agg` path already used, and it measures clean.
+The activations go on the wire as **bf16**, not fp32. Because the RMSNorm above emits both forms in
+one pass — fp32 into `ext_t`, which only the router reads, and bf16 into `ext_t_bf16`, which is what
+travels — halving the outbound wire cost needs no separate cast kernel and no extra HBM round trip,
+at no accuracy the MoE MLPs would notice: they consume bf16 anyway.
 
 Once the gather completes, `getp_map_global_to_local_batch` filters all `EP × BATCH_SIZE` tokens down to
 the ones this rank can serve, keeping `eg >= expert_start && eg < expert_end` and rebasing the id to
@@ -220,12 +230,15 @@ the ones this rank can serve, keeping `eg >= expert_start && eg < expert_end` an
 
 ## Phase two: the reduce-scatter
 
-The return path is a **fetch**, not a push, and the asymmetry is deliberate.
+The return path is a **fetch**, the same shape as phase one: a rank reads from its peers rather than writing to them.
 
 `moe_gather_pairs_acc` sums each token's expert pairs once and splits the result by destination. For
 the `BATCH_SIZE` tokens of its own slice it adds straight into the residual `dev_x`, which saves a
 `getp_vecadd`; for the other `(EP−1) × BATCH_SIZE` tokens it _overwrites_ `ext_e_agg`
-(`e_agg[...] = s`, not `+=` — the B × H grid covers every cell exactly once). Every rank therefore
+(`e_agg[...] = s`, not `+=`). With `GETP_ROWSKIP=0` the B × H grid covers every cell exactly once;
+with it on — the default whenever EP > 2, hence on 120B — the kernel returns early for the rows whose
+partial sum is zero and packs the survivors to the head of each peer's slice, which is what lets the
+fetch be shortened to those rows (see **What it costs**). Every rank therefore
 holds a partial sum for every token it does _not_ own — partial, because it only ran the experts it
 owns — while its own slice of `ext_e_agg`, which no peer ever reads, is never written at all. Having
 folded its own slice into the residual, the rank pulls from each peer the part of that peer's
@@ -254,7 +267,7 @@ Summed over ranks, scattered over token slices: reduce-scatter.
 The inbound partial sums stay **fp32**. They are sums of expert outputs that will be added into the
 residual, and rounding each peer's partial to bf16 before summing would accumulate error across up to
 eight contributions. The bandwidth cost is accepted instead. Per token slice the return path therefore
-moves twice the bytes of the forward path — 8.44 MiB against 4.22 MiB per peer on 120B.
+Per token slice the return path would therefore move twice the bytes of the forward path — 8.44 MiB against 4.22 MiB per peer on 120B — were every row sent. `GETP_ROWSKIP` (default on, and active here because 120B runs `EXPERT_PARALLELISM` 8) pulls only the rows that are non-zero, and on 120B 57 % of them are zero, so the fetch is about 3.6 MiB per peer — below the 4.22 MiB outbound.
 
 The adds are overlapped with the transfers rather than waiting for all of them:
 
@@ -276,11 +289,11 @@ for (int delta = 1, j = 0; delta < EXPERT_PARALLELISM; ++delta) {
 Each fetch records its own event; the compute stream waits on event _j_ immediately before the _j_-th
 `getp_vecadd`. The first peer's contribution is being added while the later transfers — in order on the
 same memory stream — are still in flight. That is why this phase does not end with a
-`hipStreamSynchronize` on the memory stream the way phase one does.
+`hipStreamSynchronize` on the memory stream. Phase one does not either: it hands its pulls to the compute stream through `events_pull` the same way.
 
 ## Ordering: the delta rotation
 
-All four loops in the MoE block walk the same rotation. Three of them copy — the `ext_t_bf16`
+All five loops in the MoE block walk the same rotation. Two of them copy — the phase-one pull, whose single body carries `ext_t_bf16` and both top-k arrays, and the `ext_e_agg` fetch. The other three issue no transfer at all: two reuse the walk to pair each `hipStreamWaitEvent` with the work that follows it — the waits on `events_pull`, and the waits that gate each add on the return path — and the third, present only when `GETP_ROWSKIP` is active (`EXPERT_PARALLELISM > 2`), launches the receive-side row-list build once per peer slice:
 push, the top-k push and the `ext_e_agg` fetch; the fourth issues no transfer at all and only
 reuses the same walk to pair each `hipStreamWaitEvent` with its `getp_vecadd`:
 
@@ -300,7 +313,7 @@ The copies of one phase are all issued on the same per-device `memory_stream`, c
 `hipStreamNonBlocking` in [`src/getp/transformer.cpp`](../src/getp/transformer.cpp), so they execute in
 issue order. That is what makes the ordering meaningful rather than cosmetic.
 
-At step `delta`, rank _i_ is pushing to rank _(i+delta) mod N_ while being pushed to by rank
+At step `delta`, rank _i_ is pulling from rank _(i+delta) mod N_ while being pulled from by rank
 _(i−delta) mod N_. One outbound and one inbound transfer per rank: a perfect matching on the peer graph
 at every step, so every link carries traffic in both directions at once. PCIe is full duplex, and this
 is the pattern that uses both halves of it.
@@ -325,7 +338,7 @@ N−1 transfers while its own outbound link sits idle. The phase stretches to ro
 transfers instead of N−1 concurrent ones. On 120B that is the difference between 7 rounds and something
 closer to 7 × 7.
 
-The fetch loop in phase two inverts the roles — rank _i_ reads _from_ _(i+delta)_ — and the matching
+Both copy loops read the same way — rank _i_ reads _from_ _(i+delta)_ — and the matching
 argument is unchanged: at each step every rank is the source for exactly one peer and the destination of
 exactly one transfer.
 
@@ -386,11 +399,11 @@ Over a full decode step:
 |                                                             | `gpt-oss-20b` | `gpt-oss-120b` |
 | ----------------------------------------------------------- | ------------: | -------------: |
 | Layers                                                      |            24 |             36 |
-| P2P bytes per device per decode step                        |      ≈ 638 MB |      ≈ 3.35 GB |
+| P2P bytes per device per decode step                        |      ≈ 638 MB |      ≈ 2.08 GB |
 | `hipMemcpyPeerAsync` calls per device per layer, 4 × (EP−1) |             4 |             28 |
 | Global barriers per decode step, 2 per layer + 1            |            49 |             73 |
 
-Counting the whole phase, inbound is a shade under twice outbound rather than exactly twice, because the
+Counting the whole phase, which direction dominates depends on `GETP_ROWSKIP`. With it on — the default, and active at EP 8, so this is the shipping configuration for 120B — inbound is the smaller side: about 26,600,000 B in against 31,137,792 B out per layer, because only the reduce-scatter is row-skipped and the all-gather still sends every row. With `GETP_ROWSKIP=0`, inbound is 61,931,520 B, a shade under twice outbound rather than exactly twice, because the outbound side also carries the two top-k arrays.
 outbound side also carries the two top-k arrays: 61,931,520 B in against 31,137,792 B out per layer on
 120B.
 
@@ -405,7 +418,12 @@ Staging memory is the other cost. Every EP buffer is sized `EP × BATCH_SIZE × 
 | `ext_t_bf16` | bf16 |      35.4 MB |
 | `ext_e_agg`  | fp32 |      70.8 MB |
 | `peer_e_agg` | fp32 |      70.8 MB |
-| **Total**    |      | **≈ 248 MB** |
+| `ext_e_agg`  | fp32 |      70.8 MB |
+| `ext_e_agg2` | fp32 |      70.8 MB |
+| `peer_e_agg` | fp32 |      70.8 MB |
+| **Total**    |      | **≈ 319 MB** |
+
+`ext_e_agg2` is the second half of the layer-parity double buffer (`src/hip/forward.hip:5606`), so it is resident for the whole run and has to be counted.
 
 `peer_e_agg` is over-allocated: it gets EP slots and only ever uses EP−1, so about 8.8 MB of its 70.8 MB
 is never touched on 120B.
@@ -414,7 +432,47 @@ is never touched on 120B.
 
 Completion is signalled on the host, not with device-side flags. There are two barriers per layer.
 
-Phase one ends with `hipStreamSynchronize(memory_stream)` — the sender blocks until its own pushes have
+Phase one *begins* with the barrier rather than ending with one. Before any peer copy is issued, every rank
+waits at the phase-one sync point, so each has finished writing its own `ext_t_bf16` and top-k slice before
+anyone reads them:
+
+```c
+#if GETP_DEVSYNC
+    sync_workers_dev(compute_stream, memory_stream, sync_point, device_index,
+                     EXPERT_PARALLELISM, base_device_index, 2 * (int)l + 0);
+#else
+    sync_workers(compute_stream, sync_point);
+#endif
+```
+
+`GETP_DEVSYNC` defaults to 1. At `EP > 2` — the 120B case — `sync_workers_dev` falls through to the same
+thing `sync_workers` does, `hipStreamSynchronize` on the stream it was handed plus a host barrier:
+
+```c
+inline void sync_workers(hipStream_t stream, Barrier &sync_point) {
+  HIP_CHECK(hipStreamSynchronize(stream));
+  sync_point.wait();
+}
+```
+
+At `EP <= 2` — the 20B case — it instead records an event on `compute_stream`, takes the host barrier, and
+has each peer `hipStreamWaitEvent` on it, so the host never blocks on the stream at all. The measurement
+behind that split is in the comment above `sync_workers_dev`: the event path is 0.7 % faster at EP = 2 and
+15 % slower at EP = 8, where seven `hipStreamWaitEvent`s per sync point pile onto `memory_stream`.
+
+Only after the barrier does each rank *pull* its peers' slices — the copies read the peer's buffer and write
+the rank's own, on the rank's `memory_stream`, one `events_pull[j]` recorded per peer — and the compute
+stream is then gated on those events with `hipStreamWaitEvent(compute_stream, events_pull[j], 0)`. The
+sender never blocks on its own transfers, because it never sends: there is no `hipStreamSynchronize` on
+`memory_stream` anywhere in the layer loop. Both `sync_workers` and `sync_workers_dev` sync `compute_stream`.
+
+Pull replaced push here for correctness, not speed. Pushing into the peer's buffer on the peer's
+`memory_stream` and then taking a host barrier left a rare window in which a rank read the previous layer's
+`ext_t_bf16`/top-k: hashing 11 checkpoints per layer across two 8-GPU runs caught about four events per run,
+always in matched EP pairs of (step, layer), with the first divergence at `a_in` after the scatter while the
+rank's own top-k and attention still matched. Neither a receiver-side acquire nor fine-grained memory fixed
+it. Pulling on the receiving device's queue plus an event is the pattern the `e_agg` leg already used, and it
+hashes clean.
 landed — followed by `sync_workers`:
 
 ```c
@@ -436,7 +494,7 @@ exactly once instead of accumulating into it, so the per-layer `hipMemsetAsync` 
 whole buffer — 70.8 MB of it on 120B — and the `event_memset` that gated it into the compute stream are
 both gone. That overwrite still has to be ordered against peers reading the previous layer's
 `ext_e_agg`, and it is, by the same dependency chain: it is issued after the phase-one barrier, and
-every rank reaches that barrier only after its own `hipStreamSynchronize(memory_stream)` has drained
+That overwrite still has to be ordered against peers reading the previous layer's slice, and what does it is a double buffer alternated by layer parity, not the barrier: `moe_gather_pairs_acc` writes `ext_e_agg` on even layers and `ext_e_agg2` on odd ones (`float *eagg_out = (l & 1) ? ext->ext_e_agg2 : ext->ext_e_agg;` in [`src/hip/forward.hip`](../src/hip/forward.hip)), and the peer fetch reads the matching buffer of the layer it belongs to. So the earliest gather that can land on the buffer a peer is copying out of in layer L is the one in layer L+2, and by then every rank has passed the layer L+1 barriers — each of which drains that rank's `compute_stream`, into which the layer-L fetches were already joined by `hipStreamWaitEvent(compute_stream, events_e_agg[j])` before the add. Note that the barriers synchronise `compute_stream`, never `memory_stream`: nothing makes `memory_stream` wait on our own compute work, which is why one buffer is not enough. It was measured: the same binary run twice on 8 GPUs for 1024 steps self-matched on 49.5 % of lines with a single buffer and 89.8 % with two, at unchanged throughput.
 the previous layer's fetches from that same memory stream. That is a real dependency chain, not a
 coincidence — moving the write earlier would introduce a race.
 
@@ -475,7 +533,7 @@ synchronising `HIP_CHECK`.
 
 **Events are created once per host thread and never destroyed.** `getp_forward_120b` holds
 `event_rmsnorm`, `event_router_topk` and `events_e_agg[MAXIMUM_GPU]` as `static thread_local` and fills
-them on that thread's first call — `2 + EP` events, 10 on 120B and 4 on 20B — and there is no
+them on that thread's first call — `2 + 2 × EP` events, 18 on 120B and 6 on 20B, plus the 128 `g_ev_sync` events `sync_workers_dev` creates per device — and there is no
 `hipEventDestroy` anywhere in the tree. The loop also
 creates EP events into `events_e_agg` while only EP−1 are ever used. `MAXIMUM_GPU` (8) in
 [`include/transformer.hpp`](../include/transformer.hpp) exists solely as the bound on that array, so it

@@ -147,7 +147,7 @@ The output file holds token ids, not text. Turn them back into words:
 ```
 
 Every visible GPU is used automatically — `warm_up` takes the count from `hipGetDeviceCount` and uses
-all of it, with no cap. To use fewer, regenerate the input for that count — the required size follows
+all of it. Eight is the ceiling, though: [`include/transformer.hpp`](include/transformer.hpp) pins `MAXIMUM_GPU` at 8, and the per-device sync state in [`src/hip/forward.hip`](src/hip/forward.hip) — `g_ev_sync` and its `g_ev_sync_ready` flags — is declared `[MAXIMUM_GPU]` and indexed by the absolute device index, before any peer-count check. `warm_up` never clamps the count, so past the eighth device the engine writes off the end of those arrays. To use fewer, regenerate the input for that count — the required size follows
 the device count. The count itself has to be even for the 20B model, which pins
 `EXPERT_PARALLELISM = 2` and exits during warm-up when the device count is not divisible by it,
 however the input was sized:
@@ -284,10 +284,10 @@ optimisations in it, so they are not the ones those scores were computed from �
 scored without a GPU: `./run.sh eval 20b` reports METEOR 0.533 and BERTScore 0.978 on them, a hair
 under the table's METEOR and the same BERTScore.
 
-Repeating a run moves throughput by well under a percent and no longer moves the completions at all.
+Repeating a run still moves throughput by over a percent — the two runs behind the 120B figure came in at 22,583 and 22,938, 1.6% apart — but it no longer moves the completions at all.
 That was not always true: before the expert exchange was made pull-based, a receiver could read a peer's
 buffer while it was still being written, so two runs of the _same binary_ at 8 GPUs agreed on only about
-64% of tokens. With the pull in place the engine is reproducible, and every optimisation listed above
+50 % to 95 % of output lines, run pair by run pair. With the pull in place the engine is reproducible, and every optimisation listed above
 was checked by hashing the output rather than by scoring it - the 20B against 720709b86d36 and the 120B
 against efe1096ff64c, both with zero differing lines. A hash is a far sharper instrument than METEOR
 when the claim is that a change moved no numbers, and it is what makes a 0.6% win safe to accept.

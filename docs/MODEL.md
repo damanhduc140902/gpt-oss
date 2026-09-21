@@ -259,15 +259,15 @@ One leftover: `Tokenizer::byte_tokens[256]` is populated at load and never read 
 
 The harmony format wraps messages in control tokens. The ids appear in comments at the top of `generate()` and of the `getp` loops:
 
-| Token | id        | Used in code? |
-| ----- | --------- | ------------- | ------ | ----------------- |
-| `<    | endoftext | >`            | 199999 | yes — stop token  |
-| `<    | return    | >`            | 200002 | yes — stop token  |
-| `<    | constrain | >`            | 200003 | no                |
-| `<    | channel   | >`            | 200005 | no                |
-| `<    | start     | >`            | 200006 | inert (see below) |
-| `<    | end       | >`            | 200007 | no                |
-| `<    | message   | >`            | 200008 | no                |
+| Token | id | Used in code? |
+| --- | ---: | --- |
+| `<\|endoftext\|>` | 199999 | yes — stop token |
+| `<\|return\|>` | 200002 | yes — stop token |
+| `<\|constrain\|>` | 200003 | no |
+| `<\|channel\|>` | 200005 | no |
+| `<\|start\|>` | 200006 | inert (see below) |
+| `<\|end\|>` | 200007 | no |
+| `<\|message\|>` | 200008 | no |
 
 Only the first two are acted on. Both `generate()` and the batch loop retire a sequence when the sampled token is 199999 or 200002. The one other live occurrence, `decode_piece(tokenizer, 200006, token)`, is inert because `decode_piece` discards its `prev_token` argument outright.
 

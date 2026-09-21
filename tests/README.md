@@ -103,7 +103,7 @@ bertscore_f1    0.977838
 
 Those two numbers come from the completions committed in `submission/`: `gpt-oss-20b` in `getp` mode
 on 8x AMD MI250, 12288 requests, scored over the first 4096. They clear both thresholds in
-`threshold.json` comfortably. They sit just under the METEOR 0.534 and BERTScore 0.978 in the
+`threshold.json` comfortably. They sit just under the METEOR 0.535 and BERTScore 0.978 in the
 [main README](../README.md) table, and that gap is a different engine rather than run-to-run noise --
 see the note under the 120B block.
 
@@ -118,7 +118,7 @@ bertscore_f1    0.98164
 
 Both models' completions in `submission/` come from runs on 8x AMD MI250, scored over the first 4096
 of 12288 (20B) and 6144 (120B) requests -- on the pre-rewrite build that ran at 33,979 and 13,149
-tok/s, not the current one, which scores METEOR 0.534 / BERTScore 0.978 on 20B and 0.566 / 0.981 on
+tok/s, not the current one, which scores METEOR 0.535 / BERTScore 0.978 on 20B and 0.561 / 0.981 on
 120B. Reproducing the table's last two columns therefore means re-running `getp` on this commit and
 re-scoring, not scoring the files committed here.
 
@@ -126,7 +126,9 @@ re-scoring, not scoring the files committed here.
 
 ## Scoring your own run
 
-`getp` accepts exactly `n_devices x BATCH_SIZE` requests -- 1536 per GPU for 20B, 768 for 120B -- while
+`getp` sizes its input off `n_devices x BATCH_SIZE` -- 1536 per GPU for 20B, 768 for 120B. The 20B
+path requires exactly that count; the 120B path walks the file in chunks, so it accepts any multiple.
+Meanwhile
 the reference files here hold 4096 completions. The two line up if you build the input by repeating
 `input.txt` and then score only the first 4096 outputs. On eight GPUs that is 12288 = 3 x 4096:
 
@@ -139,12 +141,20 @@ python eval.py -m 20b -s /tmp/submission.txt
 
 Completions are written in request order, so output line _i_ is the answer to prompt _i_.
 
-Note that the engine is not deterministic. The same prompt placed at a different batch index takes a
-different numerical path through the expert grouping, so repeated copies of one prompt do not produce
-identical completions even at temperature 0 -- and neither do two runs of the same binary on the same
-input file: at 8 GPUs and 1024 steps they agree on only about 64% of tokens, while METEOR and BERTScore
-stay put. (At 16 steps on 4 GPUs it is exactly deterministic.) Token agreement therefore cannot validate
-a change at this scale; the quality scores are the gate.
+The engine is reproducible: two runs of the same binary on the same input file produce identical
+output, and that is how changes are validated here -- the 20B against output hash 720709b86d36 and
+the 120B against efe1096ff64c, both with zero differing lines. Hashing the output, not METEOR or
+BERTScore, is therefore the gate for any change that is supposed to move no numbers; the scores are
+the coarse backstop, too noisy to accept or reject a sub-percent change.
+
+It was not always so. Before the expert exchange became a pull, a receiver could read a peer's buffer
+while it was still being written, and two 8-GPU runs of the same binary agreed on only 50 % to
+95 % of output lines, run pair by run pair.
+
+What the engine is still not is position-invariant: a completion depends on where its prompt sits in
+the batch. The same prompt at a different batch index takes a different numerical path through the
+expert grouping, so repeated copies of one prompt do not produce identical completions even at
+temperature 0.
 
 ## Tips & troubleshooting
 

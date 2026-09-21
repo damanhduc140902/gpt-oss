@@ -332,12 +332,12 @@ over `dim3 grid(n_kv_heads, batch_size)` in `getp_flash_attn_decode_bf16`,
 
 At the shipped 20B settings the marginal cost of one more sequence in the batch is about **16.1 MB**
 at `seq_len` 1024. The table row above accounts for 15.7 MB of that — it is KV only. The remaining
-0.38 MB, 2.4 % of the total, is the rest of the per-row state, and it is worth naming rather than
+0.41 MB, 2.5 % of the total, is the rest of the per-row state, and it is worth naming rather than
 waving away:
 
 - ~79 KB of `RunState` per row: `x`, `t`, `tb2` and `e_agg` at `hidden_dim` fp32, plus `tb` and `q`
   at `n_attn_heads × head_dim` fp32 ([`transformer.cpp:213-226`](../src/getp/transformer.cpp)).
-- ~265 KB of `RunStateExt` per row. Almost every buffer in `ext_alloc_device`
+- ~288 KB of `RunStateExt` per row. Almost every buffer in `ext_alloc_device`
   ([`src/getp/state_ext.cpp:20-75`](../src/getp/state_ext.cpp)) is sized
   `EXPERT_PARALLELISM × batch_size × …`, so at `EXPERT_PARALLELISM = 2` each local row is charged
   twice. The largest single item is `z_partial` at `experts_per_token × hidden_dim` fp32 — 46 KB per
@@ -346,7 +346,23 @@ waving away:
   the never-called generic collectives would have used.
 
 KV still dominates by a factor of forty, which is why the sizing argument above is the one that
-matters — but 0.38 MB × 1536 rows is 0.58 GB, which is not nothing on a device that is already
+matters — but Line 349, replace "Line 349, replace "0.38 MB × 1536 rows is 0.58 GB" with "0.40 MB × 1536 rows is 0.62 GB", giving the full line:
+
+matters — but 0.40 MB × 1536 rows is 0.62 GB, which is not nothing on a device that is already
+
+Required companion edits in the same paragraph, or the doc contradicts itself:
+- Line 335: "The remaining 0.38 MB, 2.4 % of the total" -> "The remaining 0.40 MB, 2.5 % of the total"
+- Line 340: "- ~265 KB of `RunStateExt` per row." -> "- ~288 KB of `RunStateExt` per row."
+- Line 341: citation "[`src/getp/state_ext.cpp:20-75`](../src/getp/state_ext.cpp)" -> "[`src/getp/state_ext.cpp:20-95`](../src/getp/state_ext.cpp)" so the range covers the `expert_parallelism > 1` block that holds ext_t, ext_e_agg, ext_e_agg2 and peer_e_agg.
+Line 333's 16.1 MB is unchanged (15.7 + 0.40 = 16.1)." with "0.40 MB × 1536 rows is 0.62 GB", giving the full line:
+
+matters — but 0.40 MB × 1536 rows is 0.62 GB, which is not nothing on a device that is already
+
+Required companion edits in the same paragraph, or the doc contradicts itself:
+- Line 335: "The remaining 0.41 MB, 2.5 % of the total" -> "The remaining 0.40 MB, 2.5 % of the total"
+- Line 340: "- ~288 KB of `RunStateExt` per row." -> "- ~288 KB of `RunStateExt` per row."
+- Line 341: citation "[`src/getp/state_ext.cpp:20-75`](../src/getp/state_ext.cpp)" -> "[`src/getp/state_ext.cpp:20-95`](../src/getp/state_ext.cpp)" so the range covers the `expert_parallelism > 1` block that holds ext_t, ext_e_agg, ext_e_agg2 and peer_e_agg.
+Line 333's 16.1 MB is unchanged (15.7 + 0.40 = 16.1)., which is not nothing on a device that is already
 2 GB over budget at `seq_len` 2048.
 
 ## Warm-up: where the 23 s and 176 s go
@@ -453,7 +469,7 @@ itself. The `yield()` is the concession to correctness if that assumption breaks
 Each 20B model group allocates its own `Barrier` on the heap, so the four groups never touch each
 other's cache lines. The 120B path builds one on the stack per 6144-request chunk.
 
-The composite primitive is `sync_workers` ([`forward.hip`](../src/hip/forward.hip)):
+The composite primitive is `sync_workers_dev` ([`forward.hip:5216`](../src/hip/forward.hip)), which is what both per-layer sync points call in the default build (`GETP_DEVSYNC` defaults to 1 at [`forward.hip:5203-5205`](../src/hip/forward.hip); call sites [`5466`](../src/hip/forward.hip) and [`5620`](../src/hip/forward.hip)). It reduces to the drain-then-barrier form below whenever `EXPERT_PARALLELISM > 2` ([`forward.hip:5230-5234`](../src/hip/forward.hip)), which is the 120B configuration, and the older `sync_workers` function itself is on the live path only when the file is compiled with `-DGETP_DEVSYNC=0` ([`5469`](../src/hip/forward.hip), [`5623`](../src/hip/forward.hip)):
 
 ```cpp
 inline void sync_workers(hipStream_t stream, Barrier &sync_point) {
@@ -464,7 +480,12 @@ inline void sync_workers(hipStream_t stream, Barrier &sync_point) {
 
 Synchronize this thread's compute stream, then wait on the barrier. After it returns, this device's
 work is complete _and_ every peer has reached the same point — which is exactly the precondition for
-reading a buffer a peer just wrote by `hipMemcpyPeerAsync`. It runs twice per layer: once before the
+reading a buffer a peer just wrote by `hipMemcpyPeerAsync`. At `EXPERT_PARALLELISM = 2` — the 20B
+configuration ([`run.cpp:54`](../src/getp/run.cpp)) — `sync_workers_dev` establishes the same
+precondition without the drain: it records an event on the stream that wrote the data, uses the
+barrier only to establish that every thread has issued its event, and makes the reading stream wait
+on each peer's event ([`forward.hip:5235-5241`](../src/hip/forward.hip)); see "Host synchronisations
+on the critical path" below. Either way the sync point runs twice per layer: once before the
 hidden-state and top-k exchange, once after the MoE aggregate.
 
 That precondition is also where the engine's only nondeterminism lived, and it took a hash trace to
@@ -585,7 +606,15 @@ which took a `hipFree`, and with it a full-device synchronisation, off the criti
 token step.
 
 `hipEvent_t` objects are created once per thread, on the first call to `getp_forward_120b`, and never
-destroyed: `2 + EXPERT_PARALLELISM` per thread, so 4 for the 20B model and 10 for the 120B model
+destroyed: `hipEvent_t` objects are created once per thread, on the first call to `getp_forward_120b`, and never
+destroyed: `2 + 2 × EXPERT_PARALLELISM` per thread — `event_rmsnorm`, `event_router_topk`, and one
+`events_e_agg` plus one `events_pull` for every peer ([`forward.hip:5286-5297`](../src/hip/forward.hip))
+— so 6 for the 20B model and 18 for the 120B model. On top of that the first `sync_workers_dev` call
+creates `GETP_SYNC_SLOTS = 128` events for its device and never destroys them
+([`forward.hip:5219-5221`](../src/hip/forward.hip)). That loop runs before the `n_dev > 2` early return,
+so the 120B configuration allocates all 128 and then never uses them — at `EXPERT_PARALLELISM > 2` the
+function falls back to the host barrier. With one thread per device that is 134 events for the 20B model
+and 146 for the 120B. Still a fixed, one-off cost per thread for the whole run, not a per-step leak.
 ([`forward.hip`](../src/hip/forward.hip)). That is a fixed handful per thread for the whole run, not
 a per-step leak.
 
@@ -652,9 +681,9 @@ shipped one runs. Working backwards from the published figures:
 | Sequences in flight                                   | 12288       | 6144        |
 | Forward passes (`-n 1024`, `while (pos + 1 < steps)`) | 1023        | 1023        |
 | Measured throughput                                   | 69309 tok/s | 22760 tok/s |
-| Implied token-step time                               | 173 ms      | 264 ms      |
+| Implied token-step time                               | 172 ms      | 261 ms      |
 | Barrier crossings per step                            | 49          | 73          |
-| Host stream syncs per step                            | ≈ 145       | ≈ 217       |
+| Host stream syncs per step                            | 1           | 109         |
 
 Both figures are averages over a run whose step time grows. The odd layers' attention work scales
 with `pos + 1 - t_start` until the `seq_len/2` cap is reached, while the even layers stay pinned at
