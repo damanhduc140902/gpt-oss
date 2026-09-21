@@ -353,6 +353,25 @@ Per device, per decoder layer, with `hidden_dim` = 2880 and `experts_per_token` 
 | In (reduce-scatter) | `ext_e_agg` slice           | fp32         |      8,847,360 |      61,931,520 |
 | **Total**           |                             |              |                |  **93,069,312** |
 
+The reduce-scatter row is the one that is mostly zeros, and `GETP_ROWSKIP` stops sending them. A rank
+can only have produced output for a token that routed to one of _its_ experts, and with 128 experts and
+`experts_per_token` = 4 the chance a given token missed all 16 of a rank's experts is
+C(112,4)/C(128,4) = 0.582. Counted on the real routing it is 55-61 %, mean 57 %. So of the 61,931,520
+bytes above, about 35 million carry nothing but zeros, and adding zero is exactly what it sounds like:
+
+| In (reduce-scatter), non-zero rows only | fp32 | ~3,800,000 | ~26,600,000 |
+
+That is 93 MB per layer down to about 58 MB, and it measured 20,426 to 22,760 tok/s, +11.4 %, with the
+output hash unchanged. The receiver is not told how many rows are coming. After phase one it holds
+every slice of `ext_topk_i`, and expert ownership is the contiguous range `[expert_start, expert_end)`,
+so it derives the same row set the sender derived — the sender from its own `n_local`, the receiver
+from the top-k and the sender's range. `hipMemcpyPeerAsync` does still need the byte count on the host,
+which would normally force a stream sync; at EP > 2 it does not, because `sync_workers_dev` takes the
+`n_dev > 2` branch and has already called `hipStreamSynchronize`. Reading 32 bytes back at that exact
+point is free. That is also why the whole path disables itself at EP = 2, where the sync point uses
+events instead and a blocking copy would cost the overlap — and the 20B would gain nothing from it in
+any case, since only 3 % of its rows are zero.
+
 **`gpt-oss-20b`** — EP = 2, `BATCH_SIZE` = 1536, 1 peer:
 
 | Direction           | Buffer                      | Type         | Bytes per layer |

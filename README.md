@@ -23,7 +23,7 @@ hipBLAS, no RCCL, no MPI. Every kernel, every collective and the tokenizer are w
 this repository. The only dependency is the HIP runtime itself.
 
 It began from [llama2.c](https://github.com/karpathy/llama2.c) and grew into a complete inference system.
-On a single node of 8 AMD MI250 GPUs it serves **64,509 tokens per second on the 20B model and 20,168 on
+On a single node of 8 AMD MI250 GPUs it serves **69,309 tokens per second on the 20B model and 22,760 on
 the 120B model**, while keeping the generated text faithful to a CPU reference.
 
 Two things are measured, and both have to hold:
@@ -224,8 +224,8 @@ Measured on one node of 8× AMD MI250 in batch (`getp`) mode.
 
 | Model          | Requests | Warm-up (s) | Inference (s) | Throughput (TPS) | METEOR | BERTScore |
 | -------------- | -------: | ----------: | ------------: | ---------------: | -----: | --------: |
-| `gpt-oss-20b`  |    12288 |          23 |           189 |        **64509** |  0.535 |     0.978 |
-| `gpt-oss-120b` |     6144 |         176 |           301 |        **20168** |  0.561 |     0.981 |
+| `gpt-oss-20b`  |    12288 |          23 |           176 |        **69309** |  0.535 |     0.978 |
+| `gpt-oss-120b` |     6144 |         176 |           267 |        **22760** |  0.561 |     0.981 |
 
 Where those numbers came from, one optimisation at a time on the 20B model:
 
@@ -243,10 +243,33 @@ Where those numbers came from, one optimisation at a time on the 20B model:
 | MoE host read-backs removed; grids sized from the worst case           |      63444 |  +0.8% |
 | Expert exchange made pull-based; two runs now agree on 100 % of output |      62841 |  -1.0% |
 | mlp2 k-loop schedule pinned; per-layer queue drains removed            |      64143 |  +2.1% |
-| mlp1 k-loop schedule pinned, including the HBM loads                   |  **64509** |  +0.6% |
+| mlp1 k-loop schedule pinned, including the HBM loads                   |      64509 |  +0.6% |
+| RoPE folded into the qkv epilogue; router block sized to the expert count; argmax reduced in registers |      65651 |  +1.8% |
+| LM head rastered in groups of two row blocks so the weight tile lands in L2 |      66096 |  +0.7% |
+| LM head activations converted to bf16 once, which widens the grouping to six |      68424 |  +3.5% |
+| q written pre-scaled as bf16, since attention rounded it to bf16 anyway |  **69309** |  +1.3% |
 
-The 120B model went from 13,149 to 20,168 tok/s over the same work, with no
-changes specific to it - it runs the same kernels with the same defaults.
+The 120B model reached 20,426 tok/s on that same work without a single change written for it: it runs
+the same kernels with the same defaults. Past that point it needed its own work, because its bottleneck
+is not the same one:
+
+|                                                                        | Throughput | Change |
+| ---------------------------------------------------------------------- | ---------: | -----: |
+| Same kernels as the 20B model, no changes specific to the 120B          |      20426 |      — |
+| Only the non-zero rows sent in the expert-output exchange               |  **22760** | +11.4% |
+
+At expert parallelism 8 the 120B spends 63% of every step with the GPUs idle, nearly all of it waiting
+on the expert-output exchange: seven dense 8.85 MB blocks per layer, one per peer, 62 MB in all.
+But a device only produces output for tokens that routed to one of its own experts, and with 128
+experts and top-4 that is 43% of them - the other 57% of what it sends is zeros. Sending only the non-zero rows is exact, and
+the receiver needs nothing extra to know which rows are coming: it already holds every slice of the
+top-k table, so it derives the same set the sender did.
+
+Two attempts to overlap the transfers instead of shrinking them both lost, and it is worth saying so.
+Splitting one copy across 2, 4 and 8 streams on the 20B went 69274 to 68691 to 67750 to 66001; giving
+each of the seven peers its own stream on the 120B went 20617 to 12877. The GCDs share one fabric
+rather than holding seven independent paths, so the transfer time is set by total bytes and
+concurrency only adds contention. Those two negative results are what pointed at the zeros.
 
 Warm-up is dominated by reading the checkpoint off disk, so it depends on whether the file is still in
 the page cache; it is not part of what the optimisation work changed.
@@ -261,12 +284,13 @@ optimisations in it, so they are not the ones those scores were computed from �
 scored without a GPU: `./run.sh eval 20b` reports METEOR 0.533 and BERTScore 0.978 on them, a hair
 under the table's METEOR and the same BERTScore.
 
-Repeating a run moves throughput by well under a percent, but it moves the completions a great deal.
-The engine is not bit-deterministic — the same prompt at a different batch index takes a different path
-through the expert grouping — and greedy decoding turns any difference into a different trajectory. Two
-runs of the _same binary_ at 8 GPUs and 1024 steps agree on only about 64% of tokens, while the quality
-scores stay put. That is worth knowing before using token agreement to check a change: at this scale it
-cannot tell a real bug from a rounding difference, and METEOR and BERTScore are the gates that can.
+Repeating a run moves throughput by well under a percent and no longer moves the completions at all.
+That was not always true: before the expert exchange was made pull-based, a receiver could read a peer's
+buffer while it was still being written, so two runs of the _same binary_ at 8 GPUs agreed on only about
+64% of tokens. With the pull in place the engine is reproducible, and every optimisation listed above
+was checked by hashing the output rather than by scoring it - the 20B against 720709b86d36 and the 120B
+against efe1096ff64c, both with zero differing lines. A hash is a far sharper instrument than METEOR
+when the claim is that a change moved no numbers, and it is what makes a 0.6% win safe to accept.
 
 ---
 
