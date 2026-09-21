@@ -680,10 +680,10 @@ shipped one runs. Working backwards from the published figures:
 | ----------------------------------------------------- | ----------- | ----------- |
 | Sequences in flight                                   | 12288       | 6144        |
 | Forward passes (`-n 1024`, `while (pos + 1 < steps)`) | 1023        | 1023        |
-| Measured throughput                                   | 69309 tok/s | 22760 tok/s |
+| Measured throughput                                   | 69309 tok/s | 24315 tok/s |
 | Implied token-step time                               | 172 ms      | 261 ms      |
 | Barrier crossings per step                            | 49          | 73          |
-| Host stream syncs per step                            | 1           | 109         |
+| Host stream syncs per step                            | 1           | 73          |
 
 Both figures are averages over a run whose step time grows. The odd layers' attention work scales
 with `pos + 1 - t_start` until the `seq_len/2` cap is reached, while the even layers stay pinned at

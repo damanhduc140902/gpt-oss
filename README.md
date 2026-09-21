@@ -23,7 +23,7 @@ hipBLAS, no RCCL, no MPI. Every kernel, every collective and the tokenizer are w
 this repository. The only dependency is the HIP runtime itself.
 
 It began from [llama2.c](https://github.com/karpathy/llama2.c) and grew into a complete inference system.
-On a single node of 8 AMD MI250 GPUs it serves **69,309 tokens per second on the 20B model and 22,760 on
+On a single node of 8 AMD MI250 GPUs it serves **69,309 tokens per second on the 20B model and 24,315 on
 the 120B model**, while keeping the generated text faithful to a CPU reference.
 
 Two things are measured, and both have to hold:
@@ -225,7 +225,7 @@ Measured on one node of 8× AMD MI250 in batch (`getp`) mode.
 | Model          | Requests | Warm-up (s) | Inference (s) | Throughput (TPS) | METEOR | BERTScore |
 | -------------- | -------: | ----------: | ------------: | ---------------: | -----: | --------: |
 | `gpt-oss-20b`  |    12288 |          23 |           176 |        **69309** |  0.535 |     0.978 |
-| `gpt-oss-120b` |     6144 |         176 |           267 |        **22760** |  0.561 |     0.981 |
+| `gpt-oss-120b` |     6144 |         176 |           250 |        **24315** |  0.561 |     0.981 |
 
 Where those numbers came from, one optimisation at a time on the 20B model:
 
@@ -256,14 +256,41 @@ is not the same one:
 |                                                                        | Throughput | Change |
 | ---------------------------------------------------------------------- | ---------: | -----: |
 | Same kernels as the 20B model, no changes specific to the 120B          |      20426 |      — |
-| Only the non-zero rows sent in the expert-output exchange               |  **22760** | +11.4% |
+| Only the non-zero rows sent in the expert-output exchange               |      22760 | +11.4% |
+| The fourteen row-list launches per layer merged into two                |      23136 |  +1.4% |
+| Only the rows each peer needs sent in the expert-input exchange         |      23910 |  +3.9% |
+| The second sync point on per-peer events instead of a barrier           |  **24341** |  +1.8% |
 
-At expert parallelism 8 the 120B spends 63% of every step with the GPUs idle, nearly all of it waiting
-on the expert-output exchange: seven dense 8.85 MB blocks per layer, one per peer, 62 MB in all.
-But a device only produces output for tokens that routed to one of its own experts, and with 128
-experts and top-4 that is 43% of them - the other 57% of what it sends is zeros. Sending only the non-zero rows is exact, and
-the receiver needs nothing extra to know which rows are coming: it already holds every slice of the
-top-k table, so it derives the same set the sender did.
+Each percentage is a paired measurement: the two builds run alternately in one session, twice each,
+against the same input. Absolute throughput moves about 1 % between sessions, so the rows are not
+strictly comparable across the table - the number that stands behind the summary above is the
+verification run of the shipped build, which measured 24,257 and 24,373 tok/s with no flags set,
+METEOR 0.561 and BERTScore 0.981. Those two scores are unchanged because the output is unchanged:
+every optimisation below is bit-exact and the 120B still hashes to `efe1096ff64c`.
+
+At expert parallelism 8 the 120B spent 63% of every step with the GPUs idle, nearly all of it waiting
+on the expert exchange. The output half was seven dense 8.85 MB blocks per layer, one per peer,
+62 MB in all - but a device only produces output for tokens that routed to one of its own experts,
+and with 128 experts and top-4 that is 43% of them, so the other 57% of what it sent was zeros.
+Sending only the non-zero rows is exact, and the receiver needs nothing extra to know which rows
+are coming: it already holds every slice of the top-k table, so it derives the same set the sender
+did.
+
+The input half turned out to be the same shape of waste, and it took a second look to see it. Every
+rank was broadcasting all 768 of its rows to all seven peers, 31.0 MB per layer, although a peer
+reads a row only if it owns one of that row's experts - the same 42% of rows, by the same
+arithmetic. Nothing else reads those rows either: the activations are only ever fetched through the
+(token, expert) pair list, so a row nobody owns is never touched. Not sending it is exact. That
+turns the broadcast into an all-to-all and takes the input half to 13.2 MB per layer.
+
+What that exposed is that trimming bytes has a ceiling. The 18 MB cut was worth only +3.9%, not the
++6% the byte count predicts, because a rank that finishes its transfer early just waits longer at
+the next barrier - the slowest rank still gates everyone. So the last change is not about bytes at
+all: the second of the two per-layer sync points now orders the exchange with one event per peer
+instead of draining the stream and meeting at a barrier. The old sequence made the GPU wait for a
+full round trip through the host - finish, wake the host thread, meet seven other threads, issue
+the copies - and that round trip was 1.57 ms per layer, 39% of all idle time. With events the
+copies are already queued and start the instant the peer's data is ready.
 
 Two attempts to overlap the transfers instead of shrinking them both lost, and it is worth saying so.
 Splitting one copy across 2, 4 and 8 streams on the 20B went 69274 to 68691 to 67750 to 66001; giving

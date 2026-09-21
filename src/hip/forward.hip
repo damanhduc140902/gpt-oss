@@ -56,6 +56,42 @@
 
 // Chi gui hang khac 0 trong khoi e_agg giua cac GPU. 120b: 57 % hang la so 0 (do duoc).
 // Xem dau file rowskip. Chi co y nghia khi EXPERT_PARALLELISM > 2.
+// Gop 14 lan phong kernel dung danh sach thanh 2: mot BLOCK lo mot lat cat, thay vi
+// mot LAN PHONG cho moi lat cat. Moi lan phong cu chi ton 8 us nhung cach nhau 60 us,
+// tuc gan het chi phi la phong tuan tu chu khong phai tinh toan. Cung phep tinh, chi
+// khac so lan phong, nen bit-exact. Do tren 120B: 22.807 -> 23.136 tok/s (+1,4 %),
+// md5 efe1096ff64c khong doi. Dat 0 de quay ve mot lan phong moi lat cat.
+#ifndef GETP_RS_MERGE
+#define GETP_RS_MERGE 1
+#endif
+
+// Diem dong bo 2 dung SU KIEN theo tung peer thay cho drain + hang rao. Chuoi cu la: GPU xong
+// gather_pairs -> host tinh day khoi hipStreamSynchronize -> hang rao 8 thread -> host phat lenh
+// keo -> GPU moi keo; ca vong qua host do nam trong khoang trong 1,57 ms moi lop. Voi su kien,
+// lenh keo da nam san trong hang doi va chay ngay khi peer ghi xong.
+// Van giu mot hang rao HOST o day nhung KHONG drain: no chi dam bao moi thread da PHAT
+// hipEventRecord truoc khi ai do cho - cho tren mot event chua ghi se tra ve ngay lap tuc.
+// CAN GETP_AGSKIP: no dat so hang vao g_ag_cnt tu truoc hang rao sp1, nho vay xoa duoc lan
+// hipMemcpy chan o day. Chinh lan doc do tung lam ban "duong su kien" cu nhan rac va bao
+// hipErrorInvalidValue. Diem dong bo 1 VAN la drain + hang rao, co chu y: no re (0,20 ms so voi
+// 0,86 ms cua sp2) va no chan khong cho hai rank troi xa nhau qua mot lop, nen o su kien khong
+// bao gio bi dung lai nham. Ban cu doi CA HAI diem dong bo nen host chay truoc vo han va cham
+// hon 15 %.
+// Do tren 120B: 23.910 -> 24.341 tok/s (+1,8 %), md5 khong doi.
+#ifndef GETP_EVAGG
+#define GETP_EVAGG 1
+#endif
+
+// Chieu all-gather chi gui nhung hang peer that su can, doi xung voi GETP_ROWSKIP (von chi cat
+// chieu reduce-scatter). Ban cu gui du BATCH_SIZE hang cho moi peer, 31,0 MB moi lop, trong khi
+// moi cap rank chi dung 326/768 = 42,4 % so hang do - phan con lai khong kernel nao doc, vi
+// ext_t_bf16 chi duoc lay qua danh sach cap (tok_idx/e_dev). Nen bo chung di la bit-exact.
+// 31,0 -> 13,2 MB moi lop. Do tren 120B: 23.022 -> 23.910 tok/s (+3,9 %), md5 khong doi.
+// Dat 0 de quay ve gui du moi hang.
+#ifndef GETP_AGSKIP
+#define GETP_AGSKIP 1
+#endif
+
 #ifndef GETP_ROWSKIP
 #define GETP_ROWSKIP 1   // mac dinh BAT; tu tat khi EP <= 2. Dat 0 de A/B
 #endif
@@ -1703,6 +1739,105 @@ __global__ __launch_bounds__(256) void getp_rowskip_build_kernel(
   }
   if (threadIdx.x == 0) cnt[cnt_slot] = sacc;
 }
+
+#if GETP_RS_MERGE
+// Y het getp_rowskip_build_kernel nhung mot BLOCK lo mot lat cat, nen ca 7 lat di trong mot lan
+// phong. `skip_slice` la lat cat cua chinh minh - block do thoat ngay.
+// blockIdx.x chay tren so hieu lat cat dich (ben gui) hoac so hieu peer (ben nhan).
+template <bool FROM_NLOCAL>
+__global__ __launch_bounds__(256) void getp_rowskip_build_all_kernel(
+    const int *__restrict__ n_local, const int *__restrict__ topk_i,
+    int K, int B, int in_slice_fixed, int skip_slice, int ep,
+    const int *__restrict__ e_lo_arr, const int *__restrict__ e_hi_arr,
+    int *__restrict__ rank, int *__restrict__ idx, int *__restrict__ cnt) {
+  const int sl = blockIdx.x;
+  if (sl >= ep || sl == skip_slice) return;
+  // Ben gui doc lat cat sl; ben nhan luon doc lat cat cua chinh minh.
+  const int in_base = (FROM_NLOCAL ? sl : in_slice_fixed) * B;
+  const int e_lo = FROM_NLOCAL ? 0 : e_lo_arr[sl];
+  const int e_hi = FROM_NLOCAL ? 0 : e_hi_arr[sl];
+  const int out_base = sl * B;
+  __shared__ int sacc;
+  __shared__ int sc[256];
+  if (threadIdx.x == 0) sacc = 0;
+  __syncthreads();
+  for (int b0 = 0; b0 < B; b0 += 256) {
+    const int b = b0 + threadIdx.x;
+    int nz = 0;
+    if (b < B) {
+      if (FROM_NLOCAL) {
+        nz = (n_local[in_base + b] > 0) ? 1 : 0;
+      } else {
+        for (int k = 0; k < K; ++k) {
+          const int eg = topk_i[(size_t)(in_base + b) * K + k];
+          if (eg >= e_lo && eg < e_hi) { nz = 1; break; }
+        }
+      }
+    }
+    sc[threadIdx.x] = nz;
+    __syncthreads();
+    for (int off = 1; off < 256; off <<= 1) {
+      const int v = (threadIdx.x >= off) ? sc[threadIdx.x - off] : 0;
+      __syncthreads();
+      sc[threadIdx.x] += v;
+      __syncthreads();
+    }
+    const int excl = sc[threadIdx.x] - nz;
+    const int tail = sc[255];
+    if (b < B) {
+      const int r = nz ? (sacc + excl) : -1;
+      rank[out_base + b] = r;
+      if (r >= 0) idx[out_base + r] = b;
+    }
+    __syncthreads();
+    if (threadIdx.x == 0) sacc += tail;
+    __syncthreads();
+  }
+  if (threadIdx.x == 0) cnt[sl] = sacc;
+}
+static inline void getp_rowskip_build_all_send(const int *n_local, int B, int ep, int skip_slice,
+                                               int *rank, int *idx, int *cnt, hipStream_t st) {
+  getp_rowskip_build_all_kernel<true><<<dim3((unsigned)ep), 256, 0, st>>>(
+      n_local, nullptr, 0, B, 0, skip_slice, ep, nullptr, nullptr, rank, idx, cnt);
+}
+static inline void getp_rowskip_build_all_recv(const int *topk_i, int K, int B, int ep,
+                                               int in_slice, int skip_slice,
+                                               const int *e_lo, const int *e_hi,
+                                               int *rank, int *idx, int *cnt, hipStream_t st) {
+  getp_rowskip_build_all_kernel<false><<<dim3((unsigned)ep), 256, 0, st>>>(
+      nullptr, topk_i, K, B, in_slice, skip_slice, ep, e_lo, e_hi, rank, idx, cnt);
+}
+#endif
+
+#if GETP_AGSKIP
+// Gom cac hang lat cat cua minh ma lat cat dich `sl` can, thanh mot khoi lien tuc.
+// Luoi (EP, B): block (sl, i) lo hang thu i cua danh sach gui cho sl. i >= cnt[sl] thoat ngay.
+__global__ __launch_bounds__(256) void getp_agskip_gather_kernel(
+    const __hip_bfloat16 *__restrict__ src, __hip_bfloat16 *__restrict__ dst,
+    const int *__restrict__ idx, const int *__restrict__ cnt, int own, int B, int H) {
+  const int sl = blockIdx.x;
+  if (sl == own || (int)blockIdx.y >= cnt[sl]) return;
+  const int b = idx[(size_t)sl * B + blockIdx.y];
+  const __hip_bfloat16 *sp = src + (size_t)b * H;
+  __hip_bfloat16 *dp = dst + ((size_t)sl * B + blockIdx.y) * H;
+  const int H8 = H & ~7;
+  for (int k = threadIdx.x * 8; k < H8; k += blockDim.x * 8)
+    reinterpret_cast<uint4 *>(dp)[k >> 3] = reinterpret_cast<const uint4 *>(sp)[k >> 3];
+  for (int k = H8 + threadIdx.x; k < H; k += blockDim.x) dp[k] = sp[k];
+}
+// Tan khoi lien tuc vua keo ve, tro lai dung hang trong o cua peer.
+__global__ __launch_bounds__(256) void getp_agskip_scatter_kernel(
+    __hip_bfloat16 *__restrict__ dst, const __hip_bfloat16 *__restrict__ src,
+    const int *__restrict__ idx, int H) {
+  const int b = idx[blockIdx.x];
+  const __hip_bfloat16 *sp = src + (size_t)blockIdx.x * H;
+  __hip_bfloat16 *dp = dst + (size_t)b * H;
+  const int H8 = H & ~7;
+  for (int k = threadIdx.x * 8; k < H8; k += blockDim.x * 8)
+    reinterpret_cast<uint4 *>(dp)[k >> 3] = reinterpret_cast<const uint4 *>(sp)[k >> 3];
+  for (int k = H8 + threadIdx.x; k < H; k += blockDim.x) dp[k] = sp[k];
+}
+#endif
 
 static inline void getp_rowskip_build_send(const int *n_local, int B, int slice,
                                            int *rank, int *idx, int *cnt, hipStream_t st) {
@@ -5207,6 +5342,20 @@ static inline void getp_argmax_rows(const float *logits, int V, int *out, int B,
 #if GETP_DEVSYNC
 // Event "da toi diem nay" cua tung thiet bi, mot khe cho moi (lop, pha). Thiet bi khac cho tren
 // event nay bang hipStreamWaitEvent thay vi doi host vat can hang doi.
+#if GETP_AGSKIP
+// Ca 8 rank la thread cung mot tien trinh, nen bang nay di qua bo nho host binh thuong.
+// Viet truoc hang rao sp1, doc sau no => chinh hang rao dam bao thay, khong can dong bo them.
+static __hip_bfloat16 *g_ag_send[MAXIMUM_GPU];   // [thiet bi] -> [EP][B][H] da nen theo dich
+static int *g_ag_idx[MAXIMUM_GPU];               // [thiet bi] -> rr_idx [EP][B]
+static int g_ag_cnt[MAXIMUM_GPU][MAXIMUM_GPU];   // [lat cat gui][lat cat nhan]
+#endif
+
+#if GETP_EVAGG
+// Su kien "e_agg cua toi da ghi xong", mot o moi lop. sp1 van la hang rao nen hai rank khong
+// bao gio cach nhau qua mot lop, 128 o la du xa.
+static hipEvent_t g_ev_eagg[MAXIMUM_GPU][128];
+#endif
+
 #define GETP_SYNC_SLOTS 128
 static hipEvent_t g_ev_sync[MAXIMUM_GPU][GETP_SYNC_SLOTS];
 static bool g_ev_sync_ready[MAXIMUM_GPU] = {false};
@@ -5302,6 +5451,25 @@ int *getp_forward_120b(Transformer * /*transformer*/,
   static thread_local int *rs_rank = nullptr, *rs_idx = nullptr, *rs_cnt = nullptr;
   static thread_local int *rr_idx = nullptr, *rr_rank = nullptr, *rr_cnt = nullptr;
   static thread_local int *rs_hcnt = nullptr;
+#if GETP_AGSKIP
+  const bool ag_on = rs_on;
+  static thread_local __hip_bfloat16 *ag_send = nullptr, *ag_recv = nullptr;
+  static thread_local int *ag_ridx = nullptr;
+#endif
+#if GETP_RS_MERGE
+  // Khoang expert cua tung lat cat, co dinh ca lan chay nen day len mot lan.
+  static thread_local int *rs_elo = nullptr, *rs_ehi = nullptr;
+  if (rs_on && rs_elo == nullptr) {
+    int hlo[MAXIMUM_GPU], hhi[MAXIMUM_GPU];
+    for (int q = 0; q < EXPERT_PARALLELISM; ++q) {
+      hlo[q] = workers[q].expert_start; hhi[q] = workers[q].expert_end;
+    }
+    HIP_CHECK(hipMalloc(&rs_elo, sizeof(int) * EXPERT_PARALLELISM));
+    HIP_CHECK(hipMalloc(&rs_ehi, sizeof(int) * EXPERT_PARALLELISM));
+    HIP_CHECK(hipMemcpy(rs_elo, hlo, sizeof(int) * EXPERT_PARALLELISM, hipMemcpyHostToDevice));
+    HIP_CHECK(hipMemcpy(rs_ehi, hhi, sizeof(int) * EXPERT_PARALLELISM, hipMemcpyHostToDevice));
+  }
+#endif
   if (rs_on && rs_rank == nullptr) {
     const size_t n = (size_t)EXPERT_PARALLELISM * BATCH_SIZE;
     HIP_CHECK(hipMalloc(&rs_rank, sizeof(int) * n));
@@ -5311,6 +5479,20 @@ int *getp_forward_120b(Transformer * /*transformer*/,
     HIP_CHECK(hipMalloc(&rs_cnt,  sizeof(int) * EXPERT_PARALLELISM));
     HIP_CHECK(hipMalloc(&rr_cnt,  sizeof(int) * EXPERT_PARALLELISM));
     HIP_CHECK(hipHostMalloc(&rs_hcnt, sizeof(int) * EXPERT_PARALLELISM, hipHostMallocDefault));
+#if GETP_AGSKIP
+    // Cong bo cho cac thread khac. Doc chi xay ra sau hang rao sp1 nen an toan.
+    HIP_CHECK(hipMalloc(&ag_send, sizeof(__hip_bfloat16) * (size_t)EXPERT_PARALLELISM *
+                                      BATCH_SIZE * hidden_dim));
+    HIP_CHECK(hipMalloc(&ag_recv, sizeof(__hip_bfloat16) * (size_t)EXPERT_PARALLELISM *
+                                      BATCH_SIZE * hidden_dim));
+    HIP_CHECK(hipMalloc(&ag_ridx, sizeof(int) * (size_t)EXPERT_PARALLELISM * BATCH_SIZE));
+    g_ag_send[device_index] = ag_send;
+    g_ag_idx[device_index] = rr_idx;
+#if GETP_EVAGG
+    for (int q = 0; q < 128; ++q)
+      HIP_CHECK(hipEventCreateWithFlags(&g_ev_eagg[device_index][q], hipEventDisableTiming));
+#endif
+#endif
   }
 #endif
   HIP_CHECK(hipMemcpyAsync(ext->mask_on, mask_on, sizeof(int) * BATCH_SIZE,
@@ -5453,6 +5635,19 @@ int *getp_forward_120b(Transformer * /*transformer*/,
         ext->ext_topk_i + (size_t)(device_index - base_device_index) * BATCH_SIZE * p->experts_per_token,
         BATCH_SIZE, compute_stream);
     HIP_CHECK(hipEventRecord(event_router_topk, compute_stream));
+#if GETP_AGSKIP
+    // Danh sach nay chi doc topk cua LAT CAT MINH, co san tu :5542 - khong can doi peer nao.
+    // Voi lat cat dich sl no liet ke cac hang cua ta ma sl so huu expert: dung thu sl se keo.
+    if (ag_on) {
+      getp_rowskip_build_all_recv(ext->ext_topk_i, p->experts_per_token, BATCH_SIZE,
+                                  EXPERT_PARALLELISM, own_slice, own_slice,
+                                  rs_elo, rs_ehi, rr_rank, rr_idx, rr_cnt, compute_stream);
+      getp_agskip_gather_kernel<<<dim3((unsigned)EXPERT_PARALLELISM, (unsigned)BATCH_SIZE), 256,
+                                  0, compute_stream>>>(
+          ext->ext_t_bf16 + (size_t)own_slice * BATCH_SIZE * hidden_dim, ag_send, rr_idx, rr_cnt,
+          own_slice, BATCH_SIZE, hidden_dim);
+    }
+#endif
 
     // ext_t_bf16 da duoc rmsnorm ghi trong compute_stream truoc event_rmsnorm.
     // Trao doi hidden-state va top-k bang PULL sau barrier, khong PUSH truoc barrier.
@@ -5462,12 +5657,24 @@ int *getp_forward_120b(Transformer * /*transformer*/,
     // dau tien o a_in sau scatter trong khi topk va attention cua chinh no khop. Acquire
     // phia nhan (wait event cua peer) va bo nho fine-grained deu khong chua. Pull tren
     // queue cua thiet bi nhan + event la mau ma duong e_agg dung va do sach.
+#if GETP_AGSKIP
+    if (ag_on) {
+      // Y het nhanh EP > 2 cua sync_workers_dev, chen them mot lan doc so hang vao GIUA:
+      // stream vua can nen rr_cnt da xong, va hang rao ngay sau se cong bo no cho moi rank.
+      HIP_CHECK(hipStreamSynchronize(compute_stream));
+      HIP_CHECK(hipMemcpy(g_ag_cnt[own_slice], rr_cnt, sizeof(int) * EXPERT_PARALLELISM,
+                          hipMemcpyDeviceToHost));
+      sync_point.wait();
+    } else
+#endif
+    {
 #if GETP_DEVSYNC
     sync_workers_dev(compute_stream, memory_stream, sync_point, device_index,
                      EXPERT_PARALLELISM, base_device_index, 2 * (int)l + 0);
 #else
     sync_workers(compute_stream, sync_point);
 #endif
+    }
     HIP_CHECK(hipSetDevice(device_index));
     for (int delta = 1, j = 0; delta < EXPERT_PARALLELISM; ++delta) {
       int i = (device_index + delta) % EXPERT_PARALLELISM;
@@ -5476,6 +5683,23 @@ int *getp_forward_120b(Transformer * /*transformer*/,
       RunStateExt *peer_ext = ext_get(peer_device_index);
       if (peer_device_index == device_index) continue;
       const size_t ps = (size_t)(peer_device_index - base_device_index);
+#if GETP_AGSKIP
+      if (ag_on) {
+        // Chi nhung hang ta so huu expert. So hang da biet tu truoc hang rao sp1.
+        const int nrow = g_ag_cnt[ps][own_slice];
+        if (nrow > 0) {
+          HIP_CHECK(hipMemcpyPeerAsync(
+              ag_ridx + ps * BATCH_SIZE, device_index,
+              g_ag_idx[peer_device_index] + (size_t)own_slice * BATCH_SIZE, peer_device_index,
+              sizeof(int) * (size_t)nrow, memory_stream));
+          HIP_CHECK(hipMemcpyPeerAsync(
+              ag_recv + ps * BATCH_SIZE * hidden_dim, device_index,
+              g_ag_send[peer_device_index] + (size_t)own_slice * BATCH_SIZE * hidden_dim,
+              peer_device_index,
+              sizeof(__hip_bfloat16) * (size_t)nrow * (size_t)hidden_dim, memory_stream));
+        }
+      } else
+#endif
       HIP_CHECK(hipMemcpyPeerAsync(
           ext->ext_t_bf16 + ps * BATCH_SIZE * hidden_dim, device_index,
           peer_ext->ext_t_bf16 + ps * BATCH_SIZE * hidden_dim, peer_device_index,
@@ -5497,6 +5721,20 @@ int *getp_forward_120b(Transformer * /*transformer*/,
       HIP_CHECK(hipStreamWaitEvent(compute_stream, events_pull[j], 0));
       ++j;
     }
+#if GETP_AGSKIP
+    if (ag_on) {
+      for (int delta = 1; delta < EXPERT_PARALLELISM; ++delta) {
+        const int pd = workers[(device_index + delta) % EXPERT_PARALLELISM].device_index;
+        if (pd == device_index) continue;
+        const size_t ps = (size_t)(pd - base_device_index);
+        const int nrow = g_ag_cnt[ps][own_slice];
+        if (nrow <= 0) continue;
+        getp_agskip_scatter_kernel<<<dim3((unsigned)nrow), 256, 0, compute_stream>>>(
+            ext->ext_t_bf16 + ps * BATCH_SIZE * hidden_dim,
+            ag_recv + ps * BATCH_SIZE * hidden_dim, ag_ridx + ps * BATCH_SIZE, hidden_dim);
+      }
+    }
+#endif
     getp_map_global_to_local_batch(
         ext->ext_topk_i, ext->ext_topk_v, ext->local_ids, ext->local_wts,
         ext->n_local, p->experts_per_token, worker->expert_start,
@@ -5505,6 +5743,18 @@ int *getp_forward_120b(Transformer * /*transformer*/,
     int experts_per_device = worker->expert_end - worker->expert_start;
 #if GETP_ROWSKIP
     if (rs_on) {
+#if GETP_RS_MERGE
+      // Mot lan phong cho ca bay lat cat, thay vi bay lan cach nhau 60 us.
+      getp_rowskip_build_all_send(ext->n_local, BATCH_SIZE, EXPERT_PARALLELISM, own_slice,
+                                  rs_rank, rs_idx, rs_cnt, compute_stream);
+#if GETP_AGSKIP
+      // Da dung truoc diem dong bo 1 cho chieu all-gather; rr_* con nguyen, dung lai luon.
+      if (!ag_on)
+#endif
+      getp_rowskip_build_all_recv(ext->ext_topk_i, p->experts_per_token, BATCH_SIZE,
+                                  EXPERT_PARALLELISM, own_slice, own_slice,
+                                  rs_elo, rs_ehi, rr_rank, rr_idx, rr_cnt, compute_stream);
+#else
       // Ben GUI: mot danh sach cho moi lat cat KHONG phai cua minh - do la cac lat se gui di.
       for (int sd = 0; sd < EXPERT_PARALLELISM; ++sd) {
         if (sd == own_slice) continue;
@@ -5521,6 +5771,7 @@ int *getp_forward_120b(Transformer * /*transformer*/,
                                 pw->expert_start, pw->expert_end,
                                 rr_rank, rr_idx, rr_cnt, ps, compute_stream);
       }
+#endif
     }
 #endif
 
@@ -5616,16 +5867,38 @@ int *getp_forward_120b(Transformer * /*transformer*/,
                          nullptr);
 #endif
 
+#if GETP_EVAGG
+    const int ev_k = (int)(l % 128);
+    if (ag_on) {
+      // Khong drain. Hang rao chi de chac rang moi thread DA PHAT event cua minh: cho tren mot
+      // event chua ghi se tra ve ngay va ta doc phai e_agg cua buoc truoc.
+      HIP_CHECK(hipEventRecord(g_ev_eagg[device_index][ev_k], compute_stream));
+      sync_point.wait();
+    } else
+#endif
+    {
 #if GETP_DEVSYNC
     sync_workers_dev(compute_stream, memory_stream, sync_point, device_index,
                      EXPERT_PARALLELISM, base_device_index, 2 * (int)l + 1);
 #else
     sync_workers(compute_stream, sync_point);
 #endif
+    }
 #if GETP_ROWSKIP
     // Mien phi o EP > 2: sync_workers_dev vua goi hipStreamSynchronize nen stream da can.
-    if (rs_on) HIP_CHECK(hipMemcpy(rs_hcnt, rr_cnt, sizeof(int) * EXPERT_PARALLELISM,
-                                   hipMemcpyDeviceToHost));
+    // Voi EVAGG khong con drain nua, nhung cung khong con can lan doc nay: agskip da dat cung
+    // nhung con so do vao g_ag_cnt[own_slice][*] tu truoc hang rao sp1.
+#if GETP_EVAGG
+    if (rs_on && !ag_on)
+#else
+    if (rs_on)
+#endif
+      HIP_CHECK(hipMemcpy(rs_hcnt, rr_cnt, sizeof(int) * EXPERT_PARALLELISM,
+                          hipMemcpyDeviceToHost));
+#if GETP_EVAGG
+    if (ag_on)
+      for (int q = 0; q < EXPERT_PARALLELISM; ++q) rs_hcnt[q] = g_ag_cnt[own_slice][q];
+#endif
 #endif
 
     for (int delta = 1, j = 0; delta < EXPERT_PARALLELISM; ++delta) {
@@ -5634,6 +5907,11 @@ int *getp_forward_120b(Transformer * /*transformer*/,
       int peer_device_index = peer_worker->device_index;
       RunStateExt *peer_ext = ext_get(peer_device_index);
       if (peer_device_index != device_index) {
+#if GETP_EVAGG
+        // Thay cho hang rao: chi cho DUNG peer nay ghi xong, khong cho ca 8.
+        if (ag_on)
+          HIP_CHECK(hipStreamWaitEvent(memory_stream, g_ev_eagg[peer_device_index][ev_k], 0));
+#endif
         HIP_CHECK(hipMemcpyPeerAsync(
             ext->peer_e_agg + (size_t)j * BATCH_SIZE * hidden_dim, device_index,
             ((l & 1) ? peer_ext->ext_e_agg2 : peer_ext->ext_e_agg)

@@ -375,7 +375,18 @@ bytes above, about 35 million carry nothing but zeros, and adding zero is exactl
 | In (reduce-scatter), non-zero rows only | fp32 | ~3,800,000 | ~26,600,000 |
 
 That is 93 MB per layer down to about 58 MB, and it measured 20,426 to 22,760 tok/s, +11.4 %, with the
-output hash unchanged. The receiver is not told how many rows are coming. After phase one it holds
+output hash unchanged.
+
+`GETP_AGSKIP` (default 1) then does the same to the outbound direction, which `GETP_ROWSKIP` left
+alone. The all-gather was broadcasting all `BATCH_SIZE` rows to every peer, and the test for whether
+a peer needs a row is identical: it reads the row only if it owns one of that row's experts, because
+`ext_t_bf16` is only ever fetched through the (token, expert) pair list — `moe_scatter_acts_to_expert_frombf16`
+and mlp1's own gather both index it by `tok_idx`. A row no peer owns is never read, so not sending
+it changes nothing. Measured on the real routing, 326 of 768 rows per peer pair, 42.4 %: 31.0 MB per
+layer down to 13.2 MB. The list is the one `getp_rowskip_build_all_recv` already builds, moved above
+sync point 1 — it reads only this rank's own slice of the top-k, so it needs nothing from a peer —
+and the row counts reach the other ranks through plain host memory, since all eight ranks are threads
+of one process and the sync-point-1 barrier already orders the write against the reads. The receiver is not told how many rows are coming. After phase one it holds
 every slice of `ext_topk_i`, and expert ownership is the contiguous range `[expert_start, expert_end)`,
 so it derives the same row set the sender derived — the sender from its own `n_local`, the receiver
 from the top-k and the sender's range. `hipMemcpyPeerAsync` does still need the byte count on the host,
@@ -399,16 +410,17 @@ Over a full decode step:
 |                                                             | `gpt-oss-20b` | `gpt-oss-120b` |
 | ----------------------------------------------------------- | ------------: | -------------: |
 | Layers                                                      |            24 |             36 |
-| P2P bytes per device per decode step                        |      ≈ 638 MB |      ≈ 2.08 GB |
+| P2P bytes per device per decode step                        |      ≈ 638 MB |      ≈ 1.44 GB |
 | `hipMemcpyPeerAsync` calls per device per layer, 4 × (EP−1) |             4 |             28 |
 | Global barriers per decode step, 2 per layer + 1            |            49 |             73 |
 
 Counting the whole phase, which direction dominates depends on `GETP_ROWSKIP`. With it on — the default, and active at EP 8, so this is the shipping configuration for 120B — inbound is the smaller side: about 26,600,000 B in against 31,137,792 B out per layer, because only the reduce-scatter is row-skipped and the all-gather still sends every row. With `GETP_ROWSKIP=0`, inbound is 61,931,520 B, a shade under twice outbound rather than exactly twice, because the outbound side also carries the two top-k arrays.
-outbound side also carries the two top-k arrays: 61,931,520 B in against 31,137,792 B out per layer on
-120B.
+outbound side also carries the two top-k arrays. With `GETP_AGSKIP` also on, that is 26,600,000 B in
+against about 13,300,000 B out per layer on 120B, from 61,931,520 against 31,137,792 before either.
 
-These numbers are the argument for both the delta rotation and sending bf16 on the wire. 3.35 GB of
-P2P traffic per device per token step is not something to leave half-duplex.
+These numbers are the argument for both the delta rotation and sending bf16 on the wire. Even after
+both row-skips, 1.44 GB of P2P traffic per device per token step is not something to leave
+half-duplex — and it was 3.35 GB before them.
 
 Staging memory is the other cost. Every EP buffer is sized `EP × BATCH_SIZE × hidden_dim`, so on 120B:
 
