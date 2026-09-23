@@ -23,7 +23,7 @@ hipBLAS, no RCCL, no MPI. Every kernel, every collective and the tokenizer are w
 this repository. The only dependency is the HIP runtime itself.
 
 It began from [llama2.c](https://github.com/karpathy/llama2.c) and grew into a complete inference system.
-On a single node of 8 AMD MI250 GPUs it serves **69,309 tokens per second on the 20B model and 25,994 on
+On a single node of 8 AMD MI250 GPUs it serves **69,309 tokens per second on the 20B model and 30,302 on
 the 120B model**, while keeping the generated text faithful to a CPU reference.
 
 Two things are measured, and both have to hold:
@@ -225,7 +225,7 @@ Measured on one node of 8× AMD MI250 in batch (`getp`) mode.
 | Model          | Requests | Warm-up (s) | Inference (s) | Throughput (TPS) | METEOR | BERTScore |
 | -------------- | -------: | ----------: | ------------: | ---------------: | -----: | --------: |
 | `gpt-oss-20b`  |    12288 |          23 |           176 |        **69309** |  0.535 |     0.978 |
-| `gpt-oss-120b` |     6144 |          31 |           235 |        **25994** |  0.560 |     0.981 |
+| `gpt-oss-120b` |     6144 |          36 |           201 |        **30302** |  0.554 |     0.981 |
 
 Where those numbers came from, one optimisation at a time on the 20B model:
 
@@ -262,19 +262,28 @@ is not the same one:
 | The second sync point on per-peer events instead of a barrier           |      24341 |  +1.8% |
 | The expert output emitted one destination slice at a time               |      24685 |  +1.5% |
 | The attention-out tile chosen at run time from how full the GPU is      |      24902 |  +0.6% |
-| The expert-output exchange sent as bf16 instead of fp32 †               |  **26033** |  +4.5% |
+| The expert-output exchange sent as bf16 instead of fp32 †               |      26033 |  +4.5% |
+| Experts moved between GPUs every 100 steps to even out the load ‡       |      28670 | +10.2% |
+| The peer pulls spread over four copy streams                            |  **30349** |  +6.2% |
 
 Each percentage is a paired measurement: the two builds run alternately in one session, twice each,
-against the same input. Absolute throughput moves about 1 % between sessions, so the rows are not
+against the same input - except the last two rows, which rest on one to three runs each (the
+four-stream figure was repeated at 29,750 and 30,300 in a later session). Absolute throughput moves about 1 % between sessions, so the rows are not
 strictly comparable across the table - the number that stands behind the summary above is the
-verification run of the shipped build, which measured 26,088 and 25,900 tok/s with no flags set.
+verification run of the shipped build, which measured 30,302 tok/s in both of its two runs with no flags set - their inference phases took 200.627 s each, to the millisecond.
 
-† Every row but the last is bit-exact. The last is not: the expert partial sums now cross the
-interconnect as bf16, so the 120B's output changes and it hashes to `18a57667bd03` where it used to
-hash to `efe1096ff64c`. It was therefore accepted on its scores rather than its hash - METEOR 0.5608
-to 0.5603 and BERTScore 0.9814 to 0.9805, against thresholds of 0.3 and 0.9 - and it is still
-reproducible from run to run. It is gated on `EXPERT_PARALLELISM > 2`, so the 20B never takes that
-path and still hashes to `720709b86d36`.
+Every row is bit-exact except the two marked, which change the 120B's numbers by design and were
+therefore accepted on METEOR and BERTScore (thresholds 0.3 and 0.9) rather than on a hash. Both stay
+reproducible from run to run, and both are gated on `EXPERT_PARALLELISM > 2`, so the 20B never takes
+them and still hashes to `720709b86d36`.
+
+† The expert partial sums cross the interconnect as bf16: `efe1096ff64c` became `18a57667bd03`,
+METEOR 0.5608 to 0.5603, BERTScore 0.9814 to 0.9805.
+
+‡ Moving an expert to another GPU changes which GPU sums which of a token's four expert outputs, so
+the partial sums are grouped - and rounded to bf16 - differently: `18a57667bd03` became
+`eaf474501c3c`, METEOR 0.5603 to 0.5545, BERTScore 0.9805 to 0.9811. The same run always makes the
+same moves, so the output is still reproducible, including on a host loaded by other work.
 
 At expert parallelism 8 the 120B spent 63% of every step with the GPUs idle, nearly all of it waiting
 on the expert exchange. The output half was seven dense 8.85 MB blocks per layer, one per peer,
@@ -300,11 +309,31 @@ full round trip through the host - finish, wake the host thread, meet seven othe
 the copies - and that round trip was 1.57 ms per layer, 39% of all idle time. With events the
 copies are already queued and start the instant the peer's data is ready.
 
-Two attempts to overlap the transfers instead of shrinking them both lost, and it is worth saying so.
-Splitting one copy across 2, 4 and 8 streams on the 20B went 69274 to 68691 to 67750 to 66001; giving
-each of the seven peers its own stream on the 120B went 20617 to 12877. The GCDs share one fabric
-rather than holding seven independent paths, so the transfer time is set by total bytes and
-concurrency only adds contention. Those two negative results are what pointed at the zeros.
+The next bottleneck was not the wire at all. Every rank launches the same expert GEMMs, but how long
+a rank takes is set by how many 128-row tiles its sixteen experts need - on a trace, 217 µs plus 51 µs
+per tile, correlation 0.99 - and routing is far from even: in a typical layer the most popular expert
+receives about eleven times the average load. With experts placed in fixed blocks of sixteen, the
+busiest rank's expert GEMMs ran 1.65× the mean, and every other rank waited for it at the second
+exchange: 1.27 ms of a 1.65 ms wait per layer. Which experts are popular is stable within a run but
+differs between inputs and drifts as the generations grow, so the placement is learned from the run's
+own traffic. The router writes a *label* instead of an expert id, rank _r_ owns labels
+`[16r, 16r + 16)`, and every kernel downstream keeps its contiguous-range logic; at step 40, and every
+100 steps after, the ranks count the tiles each expert needed over the last 32 steps, all compute the
+same greedy set of swaps (at most eight experts per layer change GPU), and copy those experts' weights
+across in about 0.1 s. The slowest rank's lag at the exchange fell from 1.27 ms to 0.40 ms per layer.
+
+That left the transfers themselves as the largest idle item, 1.2 ms per layer: 13.3 MB each way, at
+only 21-24 GB/s, because all seven peers' copies queued on one stream and ran one after another. Two
+earlier attempts to overlap them had lost - splitting one copy across 2, 4 and 8 streams on the 20B
+went 69274 to 68691 to 67750 to 66001, and giving each of the seven peers its own stream on the 120B
+went 20617 to 12877 - and this README used to conclude from them that the GCDs share one path, so
+concurrency only adds contention. On today's exchange that no longer holds: pulls from different
+peers overlap well, and three to seven copy streams all land within noise of each other, 6 % faster
+than one. Why the earlier attempts lost is not established - they ran on a different exchange, with
+dense fp32 blocks and a host barrier at both sync points. What is measured is that the number of
+*hardware queues* matters: raising `GPU_MAX_HW_QUEUES` from its default of 4 to 16 turns the
+seven-stream version from the fastest into a collapse (14,202 tok/s) while four streams barely notice
+(29,786). The shipped build uses four.
 
 Warm-up is dominated by reading the checkpoint off disk, so it depends on whether the file is still in
 the page cache; it is not part of what the optimisation work changed.
@@ -319,14 +348,15 @@ optimisations in it, so they are not the ones those scores were computed from �
 scored without a GPU: `./run.sh eval 20b` reports METEOR 0.533 and BERTScore 0.978 on them, a hair
 under the table's METEOR and the same BERTScore.
 
-Repeating a run still moves throughput - by about 1 % between sessions, less within one: the two runs behind the 120B figure came in at 26,088 and 25,900 - but it very rarely moves the completions.
+Repeating a run still moves throughput - by about 1 % between sessions, less within one: the two runs behind the 120B figure came in at 30,302 both times - but it very rarely moves the completions.
 That was not always true: before the expert exchange was made pull-based, a receiver could read a peer's
 buffer while it was still being written, so two runs of the _same binary_ at 8 GPUs agreed on only about
 50 % to 95 % of output lines, run pair by run pair. With the pull in place the 120B reproduces its hash from run to run, and every optimisation listed above
-but one was checked by hashing the output rather than by scoring it - the 20B against 720709b86d36 and
-the 120B against efe1096ff64c, both with zero differing lines. The exception is the bf16 return leg,
-which changes the 120B's numbers by design; it was judged on METEOR and BERTScore instead, and its
-output still hashes identically from one run to the next. A hash is a far sharper instrument than
+but two was checked by hashing the output rather than by scoring it - the 20B against 720709b86d36 and
+the 120B against the hash of the build before it, both with zero differing lines. The exceptions are the
+bf16 return leg and the expert moves, which change the 120B's numbers by design; they were judged on
+METEOR and BERTScore instead, and the output still hashes identically from one run to the next
+(`eaf474501c3c` today, on an idle host and on one loaded by an evaluation running alongside). A hash is a far sharper instrument than
 METEOR when the claim is that a change moved no numbers, and it is what makes a 0.6% win safe to accept.
 
 The 20B is not quite there. Of its last twelve full-length runs on the reference input, eleven hashed

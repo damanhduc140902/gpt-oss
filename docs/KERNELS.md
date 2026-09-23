@@ -630,7 +630,10 @@ provably _was_ order-dependent has been removed: the logits argmax used to be a 
 inside a CAS loop, which is not a transitive relation, so with thousands of column blocks racing for one
 cell the winner depended on arrival order. It is now a single `atomicMax` on a key that packs value and
 index monotonically (`pack_val_idx`), which has a total order. Softmax runs _after_
-selection and only over the K selected values, matching the reference. `GETP_ROUTER_TOPK_MAXK` (4) sizes
+selection and only over the K selected values, matching the reference. On the 120B the index it
+*writes* is passed through a per-layer table, `relabel[expert]`, so that expert load balancing
+(`GETP_EPLB`, see [PARALLELISM.md](PARALLELISM.md)) can move experts between GPUs without any kernel
+downstream knowing; selection itself, ties included, still runs on the expert ids. `GETP_ROUTER_TOPK_MAXK` (4) sizes
 the fixed-length scratch arrays and the shared-memory request; it is a compile-time ceiling on
 `experts_per_token`, and all shipped configurations use exactly 4.
 

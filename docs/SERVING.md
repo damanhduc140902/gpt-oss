@@ -530,7 +530,7 @@ Each `DeviceTransformer` creates four non-blocking streams
 | Stream           | Carries                                       |
 | ---------------- | --------------------------------------------- |
 | `compute_stream` | every kernel, plus the final argmax read-back |
-| `memory_stream`  | all `hipMemcpyPeerAsync` traffic              |
+| `memory_stream`  | all `hipMemcpyPeerAsync` traffic; at EP > 2 shared with three more copy streams, peer _j_ on stream _j_ mod 4 (`GETP_COPY_STREAMS`) |
 
 Overlap is real but narrow, and it is event-driven rather than stream-priority driven. Two places
 in the layer body actually hide work:
@@ -563,10 +563,12 @@ is part of why the 20B configuration scales so cleanly.
 
 ### Host synchronisations on the critical path
 
-Overlap is bounded by how often the host has to stop and look at the device. Per layer there are two host-side rendezvous, the two `sync_workers` barriers. Neither drains the
+Overlap is bounded by how often the host has to stop and look at the device. Per layer there are two host-side rendezvous, the two `sync_workers` barriers. On the 20B neither drains the
 queue any more: each device records an event on the stream that wrote the data, the barrier only
 establishes that every thread has issued its event, and the stream that will read a peer's buffer
-waits on that peer's event (`GETP_DEVSYNC`, on by default). The wait belongs on the reading stream -
+waits on that peer's event (`GETP_DEVSYNC`, on by default). On the 120B the second one works the same
+way (`GETP_EVAGG`), while the first still drains `compute_stream`: the host needs each peer's row
+count to size the copies (`GETP_AGSKIP`), and it reads them at that point. The wait belongs on the reading stream -
 the peer pulls run on `memory_stream`, and putting it on `compute_stream` instead lets them read
 stale data, which showed up as every one of the 6144 output lines differing. Removing the drains was
 worth 2.0 % of throughput with bit-identical output. The two remaining entries
@@ -680,7 +682,7 @@ shipped one runs. Working backwards from the published figures:
 | ----------------------------------------------------- | ----------- | ----------- |
 | Sequences in flight                                   | 12288       | 6144        |
 | Forward passes (`-n 1024`, `while (pos + 1 < steps)`) | 1023        | 1023        |
-| Measured throughput                                   | 69309 tok/s | 25994 tok/s |
+| Measured throughput                                   | 69309 tok/s | 30302 tok/s |
 | Implied token-step time                               | 172 ms      | 261 ms      |
 | Barrier crossings per step                            | 49          | 73          |
 | Host stream syncs per step                            | 1           | 73          |

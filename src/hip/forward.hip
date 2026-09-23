@@ -1,3 +1,6 @@
+#include <chrono>
+#include <algorithm>
+#include <vector>
 #include <hip/hip_runtime.h>
 #include <malloc.h>
 
@@ -3137,7 +3140,7 @@ void getp_apply_rotary_emb(float *x, float *cos, float *sin, int n_heads,
 __global__ void router_topk_softmax_batch_kernel(
     const float *__restrict__ router_score, int n_experts,
     int experts_per_token, float *__restrict__ topk_v_out,
-    int *__restrict__ topk_i_out) {
+    int *__restrict__ topk_i_out, const int *__restrict__ relabel) {
   const int b = blockIdx.x;
   const int tid = threadIdx.x;
   const int K = experts_per_token;
@@ -3207,14 +3210,16 @@ __global__ void router_topk_softmax_batch_kernel(
     float invs = 1.f / s;
     for (int i = 0; i < K; ++i) {
       topk_v_out[i] = e[i] * invs;
-      topk_i_out[i] = topi[i];
+      // The selection above is on expert ids; only the id WRITTEN is relabelled (GETP_EPLB).
+      topk_i_out[i] = relabel ? relabel[topi[i]] : topi[i];
     }
   }
 }
 
 static inline void getp_router_topk_softmax_batch(
     const float *router_score, int n_experts, int experts_per_token,
-    float *topk_v_out, int *topk_i_out, int batch_size, hipStream_t stream) {
+    float *topk_v_out, int *topk_i_out, int batch_size, hipStream_t stream,
+    const int *relabel = nullptr) {
 
 #if GETP_SMALL_TOPK
   // n_experts = 32 (20b) / 128 (120b), yet the block was still 1024 threads = 16 waves.
@@ -3260,7 +3265,7 @@ static inline void getp_router_topk_softmax_batch(
                        (size_t)BLK * (sizeof(float) + sizeof(int)) +
                        GETP_ROUTER_TOPK_MAXK * (sizeof(float) + sizeof(int));
   router_topk_softmax_batch_kernel<<<grid, block, shmem, stream>>>(
-      router_score, n_experts, experts_per_token, topk_v_out, topk_i_out);
+      router_score, n_experts, experts_per_token, topk_v_out, topk_i_out, relabel);
 
 }
 
@@ -5502,6 +5507,79 @@ static inline void sync_workers_dev(hipStream_t rec_stream, hipStream_t wait_str
 }
 #endif
 
+// GETP_EPLB (default 1): move a few experts between GPUs once, early in the run, so that the
+// per-layer MoE load evens out. See the note at its call site in getp_forward_120b.
+#ifndef GETP_EPLB
+#define GETP_EPLB 1
+#endif
+#ifndef GETP_EPLB_AT
+#define GETP_EPLB_AT 40      // the first move happens at the start of this step
+#endif
+#ifndef GETP_EPLB_PERIOD
+#define GETP_EPLB_PERIOD 100 // and again every PERIOD steps (0 = only once): popularity drifts
+#endif
+#ifndef GETP_EPLB_WINDOW
+#define GETP_EPLB_WINDOW 32  // each move is planned from the tiles of the WINDOW steps before it
+#endif
+#ifndef GETP_EPLB_MOVES
+#define GETP_EPLB_MOVES 8    // experts allowed to change GPU, per layer and per move
+#endif
+#if GETP_EPLB
+#define GETP_EPLB_MAXL 64
+#define GETP_EPLB_MAXE 128
+// Each rank's counted tiles, [layer][its local label], published for the others at the plan.
+static int g_eplb_tiles[MAXIMUM_GPU][GETP_EPLB_MAXL * GETP_EPLB_MAXE];
+static int g_eplb_ok[MAXIMUM_GPU];
+static int g_eplb_step[MAXIMUM_GPU];
+static int *g_eplb_acc[MAXIMUM_GPU];
+static int *g_eplb_relabel[MAXIMUM_GPU];
+static std::vector<int> g_eplb_label[MAXIMUM_GPU];
+static __hip_bfloat16 *g_eplb_stage[MAXIMUM_GPU];
+static int g_eplb_stage_cap[MAXIMUM_GPU];
+
+__global__ void eplb_count_kernel(int *acc, const int *e_counts, int n, int bm) {
+  const int i = threadIdx.x;
+  if (i < n) acc[i] += (e_counts[i] + bm - 1) / bm;
+}
+
+// owner[l*E + label] = rank that holds that (current) label after the plan. Pure integer greedy
+// with fixed tie-breaks, so every rank that runs it on the same table gets the same answer.
+static void eplb_plan(const std::vector<int> &tiles, int L, int E, int EP, int moves,
+                      std::vector<int> &owner) {
+  const int epd = E / EP;
+  owner.assign((size_t)L * E, 0);
+  for (int l = 0; l < L; ++l) {
+    const int *t = tiles.data() + (size_t)l * E;
+    int *own = owner.data() + (size_t)l * E;
+    long long load[MAXIMUM_GPU] = {};
+    for (int e = 0; e < E; ++e) { own[e] = e / epd; load[own[e]] += t[e]; }
+    for (int moved = 0; moved + 2 <= moves;) {
+      int hi = 0, lo = 0;
+      for (int r = 1; r < EP; ++r) {
+        if (load[r] > load[hi]) hi = r;
+        if (load[r] < load[lo]) lo = r;
+      }
+      long long best = load[hi];
+      int ba = -1, bb = -1;
+      for (int a = 0; a < E; ++a) {
+        if (own[a] != hi) continue;
+        for (int b = 0; b < E; ++b) {
+          if (own[b] != lo) continue;
+          const long long d = (long long)t[a] - t[b];
+          if (d <= 0) continue;
+          const long long m = std::max(load[hi] - d, load[lo] + d);
+          if (m < best) { best = m; ba = a; bb = b; }
+        }
+      }
+      if (ba < 0) break;
+      const long long d = (long long)t[ba] - t[bb];
+      own[ba] = lo; own[bb] = hi; load[hi] -= d; load[lo] += d;
+      moved += 2;
+    }
+  }
+}
+#endif
+
 inline void sync_workers(hipStream_t stream, Barrier &sync_point) {
   /**
     This implement makes sure that threads are synchronized to this point,
@@ -5514,6 +5592,13 @@ inline void sync_workers(hipStream_t stream, Barrier &sync_point) {
   // is not guaranteed HIP_CHECK(hipStreamSynchronize(stream)); // for
   // multi-thread access the same stream
 }
+
+#ifndef GETP_COPY_STREAMS
+// Streams the 120B's peer pulls are spread over (1 = memory_stream only). Measured on top of
+// GETP_EPLB, all bit-identical: 1 stream 28.4-28.7k tok/s; 3, 4, 5, 7 streams 29.8-30.5k. 4, not 7:
+// with GPU_MAX_HW_QUEUES raised to 16, 7 streams collapsed to 14.2k while 4 still gave 29.8k.
+#define GETP_COPY_STREAMS 4
+#endif
 
 int *getp_forward_120b(Transformer * /*transformer*/,
                        DeviceTransformer **dev_transformers, GPUWorker *workers,
@@ -5635,6 +5720,166 @@ int *getp_forward_120b(Transformer * /*transformer*/,
   const size_t odd_stride = (size_t)odd_tcap;
 
   const int own_slice = device_index - base_device_index;
+  // Copy streams for the peer pulls: [0] is memory_stream, the rest are created once per thread,
+  // and only at EP > 2 - the 20B has one peer, so extra streams would only be idle queue users.
+  const int n_copy_streams = (EXPERT_PARALLELISM > 2) ? GETP_COPY_STREAMS : 1;
+  static thread_local hipStream_t copy_streams[GETP_COPY_STREAMS] = {};
+  if (copy_streams[0] == nullptr) {
+    copy_streams[0] = memory_stream;
+    for (int c = 1; c < n_copy_streams; ++c)
+      HIP_CHECK(hipStreamCreateWithFlags(&copy_streams[c], hipStreamNonBlocking));
+  }
+#define GETP_CS(j_) (copy_streams[(j_) % n_copy_streams])
+
+#if GETP_EPLB
+  // Expert load balancing. The router writes LABELS (relabel[l][expert]); rank r owns labels
+  // [epd*r, epd*r + epd) and label epd*r + i is its weight slot i, so everything downstream keeps
+  // working on contiguous ranges. The WINDOW steps before each move count each slot's padded tiles; at
+  // the start of a move step every rank agrees on the same swaps (eplb_plan), pulls the experts it receives into a
+  // staging buffer, waits until every rank has done the same, copies them into the vacated slots,
+  // and installs the new labels. Only at EP > 2 (rs_on); the table stays the identity otherwise.
+  const int eplb_epd = worker->expert_end - worker->expert_start;
+  // Per worker SLOT, not per thread: the 120B starts fresh threads for every wave of requests,
+  // and a new thread must keep using the labels that match the weights already moved.
+  int &eplb_step = g_eplb_step[device_index];
+  int *&eplb_acc = g_eplb_acc[device_index];            // device [L][epd] tiles counted
+  int *&eplb_relabel = g_eplb_relabel[device_index];    // device [L][E] expert -> label
+  std::vector<int> &eplb_label = g_eplb_label[device_index];  // host copy of eplb_relabel
+  const bool eplb_on = (EXPERT_PARALLELISM > 2) && p->n_layers <= GETP_EPLB_MAXL &&
+                       n_experts <= GETP_EPLB_MAXE;
+  if (eplb_on && eplb_relabel == nullptr) {
+    eplb_label.resize((size_t)p->n_layers * n_experts);
+    for (int l = 0; l < p->n_layers; ++l)
+      for (int e = 0; e < n_experts; ++e) eplb_label[(size_t)l * n_experts + e] = e;
+    // Every transfer to or from these tables goes on compute_stream, the stream whose kernels
+    // read and write them, and is waited for: the null stream is NOT ordered against our
+    // non-blocking streams, so a plain hipMemcpy/hipMemset here could land after the router.
+    HIP_CHECK(hipMalloc(&eplb_relabel, sizeof(int) * eplb_label.size()));
+    HIP_CHECK(hipMemcpyAsync(eplb_relabel, eplb_label.data(), sizeof(int) * eplb_label.size(),
+                             hipMemcpyHostToDevice, compute_stream));
+    HIP_CHECK(hipMalloc(&eplb_acc, sizeof(int) * (size_t)p->n_layers * eplb_epd));
+    HIP_CHECK(hipMemsetAsync(eplb_acc, 0, sizeof(int) * (size_t)p->n_layers * eplb_epd,
+                             compute_stream));
+    HIP_CHECK(hipStreamSynchronize(compute_stream));
+  }
+  const bool eplb_move_now =
+      eplb_on && eplb_step >= GETP_EPLB_AT &&
+      (GETP_EPLB_PERIOD > 0 ? (eplb_step - GETP_EPLB_AT) % GETP_EPLB_PERIOD == 0
+                            : eplb_step == GETP_EPLB_AT);
+  if (eplb_move_now) {
+    const int L = p->n_layers, E = n_experts, EP = EXPERT_PARALLELISM, epd = eplb_epd;
+    const auto t0 = std::chrono::steady_clock::now();
+    HIP_CHECK(hipMemcpyAsync(g_eplb_tiles[device_index], eplb_acc, sizeof(int) * (size_t)L * epd,
+                             hipMemcpyDeviceToHost, compute_stream));
+    HIP_CHECK(hipStreamSynchronize(compute_stream));
+    sync_point.wait();
+    std::vector<int> tl((size_t)L * E), owner;
+    for (int q = 0; q < EP; ++q)
+      for (int l = 0; l < L; ++l)
+        for (int i = 0; i < epd; ++i)
+          tl[(size_t)l * E + q * epd + i] = g_eplb_tiles[base_device_index + q][(size_t)l * epd + i];
+    eplb_plan(tl, L, E, EP, GETP_EPLB_MOVES, owner);
+    // New slot of every current label: labels that stay keep their slot; each rank's incoming
+    // labels, in increasing order, fill its vacated slots in increasing order.
+    std::vector<int> newlab((size_t)L * E);
+    std::vector<std::vector<std::pair<int, int>>> incoming(L);  // mine: (my slot, source label)
+    int max_in = 0, moved = 0;
+    for (int l = 0; l < L; ++l) {
+      const int *own = owner.data() + (size_t)l * E;
+      for (int r = 0; r < EP; ++r) {
+        std::vector<int> vac, in;
+        for (int i = 0; i < epd; ++i) {
+          const int lab = r * epd + i;
+          if (own[lab] == r) newlab[(size_t)l * E + lab] = lab; else vac.push_back(i);
+        }
+        for (int lab = 0; lab < E; ++lab)
+          if (own[lab] == r && lab / epd != r) in.push_back(lab);
+        for (size_t k = 0; k < in.size(); ++k) {
+          newlab[(size_t)l * E + in[k]] = r * epd + vac[k];
+          if (r == own_slice) incoming[l].push_back({vac[k], in[k]});
+        }
+        moved += (int)in.size();
+      }
+      max_in = std::max(max_in, (int)incoming[l].size());
+    }
+    const int H = hidden_dim, I = p->intermediate_dim;
+    const size_t n_w1 = (size_t)2 * I * H, n_b1 = (size_t)2 * I, n_w2 = (size_t)H * I, n_b2 = H;
+    const size_t n_ex = n_w1 + n_b1 + n_w2 + n_b2;
+    // Staging is kept for the whole run and only ever grown, so no move frees device memory
+    // while the engine is running.
+    __hip_bfloat16 *&stage = g_eplb_stage[device_index];
+    int &stage_cap = g_eplb_stage_cap[device_index];
+    bool ok = true;
+    if (max_in > stage_cap) {
+      if (stage) HIP_CHECK(hipFree(stage));
+      stage = nullptr; stage_cap = 0;
+      ok = hipMalloc(&stage, sizeof(__hip_bfloat16) * n_ex * max_in) == hipSuccess;
+      if (ok) stage_cap = max_in; else stage = nullptr;
+    }
+    g_eplb_ok[device_index] = ok;
+    sync_point.wait();
+    bool all_ok = true;
+    for (int q = 0; q < EP; ++q) all_ok = all_ok && g_eplb_ok[base_device_index + q];
+    if (all_ok && moved > 0) {
+      for (int l = 0; l < L; ++l) {
+        for (size_t k = 0; k < incoming[l].size(); ++k) {
+          const int src_lab = incoming[l][k].second, q = src_lab / epd, j = src_lab % epd;
+          const DeviceTransformerWeights *sw = &dev_transformers[base_device_index + q]->weights;
+          const int sdev = workers[q].device_index;
+          __hip_bfloat16 *st = stage + k * n_ex;
+          const size_t e = (size_t)l * epd + j;
+          HIP_CHECK(hipMemcpyPeerAsync(st, device_index, sw->w_mlp1 + e * n_w1, sdev,
+                                       sizeof(__hip_bfloat16) * n_w1, memory_stream));
+          HIP_CHECK(hipMemcpyPeerAsync(st + n_w1, device_index, sw->b_mlp1 + e * n_b1, sdev,
+                                       sizeof(__hip_bfloat16) * n_b1, memory_stream));
+          HIP_CHECK(hipMemcpyPeerAsync(st + n_w1 + n_b1, device_index, sw->w_mlp2 + e * n_w2, sdev,
+                                       sizeof(__hip_bfloat16) * n_w2, memory_stream));
+          HIP_CHECK(hipMemcpyPeerAsync(st + n_w1 + n_b1 + n_w2, device_index, sw->b_mlp2 + e * n_b2,
+                                       sdev, sizeof(__hip_bfloat16) * n_b2, memory_stream));
+        }
+        HIP_CHECK(hipStreamSynchronize(memory_stream));
+        sync_point.wait();   // every rank has READ its sources for this layer: slots may change now
+        for (size_t k = 0; k < incoming[l].size(); ++k) {
+          const size_t e = (size_t)l * epd + incoming[l][k].first;
+          const __hip_bfloat16 *st = stage + k * n_ex;
+          HIP_CHECK(hipMemcpyAsync(dev_w->w_mlp1 + e * n_w1, st, sizeof(__hip_bfloat16) * n_w1,
+                                   hipMemcpyDeviceToDevice, memory_stream));
+          HIP_CHECK(hipMemcpyAsync(dev_w->b_mlp1 + e * n_b1, st + n_w1, sizeof(__hip_bfloat16) * n_b1,
+                                   hipMemcpyDeviceToDevice, memory_stream));
+          HIP_CHECK(hipMemcpyAsync(dev_w->w_mlp2 + e * n_w2, st + n_w1 + n_b1,
+                                   sizeof(__hip_bfloat16) * n_w2, hipMemcpyDeviceToDevice,
+                                   memory_stream));
+          HIP_CHECK(hipMemcpyAsync(dev_w->b_mlp2 + e * n_b2, st + n_w1 + n_b1 + n_w2,
+                                   sizeof(__hip_bfloat16) * n_b2, hipMemcpyDeviceToDevice,
+                                   memory_stream));
+        }
+        HIP_CHECK(hipStreamSynchronize(memory_stream));
+      }
+      for (size_t x = 0; x < eplb_label.size(); ++x) {
+        const int l = (int)(x / E);
+        eplb_label[x] = newlab[(size_t)l * E + eplb_label[x]];
+      }
+      HIP_CHECK(hipMemcpyAsync(eplb_relabel, eplb_label.data(), sizeof(int) * eplb_label.size(),
+                               hipMemcpyHostToDevice, compute_stream));
+    }
+    HIP_CHECK(hipMemsetAsync(eplb_acc, 0, sizeof(int) * (size_t)L * epd, compute_stream));
+    HIP_CHECK(hipStreamSynchronize(compute_stream));   // new labels and an empty window, in place
+    sync_point.wait();
+    // One line per move with GETP_EPLB_LOG set; a move that could not be applied is always reported.
+    static const bool eplb_log = getenv("GETP_EPLB_LOG") != nullptr;
+    if (own_slice == 0 && (eplb_log || !all_ok))
+      fprintf(stderr, "eplb: step %d, %d of %d experts moved%s, %.0f ms\n", eplb_step, moved,
+              L * E, all_ok ? "" : " (NOT applied: staging allocation failed)",
+              std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - t0).count());
+  }
+  // Count during the WINDOW steps before each move: [AT + k*PERIOD - WINDOW, AT + k*PERIOD).
+  const int eplb_rel = eplb_step - (GETP_EPLB_AT - GETP_EPLB_WINDOW);
+  const bool eplb_count =
+      eplb_on && eplb_rel >= 0 &&
+      (GETP_EPLB_PERIOD > 0 ? eplb_rel % GETP_EPLB_PERIOD < GETP_EPLB_WINDOW
+                            : eplb_rel < GETP_EPLB_WINDOW);
+  if (eplb_on) ++eplb_step;
+#endif
 
   for (unsigned long long l = 0; l < p->n_layers; l++) {
     // rmsnorm writes bf16 DIRECTLY into pre_qkv_bf16: the fp32 form (dev_s->t) no longer
@@ -5748,7 +5993,11 @@ int *getp_forward_120b(Transformer * /*transformer*/,
         dev_s->router_score, n_experts, p->experts_per_token,
         ext->ext_topk_v + (size_t)(device_index - base_device_index) * BATCH_SIZE * p->experts_per_token,
         ext->ext_topk_i + (size_t)(device_index - base_device_index) * BATCH_SIZE * p->experts_per_token,
-        BATCH_SIZE, compute_stream);
+        BATCH_SIZE, compute_stream
+#if GETP_EPLB
+        , eplb_on ? eplb_relabel + (size_t)l * n_experts : nullptr
+#endif
+        );
     HIP_CHECK(hipEventRecord(event_router_topk, compute_stream));
 #if GETP_AGSKIP
     // This list only reads the top-k of OUR OWN SLICE, available since :5542 - it waits for no peer.
@@ -5808,28 +6057,28 @@ int *getp_forward_120b(Transformer * /*transformer*/,
           HIP_CHECK(hipMemcpyPeerAsync(
               ag_ridx + ps * BATCH_SIZE, device_index,
               g_ag_idx[peer_device_index] + (size_t)own_slice * BATCH_SIZE, peer_device_index,
-              sizeof(int) * (size_t)nrow, memory_stream));
+              sizeof(int) * (size_t)nrow, GETP_CS(j)));
           HIP_CHECK(hipMemcpyPeerAsync(
               ag_recv + ps * BATCH_SIZE * hidden_dim, device_index,
               g_ag_send[peer_device_index] + (size_t)own_slice * BATCH_SIZE * hidden_dim,
               peer_device_index,
-              sizeof(__hip_bfloat16) * (size_t)nrow * (size_t)hidden_dim, memory_stream));
+              sizeof(__hip_bfloat16) * (size_t)nrow * (size_t)hidden_dim, GETP_CS(j)));
         }
       } else
 #endif
       HIP_CHECK(hipMemcpyPeerAsync(
           ext->ext_t_bf16 + ps * BATCH_SIZE * hidden_dim, device_index,
           peer_ext->ext_t_bf16 + ps * BATCH_SIZE * hidden_dim, peer_device_index,
-          sizeof(__hip_bfloat16) * (size_t)BATCH_SIZE * (size_t)hidden_dim, memory_stream));
+          sizeof(__hip_bfloat16) * (size_t)BATCH_SIZE * (size_t)hidden_dim, GETP_CS(j)));
       HIP_CHECK(hipMemcpyPeerAsync(
           ext->ext_topk_i + ps * BATCH_SIZE * p->experts_per_token, device_index,
           peer_ext->ext_topk_i + ps * BATCH_SIZE * p->experts_per_token, peer_device_index,
-          sizeof(int) * (size_t)BATCH_SIZE * (size_t)p->experts_per_token, memory_stream));
+          sizeof(int) * (size_t)BATCH_SIZE * (size_t)p->experts_per_token, GETP_CS(j)));
       HIP_CHECK(hipMemcpyPeerAsync(
           ext->ext_topk_v + ps * BATCH_SIZE * p->experts_per_token, device_index,
           peer_ext->ext_topk_v + ps * BATCH_SIZE * p->experts_per_token, peer_device_index,
-          sizeof(float) * (size_t)BATCH_SIZE * (size_t)p->experts_per_token, memory_stream));
-      HIP_CHECK(hipEventRecord(events_pull[j], memory_stream));
+          sizeof(float) * (size_t)BATCH_SIZE * (size_t)p->experts_per_token, GETP_CS(j)));
+      HIP_CHECK(hipEventRecord(events_pull[j], GETP_CS(j)));
       ++j;
     }
     for (int delta = 1, j = 0; delta < EXPERT_PARALLELISM; ++delta) {
@@ -5897,6 +6146,12 @@ int *getp_forward_120b(Transformer * /*transformer*/,
         EXPERT_PARALLELISM * BATCH_SIZE, p->experts_per_token,
         experts_per_device, ext->e_counts, ext->e_offsets, ext->e_dev,
         ext->w_dev, ext->pair_pos, compute_stream);
+#if GETP_EPLB
+    if (eplb_count)
+      eplb_count_kernel<<<1, 64, 0, compute_stream>>>(eplb_acc + (size_t)l * experts_per_device,
+                                                      ext->e_counts, experts_per_device,
+                                                      MATMUL_MLP1_BLOCK_ROWS);
+#endif
 
     int total_blocks_mlp1 = build_moe_block_schedule(
       ext->e_offsets, experts_per_device, MATMUL_MLP1_BLOCK_ROWS,
@@ -6061,11 +6316,11 @@ int *getp_forward_120b(Transformer * /*transformer*/,
         if (ag_on)
 #if GETP_GPSLICE
           // delta == 1 is the peer we pull from first: it fired an early event for our slice alone.
-          HIP_CHECK(hipStreamWaitEvent(memory_stream,
+          HIP_CHECK(hipStreamWaitEvent(GETP_CS(j),
                                        (delta == 1 ? g_ev_eagg_first : g_ev_eagg)
                                            [peer_device_index][ev_k], 0));
 #else
-          HIP_CHECK(hipStreamWaitEvent(memory_stream, g_ev_eagg[peer_device_index][ev_k], 0));
+          HIP_CHECK(hipStreamWaitEvent(GETP_CS(j), g_ev_eagg[peer_device_index][ev_k], 0));
 #endif
 #endif
 #if GETP_EAGG_BF16
@@ -6082,7 +6337,7 @@ int *getp_forward_120b(Transformer * /*transformer*/,
               sizeof(__hip_bfloat16)
                   * (size_t)rs_hcnt[peer_device_index - base_device_index]
                   * (size_t)hidden_dim,
-              memory_stream));
+              GETP_CS(j)));
         } else
 #endif
         HIP_CHECK(hipMemcpyPeerAsync(
@@ -6097,8 +6352,8 @@ int *getp_forward_120b(Transformer * /*transformer*/,
 #else
             sizeof(float) * BATCH_SIZE * hidden_dim,
 #endif
-            memory_stream));
-        HIP_CHECK(hipEventRecord(events_e_agg[j], memory_stream));
+            GETP_CS(j)));
+        HIP_CHECK(hipEventRecord(events_e_agg[j], GETP_CS(j)));
         ++j;
       }
     }
@@ -6147,6 +6402,7 @@ int *getp_forward_120b(Transformer * /*transformer*/,
   HIP_CHECK(hipMemcpyAsync(next_host, dev_s->topk_i, sizeof(int) * BATCH_SIZE,
                            hipMemcpyDeviceToHost, compute_stream));
   HIP_CHECK(hipStreamSynchronize(compute_stream));
+#undef GETP_CS
   return next_host;
 }
 

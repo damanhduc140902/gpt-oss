@@ -13,7 +13,10 @@ inside each collective is not arbitrary.
 ![Expert x Data parallelism](assets/expert-data.png)
 
 Each device owns a contiguous window of experts, `[expert_start, expert_end)`, and a contiguous slice
-of the global batch. Weights that are not experts — embeddings, attention projections, norms, the
+of the global batch. (On the 120B the window is contiguous in *label* space: the router writes a label
+per expert, and the experts behind the labels move between devices during the run to balance the
+load - see [Moving experts](#moving-experts-to-balance-the-load) below. Everything in this document
+holds with "expert" read as "label".) Weights that are not experts — embeddings, attention projections, norms, the
 output head — are replicated on every device. `upload_transformer` in
 [`src/getp/transformer.cpp`](../src/getp/transformer.cpp) uploads only the device's own expert window,
 offsetting `w_mlp1`, `w_mlp2` and their biases by `worker->expert_start`, so the expert weights are
@@ -309,9 +312,11 @@ for (int delta = 1; delta < N_DEVICES; ++delta) {
 
 ![all gather](assets/all-gather.png)
 
-The copies of one phase are all issued on the same per-device `memory_stream`, created with
+On the 20B the copies of one phase are all issued on the per-device `memory_stream`, created with
 `hipStreamNonBlocking` in [`src/getp/transformer.cpp`](../src/getp/transformer.cpp), so they execute in
-issue order. That is what makes the ordering meaningful rather than cosmetic.
+issue order. On the 120B they are spread over four copy streams, peer _j_ on stream _j_ mod 4
+(`GETP_COPY_STREAMS`), so that pulls from different peers overlap; the rotation still fixes the issue
+order on each stream and the order in which the compute stream consumes the results.
 
 At step `delta`, rank _i_ is pulling from rank _(i+delta) mod N_ while being pulled from by rank
 _(i−delta) mod N_. One outbound and one inbound transfer per rank: a perfect matching on the peer graph
@@ -352,6 +357,46 @@ pointer `workers + EXPERT_PARALLELISM * model_idx`, so `base_device_index` is a 
 `device_index ≡ local_rank (mod EP)`. For 20B, replica 1 owns devices 2 and 3, and `(2+1)%2 = 1`
 resolves to `workers[1]`, which is device 3. Break that alignment and the rotation silently targets the
 wrong peer.
+
+## Moving experts to balance the load
+
+`GETP_EPLB` (default on at EP > 2). Every rank launches the same expert GEMMs, but the time a rank
+spends in them is set by the number of 128-row tiles its experts need: on a trace, mlp1 costs 126 µs
+plus 32.7 µs per tile and mlp2 91 µs plus 18.2 µs per tile, both at correlation 0.99. Routing is
+heavily skewed - per layer the most popular expert gets a median 10.8× the mean load, up to 21× - so
+with the experts in fixed blocks of sixteen the busiest rank's GEMMs took 1.65× the mean and the
+other seven waited for it at the reduce-scatter: 1.27 ms of the 1.65 ms spent there per layer.
+
+A probe of the per-expert counts showed why the placement has to be learned online. Popularity is
+stable within a run (correlation 0.976 between the two halves of 160 steps) but not across inputs
+(0.45 between the benchmark prompts and a synthetic set), and it drifts as the generations grow: a
+placement learned at step 40 saves 13.5 ms per step at first and only about 3 ms after step 400.
+
+1. **Labels.** The router writes `relabel[l][expert]` instead of the expert id. Rank _r_ owns labels
+   `[epd·r, epd·r + epd)`, and label `epd·r + i` is its weight slot _i_. The table starts as the
+   identity, which is the fixed placement.
+2. **Counting.** For the 32 steps before each move, each rank adds `ceil(count / 128)` for each of its
+   slots to a device accumulator, per layer - tiles, because tiles are what cost time.
+3. **Plan.** At step 40 and every 100 steps after, every rank publishes its counts and all ranks run
+   the same integer greedy: swap an expert of the most loaded rank with one of the least loaded while
+   that lowers the maximum, at most eight experts per layer changing rank. Same integers, fixed
+   tie-breaks, so every rank arrives at the same plan.
+4. **Move.** Layer by layer, each rank pulls the experts it receives into a staging buffer, all ranks
+   meet at a barrier - nobody overwrites a slot a peer may still be reading - and the staged experts
+   are copied into the vacated slots. Then the new labels are installed. A move shifts about 270
+   experts, 50 MB each, in 55-100 ms.
+
+The counters and the label table move between host and device on `compute_stream`, the stream whose
+kernels read them, and each transfer is waited for; the weight copies run on `memory_stream` behind
+explicit stream syncs and the barriers above; and the staging buffer is kept for the whole run. An
+earlier version used plain `hipMemcpy`/`hipMemset` for the tables - the null stream is not ordered
+against the engine's non-blocking streams - and allocated and freed its staging at every move. On a
+host loaded by other work, four runs of that version gave four different outputs, all diverging at
+the second move; three runs of this one under the same load gave the unloaded output.
+
+Measured paired: 26,012 to 28,670 tok/s (+10.2 %), and the slowest rank's lag at the exchange falls
+from 1.27 to 0.40 ms per layer. The output changes - a token's expert partial sums are grouped on
+different GPUs - so it was accepted on METEOR 0.5545 and BERTScore 0.9811 rather than on a hash.
 
 ## What it costs
 

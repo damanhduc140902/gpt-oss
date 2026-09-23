@@ -143,9 +143,10 @@ Completions are written in request order, so output line _i_ is the answer to pr
 
 The engine is reproducible, bar the rare 20B case below: two runs of the same binary on the same
 input file produce identical output, and that is how changes are validated here -- the 20B against output hash 720709b86d36 and
-the 120B against 18a57667bd03, both with zero differing lines. (The 120B hashed to efe1096ff64c until
-the expert-output exchange moved to bf16; that one change was accepted on its METEOR and BERTScore,
-since it changes the numbers by design.) Hashing the output, not METEOR or
+the 120B against eaf474501c3c, both with zero differing lines. (The 120B's hash has changed twice by
+design: efe1096ff64c became 18a57667bd03 when the expert-output exchange moved to bf16, and
+eaf474501c3c when experts started moving between GPUs to balance the load. Those two changes were
+accepted on their METEOR and BERTScore.) Hashing the output, not METEOR or
 BERTScore, is therefore the gate for any change that is supposed to move no numbers; the scores are
 the coarse backstop, too noisy to accept or reject a sub-percent change.
 
