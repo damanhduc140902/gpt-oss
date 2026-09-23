@@ -85,7 +85,7 @@ macro anywhere in the file and `-D` cannot move its tile.
 | Kernel         | BM × BN × BK   | Wave tile | BN_AGG | Effective N per workgroup (BNt) | LDS per workgroup |
 | -------------- | -------------- | --------- | ------ | ------------------------------- | ----------------- |
 | QKV †          | 128 × 128 × 32 | 64 × 64   | 1      | 128                             | 16 640 B          |
-| Attention out  | 128 × 128 × 32 | 64 × 64   | 1      | 128                             | 16 640 B          |
+| Attention out ‡| 128 × 128 × 32 | 64 × 64   | 1      | 128                             | 16 640 B          |
 | Logits         | 128 × 128 × 32 | 64 × 64   | 1      | 128                             | 19 456 B          |
 | MLP1 (gate/up) | 128 × 64 × 32  | 64 × 32   | 2      | 128                             | 24 960 B          |
 | MLP2 (down)    | 128 × 64 × 32  | 64 × 32   | 3      | 192                             | 20 736 B          |
@@ -100,6 +100,15 @@ tile.
 THREADS = 256;` — which the launcher and the kernel body both read, bound together by a `static_assert`
 in the kernel body. Retuning means editing that struct and recompiling; the LDS padding follows from
 `GetpQkvLdsTile` on its own.
+
+‡ Attention out picks between two tiles at run time: the one above, and 128 × 64 × 32 with a 64 × 32
+wave tile and 12 544 B of LDS. No single tile suits both models, because the grid is
+(N/BN, BATCH_SIZE/BM) and they run different batch sizes. At BN = 128 the kernel runs at 3 waves per
+SIMD, so 3 workgroups per CU and 312 slots on 104 CUs; the 120B's 768-row batch fills only 138 of them
+(44 %) and gains 0.6 % from halving the tile, while the 20B's 1536 rows fill 276 (88 %) and lose 2.7 %.
+The launcher asks the runtime for the wide tile's occupancy (`hipOccupancyMaxActiveBlocksPerMultiprocessor`)
+and halves the tile when the wide one would fill less than half the resident slots. Both are bit-exact;
+`-DGETP_ATTN_O_AUTO_TILE=0` restores the fixed `MATMUL_ATTN_O_*` tile.
 
 The pattern is the one blocktiling predicts. Where $\text{M}$, $\text{N}$ and $\text{K}$ are all in the
 thousands, a 128 × 128 block tile with a 64 × 64 wave tile gives the best ratio of matrix-core work to
@@ -614,8 +623,9 @@ with `eps = 1e-6f`. This matters because the logits come out of a bf16 matmul, w
 collisions are common; the CPU reference sorts with an unstable comparator, so its ties are arbitrary,
 and a deterministic rule here is what makes this kernel's output independent of thread scheduling. It
 was not by itself enough to make the engine reproducible — that came from making the expert exchange
-a pull, after which two full 8-GPU runs agree on 100 % of output lines, against 50 % to 95 % run pair
-by run pair for the push build. The one comparison that
+a pull, after which two full 8-GPU runs of the 120B agree on 100 % of output lines, against 50 % to 95 %
+run pair by run pair for the push build. The 20B does too in all but a rare run, which the main README
+describes. The one comparison that
 provably _was_ order-dependent has been removed: the logits argmax used to be a relative-tolerance test
 inside a CAS loop, which is not a transitive relation, so with thousands of column blocks racing for one
 cell the winner depended on arrival order. It is now a single `atomicMax` on a key that packs value and

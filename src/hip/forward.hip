@@ -12,96 +12,119 @@
 #include "getp/transformer.cpp"
 #include "transformer.hpp"
 
-// Padding tren truc nhanh cua tile LDS. Voi BM=BN=128 buoc giua hai mat k la
-// 64 dword, chia het 32 bank -> moi nhom 16 lane doc/ghi trung bank. Them 4
-// phan tu lam buoc thanh 66 dword, trai deu tren cac bank.
+// Padding on the fast axis of the LDS tile. At BM=BN=128 the stride between two k planes is
+// 64 dwords, a multiple of the 32 banks, so every group of 16 lanes reads and writes the same
+// bank. Four extra elements make the stride 66 dwords, which spreads it across the banks.
 #ifndef GETP_LDS_PAD
 #define GETP_LDS_PAD 4
 #endif
-// GETP_LDS_PAD o tren van la pad theo TRUC HANG cua bo cuc [BK][BM+PAD] va van
-// dung NGUYEN cho matmul_attn_o_bf16_kernel_tuned va
-// matmul_logits_argmax_bf16_kernel_tuned. Kernel QKV doi sang bo cuc o (slot)
-// [k/4][hang][4]: pad cua no dem theo O 8 byte chu khong theo short, va dieu
-// kien hop le phu thuoc BK qua NKC = BK/8 - moi kernel mot khac. Vi vay QKV co
-// macro RIENG; dung lai mot macro cho hai DON VI khac nhau la cach chac chan
-// nhat de cap phat sai tile mot cach im lang.
-//   -1 = tu suy ra gia tri nho nhat khong xung dot bank (xem GetpQkvLdsTile).
+// GETP_LDS_PAD above still pads the ROW axis of the [BK][BM+PAD] layout, and is still used
+// verbatim by matmul_attn_o_bf16_kernel_tuned and
+// matmul_logits_argmax_bf16_kernel_tuned. The QKV kernel has moved to the slot layout
+// [k/4][row][4]: its padding counts in 8-byte SLOTS rather than in shorts, and the validity
+// condition depends on BK through NKC = BK/8, which differs per kernel. That is why QKV has
+// its OWN macro; reusing one macro for two different UNITS is a reliable way to get it wrong.
+//   -1 = derive the smallest bank-conflict-free value (see GetpQkvLdsTile).
 #ifndef GETP_QKV_LDS_PAD_SLOTS
 #define GETP_QKV_LDS_PAD_SLOTS (-1)
 #endif
 
-// Gap phep xoay RoPE vao epilogue cua kernel QKV. Xem ghi chu dai ngay tren
-// epilogue: ban doi dim+head_dim/2 nam cung lane nen khong ton shuffle nao.
+// Fold the RoPE rotation into the QKV kernel epilogue. See the long note just above the
+// epilogue: the partner at dim+head_dim/2 lands in the same lane, so no shuffle is needed.
 #ifndef GETP_ROPE_FUSED
-#define GETP_ROPE_FUSED 1   // mac dinh BAT (do e2e: -0,73 ms/buoc); dat 0 de A/B
+#define GETP_ROPE_FUSED 1   // on by default (measured end to end: -0,73 ms/step); set 0 to A/B
 #endif
-// Them mot bac: ghi thang khe KV cache o bf16 tu epilogue va bo kv_store_pair.
-// Tach co rieng vi no danh doi hieu suat ghi (2 byte/lane) lay 12,6 MB/lop.
+// One step further: write the KV cache slot directly as bf16 from the epilogue and drop
+// kv_store_pair. A separate flag, because it trades store efficiency (2 bytes/lane) for 12,6 MB/layer.
 #ifndef GETP_ROPE_FUSED_KV
-#define GETP_ROPE_FUSED_KV 1   // mac dinh BAT (cung mot phep quay cho K); dat 0 de A/B
+#define GETP_ROPE_FUSED_KV 1   // on by default (the same rotation, applied to K); set 0 to A/B
 #endif
 #if GETP_ROPE_FUSED_KV && !GETP_ROPE_FUSED
-#error "GETP_ROPE_FUSED_KV=1 doi hoi GETP_ROPE_FUSED=1"
+#error "GETP_ROPE_FUSED_KV=1 requires GETP_ROPE_FUSED=1"
 #endif
 
-// --- smallfuse: hai cong tac doc lap, mac dinh TAT ---------------------------
-// Ghi Q san o bf16 da nhan 1/sqrt(d): attention doi no sang bf16 o lan dung dau tien roi,
-// va he so la 2^-3 nen phep nhan khong doi mantissa. Xem dau file qbf16.
+// --- smallfuse: two independent switches, OFF by default ---------------------------
+// Write q already in bf16 and already scaled by 1/sqrt(d): attention rounds it to bf16 at its
+// first use anyway, and the factor is 2^-3 so the multiply leaves the mantissa alone. See qbf16.
 #ifndef GETP_Q_BF16
-#define GETP_Q_BF16 1   // mac dinh BAT (attention 445 -> 355 us/goi); dat 0 de A/B
+#define GETP_Q_BF16 1   // on by default (attention 445 -> 355 us/call); set 0 to A/B
 #endif
 #if GETP_Q_BF16 && !GETP_ROPE_FUSED
-#error "GETP_Q_BF16 can GETP_ROPE_FUSED: epilogue khong-rope ghi q o cho khac"
+#error "GETP_Q_BF16 requires GETP_ROPE_FUSED: the non-rope epilogue writes q elsewhere"
 #endif
 
-// Chi gui hang khac 0 trong khoi e_agg giua cac GPU. 120b: 57 % hang la so 0 (do duoc).
-// Xem dau file rowskip. Chi co y nghia khi EXPERT_PARALLELISM > 2.
-// Gop 14 lan phong kernel dung danh sach thanh 2: mot BLOCK lo mot lat cat, thay vi
-// mot LAN PHONG cho moi lat cat. Moi lan phong cu chi ton 8 us nhung cach nhau 60 us,
-// tuc gan het chi phi la phong tuan tu chu khong phai tinh toan. Cung phep tinh, chi
-// khac so lan phong, nen bit-exact. Do tren 120B: 22.807 -> 23.136 tok/s (+1,4 %),
-// md5 efe1096ff64c khong doi. Dat 0 de quay ve mot lan phong moi lat cat.
+// Send only the non-zero rows of the e_agg block between GPUs. On the 120B, 57 % of the rows
+// are zero (measured). See the rowskip notes. Only meaningful at EXPERT_PARALLELISM > 2.
+// Merge the fourteen row-list launches per layer into two: one BLOCK per slice instead of one
+// LAUNCH per slice. Each of the old launches cost 8 us but sat 60 us apart, so almost all of
+// the cost was launching them in sequence rather than the work itself. Same arithmetic, only a
+// different launch count, so it is bit-exact. Measured on the 120B: 22.807 -> 23.136 tok/s
+// (+1,4 %), md5 efe1096ff64c unchanged. Set 0 to go back to one launch per slice.
 #ifndef GETP_RS_MERGE
 #define GETP_RS_MERGE 1
 #endif
 
-// Diem dong bo 2 dung SU KIEN theo tung peer thay cho drain + hang rao. Chuoi cu la: GPU xong
-// gather_pairs -> host tinh day khoi hipStreamSynchronize -> hang rao 8 thread -> host phat lenh
-// keo -> GPU moi keo; ca vong qua host do nam trong khoang trong 1,57 ms moi lop. Voi su kien,
-// lenh keo da nam san trong hang doi va chay ngay khi peer ghi xong.
-// Van giu mot hang rao HOST o day nhung KHONG drain: no chi dam bao moi thread da PHAT
-// hipEventRecord truoc khi ai do cho - cho tren mot event chua ghi se tra ve ngay lap tuc.
-// CAN GETP_AGSKIP: no dat so hang vao g_ag_cnt tu truoc hang rao sp1, nho vay xoa duoc lan
-// hipMemcpy chan o day. Chinh lan doc do tung lam ban "duong su kien" cu nhan rac va bao
-// hipErrorInvalidValue. Diem dong bo 1 VAN la drain + hang rao, co chu y: no re (0,20 ms so voi
-// 0,86 ms cua sp2) va no chan khong cho hai rank troi xa nhau qua mot lop, nen o su kien khong
-// bao gio bi dung lai nham. Ban cu doi CA HAI diem dong bo nen host chay truoc vo han va cham
-// hon 15 %.
-// Do tren 120B: 23.910 -> 24.341 tok/s (+1,8 %), md5 khong doi.
+// Sync point 2 orders the exchange with one EVENT per peer instead of a drain plus a barrier.
+// The old sequence was: GPU finishes gather_pairs -> the host wakes out of hipStreamSynchronize
+// -> eight threads meet at a barrier -> the host issues the pulls -> only then does the GPU
+// pull. That whole round trip through the host sat in a 1,57 ms gap per layer. With events the
+// pulls are already queued and start the instant the peer has written. A HOST barrier stays
+// here, but WITHOUT the drain: it only guarantees that every thread has ISSUED its
+// hipEventRecord before anyone waits, since waiting on an event that has not been recorded yet
+// returns immediately. REQUIRES GETP_AGSKIP: it puts the row counts in g_ag_cnt before the sp1
+// barrier, which is what lets the blocking hipMemcpy here be deleted. That read is exactly what
+// made the older event path pick up garbage and report hipErrorInvalidValue. Sync point 1 KEEPS
+// its drain, deliberately: it is cheap (0,20 ms against 0,86 ms for sp2) and it stops two ranks
+// drifting more than one layer apart, so an event slot is never reused under a waiter. The
+// older attempt converted BOTH sync points, so the host ran arbitrarily far ahead - 15 % slower.
+// Measured on the 120B: 23.910 -> 24.341 tok/s (+1,8 %), output hash unchanged.
+// Emit moe_gather_pairs one destination slice at a time, so the peer that pulls from us first
+// can start as soon as ITS slice is ready instead of waiting for all eight. Rank D pulls from
+// D+1 first, and D+1 owes it slice D, so each rank emits slice (own-1) first and records an
+// early event for it. Splitting the b range touches no arithmetic: every e_agg cell is still
+// written exactly once and each token's sum keeps its order, so this is bit-exact.
+// Measured on the 120B: 24.313 -> 24.685 tok/s (+1,5 %), output hash unchanged.
+#ifndef GETP_GPSLICE
+#define GETP_GPSLICE 1
+#endif
+
 #ifndef GETP_EVAGG
 #define GETP_EVAGG 1
 #endif
 
-// Chieu all-gather chi gui nhung hang peer that su can, doi xung voi GETP_ROWSKIP (von chi cat
-// chieu reduce-scatter). Ban cu gui du BATCH_SIZE hang cho moi peer, 31,0 MB moi lop, trong khi
-// moi cap rank chi dung 326/768 = 42,4 % so hang do - phan con lai khong kernel nao doc, vi
-// ext_t_bf16 chi duoc lay qua danh sach cap (tok_idx/e_dev). Nen bo chung di la bit-exact.
-// 31,0 -> 13,2 MB moi lop. Do tren 120B: 23.022 -> 23.910 tok/s (+3,9 %), md5 khong doi.
-// Dat 0 de quay ve gui du moi hang.
+// The all-gather sends only the rows each peer actually needs, mirroring GETP_ROWSKIP, which
+// trimmed the reduce-scatter leg alone. The old code sent all BATCH_SIZE rows to every peer,
+// 31,0 MB per layer, while each rank pair uses only 326/768 = 42,4 % of them - nothing reads
+// the rest, because ext_t_bf16 is only ever fetched through the pair list (tok_idx/e_dev).
+// So dropping them is bit-exact. 31,0 -> 13,2 MB per layer. Measured on the 120B: 23.022 ->
+// 23.910 tok/s (+3,9 %), output hash unchanged. Set 0 to go back to sending every row.
+// Send the reduce-scatter leg as bf16 instead of fp32. After GETP_AGSKIP the outbound leg is
+// already bf16, which left the return leg as the larger of the two purely because of its element
+// type: 26,6 MB against 13,2 MB per layer. Halving it costs no extra kernel and no extra launch.
+// This is the one change here that is NOT bit-exact. The rounding applies only to what crosses
+// the wire - a rank's own slice still adds into dev_x in fp32 - and it is measured, not argued:
+// METEOR 0,5608 -> 0,5603 and BERTScore 0,9814 -> 0,9805, against thresholds of 0,3 and 0,9.
+// It is gated on rs_on, so at EXPERT_PARALLELISM = 2 the 20B path never takes it and keeps its
+// exact-output gate (720709b86d36) as a cheap check for everything else.
+// Measured on the 120B: 24.902 -> 26.011 tok/s (+4,5 %).
+#ifndef GETP_EAGG_BF16
+#define GETP_EAGG_BF16 1
+#endif
+
 #ifndef GETP_AGSKIP
 #define GETP_AGSKIP 1
 #endif
 
 #ifndef GETP_ROWSKIP
-#define GETP_ROWSKIP 1   // mac dinh BAT; tu tat khi EP <= 2. Dat 0 de A/B
+#define GETP_ROWSKIP 1   // on by default; turns itself off when EP <= 2. Set 0 to A/B
 #endif
 
 #ifndef GETP_SMALL_TOPK
-#define GETP_SMALL_TOPK 1   // mac dinh BAT (do e2e: -2,09 ms/buoc); dat 0 de A/B
+#define GETP_SMALL_TOPK 1   // on by default (measured end to end: -2,09 ms/step); set 0 to A/B
 #endif
 #ifndef GETP_SMALL_NOSCATTER
-#define GETP_SMALL_NOSCATTER 0   // DA DO va THUA: bo kernel scatter (-1,42 ms/buoc)
-                                 // nhung mlp1 phai tu gom hang nen +1,66 ms/buoc.
+#define GETP_SMALL_NOSCATTER 0   // MEASURED and LOST: dropping the scatter kernel (-1,42 ms/step)
+                                 // but mlp1 has to gather rows itself, so +1,66 ms/step.
 #endif
 
 #ifndef GETP_ROUTER_TOPK_MAXK
@@ -117,8 +140,8 @@ extern CollectiveGroup g_world;
 #define MAX(x, y) (((x) > (y)) ? (x) : (y))
 #define MIN(x, y) (((x) < (y)) ? (x) : (y))
 
-// rmsnorm da chuyen xuong DUOI cac ham doi bf16 (tim rmsnorm_kernel_out), vi
-// no can f32_to_bf16bits de ghi thang bf16.
+// rmsnorm has moved BELOW the bf16 conversion helpers (look for rmsnorm_kernel_out), because
+// it needs f32_to_bf16bits to write bf16 directly.
 
 union __bf16_bits_u {
   __hip_bfloat16 b;
@@ -153,17 +176,17 @@ using f32x4 = __attribute__((vector_size(16))) float;
 using bf16x4 = __attribute__((vector_size(8))) unsigned short;
 
 // ---------------------------------------------------------------------------
-// rmsnorm voi dau ra chon duoc: fp32, bf16, hoac CA HAI.
+// rmsnorm with a selectable output: fp32, bf16, or BOTH.
 //
-// Gia tri fp32 duoc tinh y HET nhu ban cu - weight * (ss * x), hai phep nhan,
-// khong co phep cong nen trinh dich khong the hop thanh FMA va doi ket qua.
-// Vi mot lan ghi roi doc lai fp32 qua HBM la BIT-CHINH-XAC, ban bf16 ghi thang
-// o day bang dung nhung bit ma fp32_to_bf16_kernel rieng se tao ra. Bo kernel
-// do di la mot thay doi BIT-EXACT, khong phai xap xi.
+// The fp32 value is computed EXACTLY as before - weight * (ss * x), two multiplies with no
+// add, so the compiler cannot fuse them into an FMA and change the result.
+// Since writing fp32 to HBM and reading it back is BIT-EXACT, the bf16 output written here is
+// exactly the bits a separate fp32_to_bf16_kernel would have produced. Dropping that kernel is
+// therefore a BIT-EXACT change, not an approximation.
 //
-// Vi sao khong can trao doi qua LDS: viec lam tron chay tren DUNG thread da
-// sinh ra gia tri, tren dung phan tu do. Dau ra bf16 la 2 byte moi lane, buoc
-// 2 byte -> mot wave ghi 128 byte lien mach.
+// Why no LDS exchange is needed: the rounding runs on the SAME thread that produced the value,
+// on that same element. The bf16 output is 2 bytes per lane, so the stride
+// is 2 bytes -> one wave writes 128 contiguous bytes.
 // ---------------------------------------------------------------------------
 template <bool WRITE_F32, bool WRITE_BF16>
 __global__ void rmsnorm_kernel_out(float *o, __hip_bfloat16 *ob,
@@ -214,7 +237,7 @@ void getp_rmsnorm(float *o, float *x, float *weight, int batch_size, int dim,
           o, nullptr, x, weight, dim);
 }
 
-// Chi bf16: dung khi ban fp32 khong con ai doc (duong pre-qkv).
+// bf16 only: for the case where nothing reads the fp32 form any more (the pre-qkv path).
 void getp_rmsnorm_bf16(__hip_bfloat16 *ob, float *x, float *weight,
                        int batch_size, int dim, hipStream_t stream) {
   dim3 blockDim(1024);
@@ -224,7 +247,7 @@ void getp_rmsnorm_bf16(__hip_bfloat16 *ob, float *x, float *weight,
           nullptr, ob, x, weight, dim);
 }
 
-// Ca hai: dung khi van con mot consumer doc fp32 (router doc ext_t).
+// Both: for the case where a consumer still reads fp32 (the router reads ext_t).
 void getp_rmsnorm_f32_bf16(float *o, __hip_bfloat16 *ob, float *x,
                            float *weight, int batch_size, int dim,
                            hipStream_t stream) {
@@ -346,10 +369,10 @@ __global__ void moe_blocks_per_expert_kernel(const int *offsets, int E, int BM,
   blk_counts[e] = (n + BM - 1) / BM;
 }
 
-// Tra ve CAN TREN cua so block, tinh tren host tu hang so, thay cho viec doc
-// blk_offsets[E] ve (mot lan drain stream moi lop). Moi expert lam tron len
-// toi da 1 block, nen (max_pairs + BM - 1)/BM + E luon du. Ca hai kernel MoE
-// thoat ngay o `if (base_all >= n) return;` voi block vuot tong that.
+// Return an UPPER BOUND on the block count, computed on the host from constants, instead of
+// reading blk_offsets[E] back (one stream drain per layer). Each expert rounds up
+// by at most 1 block, so (max_pairs + BM - 1)/BM + E is always enough. Both MoE kernels
+// return at once at `if (base_all >= n) return;` for the blocks past the real total.
 static inline int build_moe_block_schedule(const int *offsets, int E, int BM,
                                            int *blk_counts, int *blk_offsets,
                                            int max_pairs, hipStream_t stream) {
@@ -394,8 +417,8 @@ static inline int build_moe_buckets_local_pos(
                                                             B, K, E, e_counts);
   exclusive_scan_small_kernel<<<dim3(1), dim3(256), sizeof(int) * 256,
                                 stream>>>(e_counts, e_offsets, E);
-    // Khong doc e_offsets ve host nua: gia tri duy nhat no phuc vu (cap_pairs)
-  // khong ai dung, ma moi lan doc la mot lan drain compute_stream giua lop.
+    // Do not read e_offsets back to the host any more: the only value it served (cap_pairs)
+  // is unused, and every read was one drain of compute_stream in the middle of a layer.
   HIP_CHECK(hipMemsetAsync(e_counts, 0, sizeof(int) * E, stream));
   moe_fill_local_pos_kernel<<<dim3(B), dim3(128), 0, stream>>>(
       local_ids, local_wts, n_local, B, K, E, e_offsets, e_counts, tok_idx_out,
@@ -451,7 +474,7 @@ __global__ void moe_scatter_acts_to_expert_frombf16_kernel(
   __hip_bfloat16 *a_in, const __hip_bfloat16 *x_bf16,
   const int *tok_idx, const int *total_pairs_dev, int H) {
 int pos = blockIdx.x;
-if (pos >= *total_pairs_dev) return;   // can doc tu device, khong drain host
+if (pos >= *total_pairs_dev) return;   // read from the device, no host drain
 int b = tok_idx[pos];
 const __hip_bfloat16 *src = x_bf16 + (size_t)b * H;
 __hip_bfloat16 *dst = a_in + (size_t)pos * H;
@@ -475,26 +498,26 @@ moe_scatter_acts_to_expert_frombf16_kernel<<<grid, block, 0, stream>>>(
     a_in, x_bf16, tok_idx, total_pairs_dev, H);
 }
 
-// Padding truc nhanh cua tile LDS trong hai kernel MoE. Truoc day hang so 8
-// nay duoc viet lai o CA than kernel lan launcher; lech nhau la cap phat
-// thieu shared memory va hong tile mot cach im lang.
+// Fast-axis padding of the LDS tile in the two MoE kernels. This constant 8 used to be written
+// out in BOTH the kernel body and the launcher; letting them disagree means allocating
+// too little shared memory and silently corrupting the tile.
 #ifndef MATMUL_MLP1_LDS_PAD
 #define MATMUL_MLP1_LDS_PAD 4
 #endif
-// mlp1 chuyen sang bo cuc LDS [k/4][hang][4]: pad dem theo O (4 short = 8 byte),
-// khong theo short. 2 o = 16 byte moi plane k0; xem Mlp1LdsPlan.
+// mlp1 has moved to the [k/4][row][4] LDS layout: padding counts in SLOTS (4 shorts = 8 bytes),
+// not in shorts. Two slots = 16 bytes per k0 plane; see Mlp1LdsPlan.
 #ifndef MATMUL_MLP1_LDS_PAD_SLOTS
 #define MATMUL_MLP1_LDS_PAD_SLOTS 2
 #endif
-// mlp2 da chuyen sang bo cuc LDS [k/4][hang][4]: pad dem theo O (4 short =
-// 8 byte), khong theo short nua, nen no can macro RIENG. MATMUL_MLP2_LDS_PAD
-// cu khong con y nghia; bao loi ngay neu con ai truyen -D cu, thay vi de no
-// thanh no-op im lang roi bi doc nham thanh nhieu do.
-// (GETP_LDS_PAD cua qkv/attn_o/logits va MATMUL_MLP1_LDS_PAD KHONG doi.)
+// mlp2 has also moved to the [k/4][row][4] LDS layout: padding counts in SLOTS (4 shorts =
+// 8 bytes) rather than in shorts, so it needs its OWN macro. The old MATMUL_MLP2_LDS_PAD no
+// longer means anything; fail loudly if anyone still passes the old -D, rather than letting it
+// become a silent no-op that later reads as measurement noise.
+// (GETP_LDS_PAD for qkv/attn_o/logits and MATMUL_MLP1_LDS_PAD are UNCHANGED.)
 #ifdef MATMUL_MLP2_LDS_PAD
-#error "MATMUL_MLP2_LDS_PAD het tac dung: dung MATMUL_MLP2_LDS_PAD_SLOTS (xem Mlp2LdsPlan) va sua dong sweep dang truyen no (run3.sh:33)."
+#error "MATMUL_MLP2_LDS_PAD no longer has any effect: use MATMUL_MLP2_LDS_PAD_SLOTS (see Mlp2LdsPlan) and stop passing the old one."
 #endif
-// -1 = tu suy ra pad nho nhat sach bank tu (BM, BNt, BK). BK=32 -> 2, BK=64 -> 1.
+// -1 = derive the smallest bank-clean padding from (BM, BNt, BK). BK=32 -> 2, BK=64 -> 1.
 #ifndef MATMUL_MLP2_LDS_PAD_SLOTS
 #define MATMUL_MLP2_LDS_PAD_SLOTS (-1)
 #endif
@@ -515,8 +538,8 @@ moe_scatter_acts_to_expert_frombf16_kernel<<<grid, block, 0, stream>>>(
 #define MATMUL_MLP1_WARP_TILE_N 32
 #endif
 #ifndef MATMUL_MLP1_WAVES_PER_BLOCK
-// Suy tu tile: than kernel dung TILE_N = 64 * (BM/WM)*(BN/WN) thread.
-// Ghi de bang -D chi duoc phep neu van bang bieu thuc nay (co static_assert).
+// Derived from the tile: the kernel body uses TILE_N = 64 * (BM/WM)*(BN/WN) threads.
+// Overriding with -D is only allowed if it still equals this expression (there is a static_assert).
 #define MATMUL_MLP1_WAVES_PER_BLOCK (((MATMUL_MLP1_BLOCK_ROWS) / (MATMUL_MLP1_WARP_TILE_M)) * ((MATMUL_MLP1_BLOCK_COLS) / (MATMUL_MLP1_WARP_TILE_N)))
 #endif
 #ifndef NUM_CTA_MLP1
@@ -548,8 +571,8 @@ moe_scatter_acts_to_expert_frombf16_kernel<<<grid, block, 0, stream>>>(
 #define MATMUL_MLP2_WARP_TILE_N 32
 #endif
 #ifndef MATMUL_MLP2_WAVES_PER_BLOCK
-// Suy tu tile: than kernel dung TILE_N = 64 * (BM/WM)*(BN/WN) thread.
-// Ghi de bang -D chi duoc phep neu van bang bieu thuc nay (co static_assert).
+// Derived from the tile: the kernel body uses TILE_N = 64 * (BM/WM)*(BN/WN) threads.
+// Overriding with -D is only allowed if it still equals this expression (there is a static_assert).
 #define MATMUL_MLP2_WAVES_PER_BLOCK (((MATMUL_MLP2_BLOCK_ROWS) / (MATMUL_MLP2_WARP_TILE_M)) * ((MATMUL_MLP2_BLOCK_COLS) / (MATMUL_MLP2_WARP_TILE_N)))
 #endif
 #ifndef NUM_CTA_MLP2
@@ -559,12 +582,12 @@ moe_scatter_acts_to_expert_frombf16_kernel<<<grid, block, 0, stream>>>(
 // at 128 steps; 2 is what the 8 GPU / 1024 step number was measured with.
 #define NUM_CTA_MLP2 2
 #endif
-// So lat cat split-K toi da cua mlp2. 1 = khong bao gio split. Voi BM=128 co
-// 4/360 launch (cac lop it cap) roi duoi nguong target_cta va se split; khi do
-// z_partial duoc cong bang atomicAdd nen thu tu cong doi theo lich block, sai
-// lech muc lam tron nay khuech dai qua bf16 den lop 23 thi doi routing. Do o
-// 8 GPU / 1024 buoc: split (62.865 tok/s) va khong split (62.899) nhanh nhu
-// nhau, nen chon khong split: dau ra bit-exact voi ban BM=96 va tat dinh.
+// Maximum number of split-K slices for mlp2. 1 = never split. At BM=128, 4 of 360 launches
+// (the layers with few pairs) fall below the target_cta threshold and would split; the
+// z_partial accumulation is then an atomicAdd, so the addition order follows the block
+// schedule, and that rounding difference amplifies through bf16 until it changes routing at
+// layer 23. Measured throughput was the same either way, so not splitting is the choice:
+// the output is bit-exact against the BM=96 build, and deterministic.
 #ifndef MATMUL_MLP2_MAX_SPLITS
 #define MATMUL_MLP2_MAX_SPLITS 1
 #endif
@@ -586,8 +609,8 @@ moe_scatter_acts_to_expert_frombf16_kernel<<<grid, block, 0, stream>>>(
 #define MATMUL_ROUTER_WARP_TILE_N 16
 #endif
 #ifndef MATMUL_ROUTER_WAVES_PER_BLOCK
-// Suy tu tile: than kernel dung TILE_N = 64 * (BM/WM)*(BN/WN) thread.
-// Ghi de bang -D chi duoc phep neu van bang bieu thuc nay (co static_assert).
+// Derived from the tile: the kernel body uses TILE_N = 64 * (BM/WM)*(BN/WN) threads.
+// Overriding with -D is only allowed if it still equals this expression (there is a static_assert).
 #define MATMUL_ROUTER_WAVES_PER_BLOCK (((MATMUL_ROUTER_BLOCK_ROWS) / (MATMUL_ROUTER_WARP_TILE_M)) * ((MATMUL_ROUTER_BLOCK_COLS) / (MATMUL_ROUTER_WARP_TILE_N)))
 #endif
 #ifndef MATMUL_ROUTER_THREADS
@@ -595,24 +618,24 @@ moe_scatter_acts_to_expert_frombf16_kernel<<<grid, block, 0, stream>>>(
 #endif
 
 // ===========================================================================
-// Bo cuc LDS cua mlp1: KPack = 4  ->  tile[k/4][hang][4]
+// mlp1 LDS layout: KPack = 4  ->  tile[k/4][row][4]
 //
-// Mot o 4 short = 8 byte chinh la 4 phan tu k LIEN TIEP ma mot lane can cho
-// v_mfma_f32_16x16x16bf16_1k (A[i][k]: lane L thanh ghi r -> i = L%16,
-// k = 4*(L/16)+r; B[k][j] doi xung). Nen:
-//   doc : 1 x ds_read_b64   thay cho 4 x ds_read_u16
-//   ghi : 2 x ds_write_b64  thay cho 8 x ds_write_b16 (mot uint4 tu HBM)
+// One slot of 4 shorts = 8 bytes is exactly the 4 CONSECUTIVE k elements a lane needs for
+// v_mfma_f32_16x16x16bf16_1k (A[i][k]: lane L register r -> i = L%16,
+// k = 4*(L/16)+r; B[k][j] likewise). So:
+//   read : 1 x ds_read_b64   instead of 4 x ds_read_u16
+//   write: 2 x ds_write_b64 instead of 8 x ds_write_b16 (one uint4 from HBM)
 //
 // Bank (32 bank x 4 byte = 128 byte/chu ky):
-//   DOC  16 lane cua mot pha co cung k0 va hang lien tiep:
-//        byte = C + 8*(L%16) -> 128 byte lien tuc = phu kin 32 bank dung mot
-//        lan. Dung voi MOI gia tri pad.
-//   GHI  16 lane cua mot pha co a = lane%NKC (chunk k, truc nhanh cua loader)
-//        va b = lane/NKC (hang): dword offset = 4*S*a + 2*b, S = so o tren mot
-//        plane k0. Pad phai lam 16 lane phu kin 16 bank chan - ham duoi kiem.
-//        S = BM + 2 = 130: 4*130 = 520 == 8 (mod 32) -> bank = 8a + 2b voi
-//        a in [0,4), b in [0,4) -> {0,2,...,30}, moi bank dung mot lan.
-//        S = BM + 0 = 128: 4*128 = 512 == 0 (mod 32) -> bank = 2b -> xung dot 4 chieu.
+//   READ   the 16 lanes of one phase share k0 and take consecutive rows:
+//          byte = C + 8*(L%16) -> 128 contiguous bytes = covering the 32 banks exactly
+//          once. True for EVERY pad value.
+//   WRITE  the 16 lanes of one phase have a = lane%NKC (k chunk, the loader's fast axis)
+//          and b = lane/NKC (row): dword offset = 4*S*a + 2*b, where S is the number of slots
+//          per k0 plane. The pad has to make the 16 lanes cover the 16 even banks - checked below.
+//        S = BM + 2 = 130: 4*130 = 520 == 8 (mod 32) -> bank = 8a + 2b with
+//          a in [0,4), b in [0,4) -> {0,2,...,30}, each bank used exactly once.
+//        S = BM + 0 = 128: 4*128 = 512 == 0 (mod 32) -> bank = 2b -> a 4-way conflict.
 // ===========================================================================
 constexpr bool mlp1_lds_write_conflict_free(int S, int NKC) {
   if (NKC <= 0 || NKC > 16 || 16 % NKC != 0) return false;
@@ -622,40 +645,40 @@ constexpr bool mlp1_lds_write_conflict_free(int S, int NKC) {
     const int b = l / NKC;
     int bank = (4 * S * a + 2 * b) % 32;
     if (bank < 0) bank += 32;
-    if (bank & 1) return false;            // o phai can le 8 byte
+    if (bank & 1) return false;            // a slot must be 8-byte aligned
     const int bit = 1 << (bank >> 1);
-    if (seen & bit) return false;          // hai lane cung bank
+    if (seen & bit) return false;          // two lanes on the same bank
     seen |= bit;
   }
-  return seen == 0xFFFF;                   // phu kin 16 bank chan
+  return seen == 0xFFFF;                   // covers all 16 even banks
 }
 
-// Ke hoach LDS dung CHUNG cho than kernel va launcher: chi con MOT ban so hoc
-// padding nen hai ben khong the lech nhau (loi im lang kieu cu).
+// One LDS plan SHARED by the kernel body and the launcher: a single copy of the padding
+// arithmetic, so the two cannot disagree (the old silent failure mode).
 template <int BM_, int BNt_, int BK_, int PADS_>
 struct Mlp1LdsPlan {
   static constexpr int KP   = 4;                 // short / o = 8 byte = 1 ds_read_b64
   static constexpr int KSL  = BK_ / KP;          // so plane k0
-  static constexpr int PADS = PADS_;             // pad dem theo O
-  static constexpr int SM   = BM_  + PADS;       // o tren mot plane, tile A
-  static constexpr int SN   = BNt_ + PADS;       // o tren mot plane, tile W
+  static constexpr int PADS = PADS_;             // pad counted in SLOTS
+  static constexpr int SM   = BM_  + PADS;       // slots per plane, tile A
+  static constexpr int SN   = BNt_ + PADS;       // slots per plane, tile W
   static constexpr size_t bytes =
       (size_t)KSL * ((size_t)SM + 2 * (size_t)SN) * KP * sizeof(unsigned short);
 
-  static_assert(BK_ % KP == 0, "BK phai chia het cho KPack = 4");
-  static_assert(BK_ % 8 == 0,  "loader nap uint4 = 8 short theo truc k");
+  static_assert(BK_ % KP == 0, "BK must be a multiple of KPack = 4");
+  static_assert(BK_ % 8 == 0,  "the loader loads a uint4 = 8 shorts along k");
   static_assert(mlp1_lds_write_conflict_free(SM, BK_ / 8),
-                "MATMUL_MLP1_LDS_PAD_SLOTS sai: ds_write_b64 tile A xung dot bank");
+                "MATMUL_MLP1_LDS_PAD_SLOTS is wrong: ds_write_b64 bank conflict on tile A");
   static_assert(mlp1_lds_write_conflict_free(SN, BK_ / 8),
-                "MATMUL_MLP1_LDS_PAD_SLOTS sai: ds_write_b64 tile W xung dot bank");
+                "MATMUL_MLP1_LDS_PAD_SLOTS is wrong: ds_write_b64 bank conflict on tile W");
   static_assert(((size_t)KSL * SM * KP * sizeof(unsigned short)) % 16 == 0,
-                "goc tile gate phai can le 16 byte");
+                "the gate tile base must be 16-byte aligned");
   static_assert(((size_t)KSL * SN * KP * sizeof(unsigned short)) % 16 == 0,
-                "goc tile up phai can le 16 byte");
+                "the up tile base must be 16-byte aligned");
 };
 
-// Gop hai dword thanh mot o 4 x bf16. Thuan tuy doi kieu: hai VGPR da o dung
-// cho, khong sinh lenh VALU nao (khac han 4 lenh trich nua-word cua ban cu).
+// Pack two dwords into one slot of 4 x bf16. A pure retype: both VGPRs are already in place,
+// so it emits no VALU instruction at all (unlike the old version's 4 half-word extracts).
 __device__ __forceinline__ bf16x4 mlp1_pack2(unsigned int lo, unsigned int hi) {
   struct Pair { unsigned int a, b; };
   union { Pair p; bf16x4 h; } cvt;
@@ -664,9 +687,9 @@ __device__ __forceinline__ bf16x4 mlp1_pack2(unsigned int lo, unsigned int hi) {
   return cvt.h;
 }
 
-// GATHER: khi bat, A_in KHONG con la bang [pair][H] da chep san ma la chinh
-// ext_t_bf16 [token][H]; hang cua tile lay qua tok_idx[pos]. Xem ghi chu o cho
-// tinh `arow`. GATHER = false sinh ma y het ban cu (tok_idx bi loai sach).
+// GATHER: when enabled, A_in is no longer a pre-copied [pair][H] table but ext_t_bf16
+// [token][H] itself; the tile's row comes from tok_idx[pos]. See the note where `arow` is
+// computed. GATHER = false generates exactly the old code (tok_idx is optimised away).
 template<
   int BM, int BN, int BK,
   int WM, int WN,
@@ -713,7 +736,7 @@ mlp1_swiglu_bf16_bucketed_kernel_outbf16_tuned(
   constexpr int strideX = TILE_N / (BK / 4);
   constexpr int strideW = TILE_N / (BK / 8);
 
-  // Bo cuc LDS [k/4][hang][4] - xem Mlp1LdsPlan.
+  // LDS layout [k/4][row][4] - see Mlp1LdsPlan.
   using LdsPlan = Mlp1LdsPlan<BM, BNt, BK, MATMUL_MLP1_LDS_PAD_SLOTS>;
   constexpr int KP  = LdsPlan::KP;    // 4 short / o
   constexpr int KSL = LdsPlan::KSL;   // so plane k0 = BK/4
@@ -726,13 +749,13 @@ mlp1_swiglu_bf16_bucketed_kernel_outbf16_tuned(
   bf16x4* const swus = swgs + (size_t)KSL * SN;
 
 #ifdef DEBUG_LDS_POISON
-  // Kiem launch: than kernel gia dinh dung TILE_N thread.
+  // Launch check: the kernel body assumes exactly TILE_N threads.
   if (blockDim.x != TILE_N) {
     if (threadIdx.x == 0)
-      printf("BAD LAUNCH: blockDim=%d nhung TILE_N=%d\n", (int)blockDim.x, (int)TILE_N);
+      printf("BAD LAUNCH: blockDim=%d but TILE_N=%d\n", (int)blockDim.x, (int)TILE_N);
     return;
   }
-  // Do day LDS bang bf16 qNaN: o nao khong duoc loader ghi se thanh NaN.
+  // Fill LDS with bf16 qNaN: any slot the loader fails to write shows up as NaN.
   {
     const int lds_shorts = KSL * (SM + 2 * SN) * KP;
     for (int idx = threadIdx.x; idx < lds_shorts; idx += blockDim.x) sm[idx] = 0x7FC0;
@@ -771,27 +794,26 @@ mlp1_swiglu_bf16_bucketed_kernel_outbf16_tuned(
   constexpr int nbLoadsX = BM / strideX8;
   constexpr int nbLoadsW = BNt / strideW;
 
-  // --- Hang cua tile A ------------------------------------------------------
-  // Ban cu: mot kernel rieng chep a_in[pos][:] = ext_t_bf16[tok_idx[pos]][:]
-  // cho ca 6144 cap (20b, EP=2) roi mlp1 doc lai. Do la 35,4 MB doc + 35,4 MB
-  // ghi moi lop chi de sap xep lai hang - va a_in khong co consumer nao khac
-  // ngoai mlp1. Gio mlp1 tu gom: A_in tro thang vao ext_t_bf16, hang la
-  // tok_idx[pos]. Them mot loi: bang nguon con 17,7 MB thay vi 35,4 MB (moi
-  // token xuat hien MOT lan thay vi mot lan tren moi expert cuc bo cua no),
-  // nen 23 khoi cot cung by dung chung L2 tot hon.
-  // Chi so nay khong phu thuoc k nen tinh MOT lan o day (nbLoadsX = 2 voi
-  // BM = 128, strideX8 = 64) chu khong phai trong vong k: gia la +2 VGPR song
-  // suot vong k - xem canh bao ve chiem dung trong bao cao.
-  // `base` KHONG chet o duong GATHER: no van la goc cua tok_idx[base + rr] va
-  // van la hang ra cua epilogue (`pos = base + row` ghi gate_up_bf16 theo chi
-  // so CAP, khong phai theo token) - do la ly do epilogue khong doi gi.
-  // Hang r >= tcnt khong bao gio duoc nap (ca ba cho nap deu co dieu kien
-  // `r < tcnt`), nen o do lay 0 cho co gia tri hop le: vua khong doc qua duoi
-  // e_dev (cap phat dung max_pairs phan tu), vua khong them nhanh re nao.
-  // Mang khai bao du nbLoadsX phan tu o CA hai duong: voi GATHER = false vong
-  // nap khong chay va `arow[i]` nam o nhanh chet cua toan tu ba ngoi, nhung
-  // neu mang chi co 1 phan tu thi nhanh chet do la mot chi so hang so VUOT
-  // bien (i = 1) - dung de trinh bien dich phai suy luan ra dieu do.
+  // --- Rows of tile A ------------------------------------------------------
+  // The old code: a separate kernel copied a_in[pos][:] = ext_t_bf16[tok_idx[pos]][:]
+  // for all 6144 pairs (20b, EP=2) and then mlp1 read it back. That was 35,4 MB read + 35,4 MB
+  // written per layer just to reorder rows - and a_in had no consumer other than mlp1. Now mlp1
+  // gathers for itself: A_in points straight at ext_t_bf16 and the row is tok_idx[pos]. One
+  // more gain: the source table is 17,7 MB instead of 35,4 MB (each token appears ONCE rather
+  // than once per local expert of its own), so the 23 column blocks share L2 better.
+  // This index does not depend on k, so it is computed ONCE here (nbLoadsX = 2 at BM = 128,
+  // strideX8 = 64) rather than inside the k loop: it costs +2 VGPRs but
+  // live across the whole k loop - see the note on occupancy.
+  // `base` is NOT dead on the GATHER path: it is still the base of tok_idx[base + rr] and
+  // still the output row of the epilogue (`pos = base + row` writes gate_up_bf16 by PAIR
+  // index, not by token) - which is why the epilogue needs no change at all.
+  // Rows r >= tcnt are never loaded (all three load sites are guarded by `r < tcnt`), so 0 is
+  // used there simply to have a valid value: it neither reads past the end of e_dev (allocated
+  // for exactly max_pairs elements) nor adds a branch.
+  // The array is declared with a full nbLoadsX elements on BOTH paths: with GATHER = false the
+  // the load does not run and `arow[i]` sits in the dead arm of a ternary - but if the array
+  // has only 1 element, that dead arm is a constant index OUT OF BOUNDS (i = 1), which is
+  // enough for the compiler to have to reason about it.
   int arow[nbLoadsX];
   #pragma unroll
   for (int i = 0; i < (GATHER ? nbLoadsX : 0); ++i) {
@@ -810,7 +832,7 @@ mlp1_swiglu_bf16_bucketed_kernel_outbf16_tuned(
     const int r = loadX_y8 + off;
     const int pos = GATHER ? arow[i] : (base + r);
 
-    // 8 short lien tiep theo k cua mot hang = 2 o ke nhau theo truc plane k0.
+    // 8 consecutive shorts along k of one row = 2 adjacent slots along the k0 plane axis.
     bf16x4* dst = &sxs[(size_t)((LOAD_VEC * loadX_x8) / KP) * SM + r];
 
     if (r < tcnt && kk + 7 < H) {
@@ -833,7 +855,7 @@ mlp1_swiglu_bf16_bucketed_kernel_outbf16_tuned(
     const int r = loadX_y8 + off;
     const int pos = GATHER ? arow[i] : (base + r);
 
-    // 8 short lien tiep theo k cua mot hang = 2 o ke nhau theo truc plane k0.
+    // 8 consecutive shorts along k of one row = 2 adjacent slots along the k0 plane axis.
     bf16x4* dst = &sxs[(size_t)((LOAD_VEC * loadX_x8) / KP) * SM + r];
 
     if (r < tcnt && kk + 7 < H) {
@@ -853,7 +875,7 @@ mlp1_swiglu_bf16_bucketed_kernel_outbf16_tuned(
     const int kk = 0 + 8 * loadW_x;
     const int col = colBase + loadW_y + off;
 
-    static_assert(LOAD_VEC == 2 * KP, "mot uint4 tu HBM phai phu dung 2 o KPack");
+    static_assert(LOAD_VEC == 2 * KP, "one uint4 from HBM must cover exactly 2 KPack slots");
     bf16x4* dg = &swgs[(size_t)((8 * loadW_x) / KP) * SN + (loadW_y + off)];
     bf16x4* du = &swus[(size_t)((8 * loadW_x) / KP) * SN + (loadW_y + off)];
 
@@ -924,7 +946,7 @@ mlp1_swiglu_bf16_bucketed_kernel_outbf16_tuned(
     // MFMA ILP optimization: Pre-load all vectors to improve instruction-level parallelism
     #pragma unroll
     for (int k = 0; k < BK; k += 16) {
-      // basek = k + 4*yMF luon chia het 4 -> plane k0 = basek/4 = (k>>2) + yMF.
+      // basek = k + 4*yMF is always a multiple of 4 -> plane k0 = basek/4 = (k>>2) + yMF.
       const int kslot = (k >> 2) + yMF;
 
       // Pre-load all activation vectors
@@ -964,12 +986,12 @@ mlp1_swiglu_bf16_bucketed_kernel_outbf16_tuned(
       }
     }
 
-    // Ghim lich cho vung tinh cua mlp1, co tinh ca lenh nap HBM: mask 0x0020 = VMEM read,
-    // 0x0100 = doc LDS, 0x0008 = MFMA. Phat het lenh nap truoc, roi doc LDS, roi MFMA.
-    // Cac vong ghim truoc chi ghim MFMA va doc LDS, nen 12 lenh nap van bi compiler rai xen
-    // giua chuoi MFMA va moi lan nhu vay keo theo mot s_waitcnt vmcnt. Do 8 GPU / 1024 buoc,
-    // hai cap xen ke: 64.505 / 64.512 so voi 64.299 / 64.248 (+0,4 %), dau ra bit-exact.
-    // Mau "xen 1 doc LDS sau moi 4 MFMA" da thu va CHAM hon (mlp1 1.797 so voi 1.688 us/goi).
+    // Pin the schedule for mlp1's compute region, including the HBM loads: mask 0x0020 = VMEM read,
+    // 0x0100 = LDS read, 0x0008 = MFMA. Issue every load first, then the LDS reads, then the MFMA.
+    // Earlier pinning rounds only pinned MFMA and LDS reads, so the compiler still scattered the 12
+    // loads through the MFMA chain, each one dragging an s_waitcnt vmcnt with it. Measured on 8 GPUs
+    // over 1024 steps, two interleaved pairs: 64.505 / 64.512 against 64.299 / 64.248 (+0,4 %), bit-exact.
+    // The 'one LDS read every 4 MFMA' pattern was tried and was SLOWER (mlp1 1.797 against 1.688 us/call).
     __builtin_amdgcn_sched_group_barrier(0x0020, 12, 0);
     __builtin_amdgcn_sched_group_barrier(0x0100, 20, 0);
     __builtin_amdgcn_sched_group_barrier(0x0008, 64, 0);
@@ -1066,61 +1088,61 @@ mlp1_swiglu_bf16_bucketed_kernel_outbf16_tuned(
 }
 
 // ===========================================================================
-// Bo cuc LDS cua mlp2: KPack = 4  ->  tile[k/4][hang][4]   (cu: tile[k][hang])
+// mlp2 LDS layout: KPack = 4  ->  tile[k/4][row][4]   (was: tile[k][row])
 //
-// Mot o 4 short = 8 byte chinh la 4 phan tu k LIEN TIEP ma mot lane can cho
-// v_mfma_f32_16x16x16bf16_1k (A[i][k]: lane L thanh ghi r -> i = L%16,
-// k = 4*(L/16)+r; B[k][j] doi xung). Nen:
-//   doc : 1 x ds_read_b64   thay cho 4 x ds_read_u16
-//   ghi : 2 x ds_write_b64  thay cho 8 x ds_write_b16 (mot uint4 tu HBM)
+// One slot of 4 shorts = 8 bytes is exactly the 4 CONSECUTIVE k elements a lane needs for
+// v_mfma_f32_16x16x16bf16_1k (A[i][k]: lane L register r -> i = L%16,
+// k = 4*(L/16)+r; B[k][j] likewise). So:
+//   read : 1 x ds_read_b64   instead of 4 x ds_read_u16
+//   write: 2 x ds_write_b64 instead of 8 x ds_write_b16 (one uint4 from HBM)
 //
-// Bank (32 bank x 4 byte = 128 byte/chu ky), so cua cau hinh mlp2 mac dinh
+// Bank (32 banks x 4 bytes = 128 bytes/cycle), numbers for the default mlp2 configuration
 // BM=64, BN=64, BN_AGG=3 -> BNt=192, BK=32, WM=WN=32, 256 thread:
 //
-//   DOC  mot pha ds_read_b64 = 16 lane cung yMF (nen CUNG plane k0), xMF=0..15
-//        chay tren 16 HANG lien tiep:  byte(L) = C + 8*L  ->  128 byte lien
-//        tuc = 32 bank, moi bank dung mot lan  => SACH VOI MOI PAD.
-//        (Ban cu: 16 lane doc 16 short lien tiep = 8 dword -> 8 bank; hai lane
-//         chung mot dword la broadcast nen "khong xung dot", nhung moi chu ky
-//         chi chuyen 64 byte co ich = mot nua bang thong, va ton 4 lan so lenh.)
+//   READ   one ds_read_b64 phase = 16 lanes with the same yMF (hence the SAME k0 plane), xMF=0..15
+//          run over 16 consecutive ROWS:  byte(L) = C + 8*L  ->  128 contiguous bytes,
+//          i.e. 32 banks, each used once  => CLEAN FOR EVERY PAD.
+//        (The old version: 16 lanes read 16 consecutive shorts = 8 dwords -> 8 banks; two lanes
+//          sharing one dword is a broadcast and so 'conflict-free', but each cycle moves only
+//          64 useful bytes = half the bandwidth, and costs 4x the instructions.)
 //
-//   GHI  loader giu NGUYEN anh xa thread -> (hang, chunk k):
-//          a = tid % NKC (chunk 8 short theo k), b = tid / NKC (hang), NKC=BK/8.
-//        Mot uint4 = 8 short theo k = 2 o KE NHAU theo truc plane k0:
-//          dword(a,b) = 4*S*a + 2*b   (S = so o tren mot plane k0)
-//        S = BM  + 2 =  66 : 4*66  = 264 == 8 (mod 32) -> bank = 8a + 2b voi
-//                           a in [0,4), b in [0,4) -> {0,2,...,30}, moi bank
-//                           dung dung mot lan  => GHI SACH.
-//        S = BNt + 2 = 194 : 4*194 = 776 == 8 (mod 32) -> y het tren => SACH.
-//        Ban cu (PAD=8): buoc chunk 8*BM_PAD/2 = 8*72/2 = 288 dword == 0 (mod
-//        32), va 8*BNt_PAD/2 = 800 == 0 (mod 32) -> CA BON chunk roi vao cung
-//        nhom bank: ds_write_b16 xung dot 4 CHIEU tren ca hai tile.
+//   WRITE  the loader keeps the thread -> (row, k chunk) mapping UNCHANGED:
+//          a = tid % NKC (a chunk of 8 shorts along k), b = tid / NKC (row), NKC=BK/8.
+//          One uint4 = 8 shorts along k = 2 ADJACENT slots along the k0 plane axis:
+//          dword(a,b) = 4*S*a + 2*b   (S = the number of slots per k0 plane)
+//        S = BM  + 2 =  66 : 4*66  = 264 == 8 (mod 32) -> bank = 8a + 2b with
+//                           a in [0,4), b in [0,4) -> {0,2,...,30}, each bank
+//                           used exactly once  => CLEAN WRITE.
+//        S = BNt + 2 = 194 : 4*194 = 776 == 8 (mod 32) -> same as above => CLEAN.
+//        The old version (PAD=8): chunk stride 8*BM_PAD/2 = 8*72/2 = 288 dwords == 0 (mod
+//          32), and 8*BNt_PAD/2 = 800 == 0 (mod 32) -> ALL FOUR chunks land on the same
+//          bank group: ds_write_b16 had a 4-WAY conflict on both tiles.
 //
-// Vi sao khong dung bo cuc phang [hang][k] (KPAD = BK + 4 short): o do doc chi
-// sach khi (BK+PAD)/4 le, con GHI van 2 chieu voi MOI pad; bo cuc o nay ghi
-// SACH that. No cung ton it LDS hon: 16640 B, so voi 18432 B cua [hang][k] va
-// 17408 B cua ban hien tai.
+// Why not the flat [row][k] layout (KPAD = BK + 4 shorts): there the read is clean only when
+// (BK+PAD)/4 is odd, while the WRITE stays two-dimensional for EVERY pad; this layout writes
+// CLEANLY for real. It also uses less LDS: 16640 B against 18432 B for [row][k], and
+// 17408 B for the layout it replaced.
 // ===========================================================================
 constexpr bool mlp2_lds_write_conflict_free(int S, int NKC) {
   if (NKC <= 0 || NKC > 16 || 16 % NKC != 0) return false;
   int seen = 0;
-  for (int l = 0; l < 16; ++l) {         // mot pha ds_write_b64 = 16 lane
-    const int a = l % NKC;               // chunk k (truc nhanh cua loader)
-    const int b = l / NKC;               // hang
+  for (int l = 0; l < 16; ++l) {         // one ds_write_b64 phase = 16 lanes
+    const int a = l % NKC;               // k chunk (the loader's fast axis)
+    const int b = l / NKC;               // row
     int bank = (4 * S * a + 2 * b) % 32;
     if (bank < 0) bank += 32;
-    if (bank & 1) return false;          // o 8 byte can le -> bank phai chan
+    if (bank & 1) return false;          // an aligned 8-byte slot -> the bank must be even
     const int bit = 1 << (bank >> 1);
-    if (seen & bit) return false;        // hai lane cung bank
+    if (seen & bit) return false;        // two lanes on the same bank
     seen |= bit;
   }
-  return seen == 0xFFFF;                 // phu kin 16 bank chan
+  return seen == 0xFFFF;                 // covers all 16 even banks
 }
 
-// Pad nho nhat hop le cho CA hai tile, suy tu (BM, BNt, BK) thay vi hang so
-// cung: BK=32 -> 2 (2, 6, 10 deu duoc); BK=64 -> 1 (1,3,5,7); BK=16 -> 4.
-// Nho vay moi dong sweep mlp2 dang co (bm128 / bn128 / 128x128 / bk64) van
-// bien dich duoc ma khong phai suy lai pad bang tay.
+// The smallest valid pad for BOTH tiles, derived from (BM, BNt, BK) rather than a constant
+// hard-wired: BK=32 -> 2 (2, 6, 10 all work); BK=64 -> 1 (1,3,5,7); BK=16 -> 4.
+// This keeps every existing mlp2 sweep line (bm128 / bn128 / 128x128 / bk64) compiling without
+// having to re-derive the padding by hand.
 constexpr int mlp2_lds_pad_slots_auto(int BM_, int BNt_, int NKC) {
   for (int p = 0; p <= 16; ++p)
     if (mlp2_lds_write_conflict_free(BM_ + p, NKC) &&
@@ -1129,40 +1151,40 @@ constexpr int mlp2_lds_pad_slots_auto(int BM_, int BNt_, int NKC) {
   return -1;
 }
 
-// Ke hoach LDS dung CHUNG cho than kernel va launcher: chi con MOT ban so hoc
-// padding nen hai ben khong the lech nhau (loi im lang kieu cu: launcher cap
-// thieu dynamic LDS thi tile hong ma khong ai bao).
+// One LDS plan SHARED by the kernel body and the launcher: a single copy of the padding
+// arithmetic, so the two cannot disagree (the old silent failure mode: the launcher allocates
+// too little dynamic LDS and the tile is corrupted with nobody reporting it).
 template <int BM_, int BNt_, int BK_, int PADS_REQ_>
 struct Mlp2LdsPlan {
   static constexpr int KP   = 4;                 // short / o = 8 byte = 1 ds_read_b64
   static constexpr int KSL  = BK_ / KP;          // so plane k0
-  static constexpr int NKC  = BK_ / 8;           // so chunk 8-short tren mot hang
+  static constexpr int NKC  = BK_ / 8;           // number of 8-short chunks in one row
   static constexpr int PADS = (PADS_REQ_ >= 0)
                                 ? PADS_REQ_
                                 : mlp2_lds_pad_slots_auto(BM_, BNt_, NKC);
-  static constexpr int SM   = BM_  + PADS;       // o tren mot plane, tile A
-  static constexpr int SN   = BNt_ + PADS;       // o tren mot plane, tile W
+  static constexpr int SM   = BM_  + PADS;       // slots per plane, tile A
+  static constexpr int SN   = BNt_ + PADS;       // slots per plane, tile W
   static constexpr size_t bytes =
       (size_t)KSL * ((size_t)SM + (size_t)SN) * KP * sizeof(unsigned short);
 
-  static_assert(BK_ % KP == 0, "BK phai chia het cho KPack = 4");
-  static_assert(BK_ % 8 == 0,  "loader nap uint4 = 8 short theo truc k");
+  static_assert(BK_ % KP == 0, "BK must be a multiple of KPack = 4");
+  static_assert(BK_ % 8 == 0,  "the loader loads a uint4 = 8 shorts along k");
   static_assert(PADS >= 0,
-                "khong tim duoc pad sach bank cho (BM,BNt,BK) nay - xem mlp2_lds_pad_slots_auto");
+                "no bank-clean pad exists for this (BM,BNt,BK) - see mlp2_lds_pad_slots_auto");
   static_assert(mlp2_lds_write_conflict_free(SM, NKC),
-                "MATMUL_MLP2_LDS_PAD_SLOTS sai: ds_write_b64 tile A xung dot bank"
-                " (BK=32 dung 2, BK=64 dung 1, BK=16 dung 4)");
+                "MATMUL_MLP2_LDS_PAD_SLOTS is wrong: ds_write_b64 bank conflict on tile A"
+                " (BK=32 takes 2, BK=64 takes 1, BK=16 takes 4)");
   static_assert(mlp2_lds_write_conflict_free(SN, NKC),
-                "MATMUL_MLP2_LDS_PAD_SLOTS sai: ds_write_b64 tile W xung dot bank"
-                " (BK=32 dung 2, BK=64 dung 1, BK=16 dung 4)");
+                "MATMUL_MLP2_LDS_PAD_SLOTS is wrong: ds_write_b64 bank conflict on tile W"
+                " (BK=32 takes 2, BK=64 takes 1, BK=16 takes 4)");
   static_assert(((size_t)KSL * SM * KP * sizeof(unsigned short)) % 16 == 0,
-                "goc tile W phai can le 16 byte");
-  static_assert(bytes <= 64u * 1024u, "tile LDS mlp2 vuot 64 KB/CU");
+                "the W tile base must be 16-byte aligned");
+  static_assert(bytes <= 64u * 1024u, "the mlp2 LDS tile exceeds 64 KB/CU");
 };
 
-// Gop hai dword thanh mot o 4 x bf16. Thuan tuy doi kieu: hai VGPR da nam dung
-// cho nen khong sinh lenh VALU nao (khac 4 lenh trich nua-word cua ban cu).
-// __builtin_bit_cast la cach viet chuan, khong phai punning qua union.
+// Pack two dwords into one slot of 4 x bf16. A pure retype: both VGPRs are already in place,
+// so it emits no VALU instruction (unlike the old version's 4 half-word extracts).
+// __builtin_bit_cast is the standard spelling, not punning through a union.
 __device__ __forceinline__ bf16x4 mlp2_pack2(unsigned int lo, unsigned int hi) {
   struct Pair { unsigned int a, b; };
   return __builtin_bit_cast(bf16x4, Pair{lo, hi});
@@ -1205,29 +1227,29 @@ mlp2_partial_bf16_bucketed_splitk_kernel_inbf16_tuned(
   const int xMF = lane & 15;
   const int yMF = lane >> 4;
 
-  // Bo cuc LDS [k/4][hang][4] - xem Mlp2LdsPlan. Hinh hoc tinh MOT lan o
-  // day, va launcher dung lai dung ke hoach nay.
+  // LDS layout [k/4][row][4] - see Mlp2LdsPlan. The geometry is computed ONCE
+  // here, and the launcher reuses that same plan.
   using LdsPlan = Mlp2LdsPlan<BM, BNt, BK, MATMUL_MLP2_LDS_PAD_SLOTS>;
   constexpr int KP  = LdsPlan::KP;    // 4 short / o
   constexpr int KSL = LdsPlan::KSL;   // so plane k0 = BK/4
   constexpr int SM  = LdsPlan::SM;    // o / plane, tile A
   constexpr int SN  = LdsPlan::SN;    // o / plane, tile W
 
-  // __align__(16): goc vung LDS dong duoc BAO DAM can le 16 byte, nen ep
-  // kieu sang bf16x4 (can le 8) la dung theo kieu, khong phai tinh co dung.
-  // Ten rieng mlp2_sm de thuoc tinh align khong va voi `sm` cua kernel khac.
+  // __align__(16): the base of the dynamic LDS region is GUARANTEED 16-byte aligned, so the
+  // cast to bf16x4 (8-byte aligned) is correct by type, not correct by accident.
+  // The name mlp2_sm is local so its align attribute cannot collide with another kernel's `sm`.
   extern __shared__ __align__(16) unsigned short mlp2_sm[];
   bf16x4* const sxs = reinterpret_cast<bf16x4*>(mlp2_sm);
   bf16x4* const sws = sxs + KSL * SM;
 
 #ifdef DEBUG_LDS_POISON
-  // Kiem launch: than kernel gia dinh dung TILE_N thread.
+  // Launch check: the kernel body assumes exactly TILE_N threads.
   if (blockDim.x != TILE_N) {
     if (threadIdx.x == 0)
-      printf("BAD LAUNCH: blockDim=%d nhung TILE_N=%d\n", (int)blockDim.x, (int)TILE_N);
+      printf("BAD LAUNCH: blockDim=%d but TILE_N=%d\n", (int)blockDim.x, (int)TILE_N);
     return;
   }
-  // Do day LDS bang bf16 qNaN: o nao khong duoc loader ghi se thanh NaN.
+  // Fill LDS with bf16 qNaN: any slot the loader fails to write shows up as NaN.
   {
     const int lds_shorts = KSL * (SM + SN) * KP;
     for (int idx = threadIdx.x; idx < lds_shorts; idx += blockDim.x) mlp2_sm[idx] = 0x7FC0;
@@ -1297,7 +1319,7 @@ mlp2_partial_bf16_bucketed_splitk_kernel_inbf16_tuned(
     const int r = loadX_y8 + off;
     const int pos = base + r;
 
-    // 8 short lien tiep theo k cua MOT hang = 2 o ke nhau theo truc plane k0.
+    // 8 consecutive shorts along k of ONE row = 2 adjacent slots along the k0 plane axis.
     bf16x4* dst = &sxs[((LOAD_VEC * loadX_x8) / KP) * SM + r];
 
     if (r < tcnt && kk + 7 < kEnd) {
@@ -1321,7 +1343,7 @@ mlp2_partial_bf16_bucketed_splitk_kernel_inbf16_tuned(
     const int r = loadX_y8 + off;
     const int pos = base + r;
 
-    // 8 short lien tiep theo k cua MOT hang = 2 o ke nhau theo truc plane k0.
+    // 8 consecutive shorts along k of ONE row = 2 adjacent slots along the k0 plane axis.
     bf16x4* dst = &sxs[((LOAD_VEC * loadX_x8) / KP) * SM + r];
 
     if (r < tcnt && kk + 7 < kEnd) {
@@ -1343,7 +1365,7 @@ mlp2_partial_bf16_bucketed_splitk_kernel_inbf16_tuned(
     const int kk = kBeg + 8 * loadW_x;
     const int col = colBase + loadW_y + off;
 
-    static_assert(LOAD_VEC == 2 * KP, "mot uint4 tu HBM phai phu dung 2 o KPack");
+    static_assert(LOAD_VEC == 2 * KP, "one uint4 from HBM must cover exactly 2 KPack slots");
     bf16x4* dst = &sws[((8 * loadW_x) / KP) * SN + (loadW_y + off)];
 
     if (col < H && kk + 7 < kEnd) {
@@ -1403,10 +1425,10 @@ mlp2_partial_bf16_bucketed_splitk_kernel_inbf16_tuned(
       }
     }
 
-    // ---- Tinh: doc frag LDS cua substep k+16 TRUOC chuoi MFMA cua substep k ----
-    // Xem ghi chu cung ten trong mlp1: do tre ds_read -> s_waitcnt -> MFMA chay
-    // noi tiep la phan lon thoi gian kernel; hai bo dem frag trong thanh ghi de
-    // ds_read cua substep sau phat truoc MFMA cua substep truoc. Bit-exact.
+    // ---- Compute: read substep k+16's LDS fragments BEFORE substep k's MFMA chain ----
+    // See the note of the same name in mlp1: the ds_read latency -> s_waitcnt -> MFMA runs
+    // back to back for most of the kernel's time; two fragment buffers in registers let the
+    // next substep's ds_read issue ahead of the previous substep's MFMA. Bit-exact.
     bf16x4 fa[2][nIterM];
     bf16x4 fb[2][BN_AGG][nIterN];
     auto load_frags = [&](int k, int buf) {
@@ -1436,10 +1458,10 @@ mlp2_partial_bf16_bucketed_splitk_kernel_inbf16_tuned(
         }
       }
     }
-    // Ep lich cho scheduler cua vung nay: doc 6 frag substep 0 truoc, roi cu 3 MFMA xen 1
-    // ds_read cua substep 1, MFMA con lai don cuoi. Khong ep thi compiler keo ds_read sat
-    // cho dung -> moi MFMA sau do cho tron mot luot tre LDS (ISA: W M W M ...). Do: mlp2
-    // 1.272 -> 1.172 us/goi (-7,9 %), bit-exact. Rao lich cuoi de MFMA khong chim qua barrier.
+    // Force a schedule on this region: read substep 0's 6 fragments first, then one ds_read of
+    // substep 1 every 3 MFMA, with the remaining MFMA at the end. Without it the compiler pulls
+    // the ds_read right up against its use, so every following MFMA waits a full LDS latency
+    // (ISA: W M W M ...). mlp2 measured 1.272 -> 1.172 us/call (-7,9 %), bit-exact. The trailing fence keeps MFMA from sinking past the barrier.
     __builtin_amdgcn_sched_group_barrier(0x0100, 6, 0);
     __builtin_amdgcn_sched_group_barrier(0x0008, 3, 0);
     __builtin_amdgcn_sched_group_barrier(0x0100, 1, 0);
@@ -1465,7 +1487,7 @@ mlp2_partial_bf16_bucketed_splitk_kernel_inbf16_tuned(
         const int r = loadX_y8 + off;
         const int pos = base + r;
 
-        // 8 short lien tiep theo k cua MOT hang = 2 o ke nhau theo truc plane k0.
+        // 8 consecutive shorts along k of ONE row = 2 adjacent slots along the k0 plane axis.
         bf16x4* dst = &sxs[((LOAD_VEC * loadX_x8) / KP) * SM + r];
 
         const uint4 v = regX[i];
@@ -1480,7 +1502,7 @@ mlp2_partial_bf16_bucketed_splitk_kernel_inbf16_tuned(
         int off = i * strideW;
         const int col = colBase + loadW_y + off;
 
-        static_assert(LOAD_VEC == 2 * KP, "mot uint4 tu HBM phai phu dung 2 o KPack");
+        static_assert(LOAD_VEC == 2 * KP, "one uint4 from HBM must cover exactly 2 KPack slots");
         bf16x4* dst = &sws[((8 * loadW_x) / KP) * SN + (loadW_y + off)];
 
         const uint4 wb = regW[i];
@@ -1494,12 +1516,12 @@ mlp2_partial_bf16_bucketed_splitk_kernel_inbf16_tuned(
   }
 
   // ---- Epilogue -------------------------------------------------------------
-  // Ban cu nap bias va w_by_bucket NGAY trong vong ghi, sau cac nhanh `continue`
-  // theo hang: ISA ra 208 global_load_dword + 192 global_load_ushort + 784
-  // s_waitcnt noi tiep, cong 192 vong CAS cua atomicAdd float cho nhanh split-K
-  // - 8.102 lenh chay mot lan moi block, dai hon ca vong chinh. O day moi lane
-  // nap 6 bias va 16 trong so hang MOT LAN, roi chi con phep tinh va ghi.
-  // Thu tu so hoc giu nguyen ((acc + bias) * w) nen ket qua bit-exact.
+  // The old version loaded the bias and w_by_bucket INSIDE the store loop, after the per-row
+  // `continue` branches: the ISA came out as 208 global_load_dword + 192 global_load_ushort +
+  // 784 serial s_waitcnt, plus 192 CAS loops of the float atomicAdd for the split-K branch
+  // - 8.102 instructions running once per block, longer than the main loop itself. Here each
+  // lane loads its 6 biases and 16 row weights ONCE, and what is left is arithmetic and stores.
+  // The arithmetic order is unchanged ((acc + bias) * w), so the result is bit-exact.
   const int xD = lane & 15;
   const int yD = 4 * (lane >> 4);
   const int colBaseLane = blockIdx.x * (BN * BN_AGG) + xTile * WN + xD;
@@ -1525,7 +1547,7 @@ mlp2_partial_bf16_bucketed_splitk_kernel_inbf16_tuned(
 
 #if MATMUL_MLP2_MAX_SPLITS > 1
   if (splits > 1) {
-    // Split-K: cong don bang atomic; bias chi cong o lat cat z = 0.
+    // Split-K: accumulate atomically; the bias is added only on slice z = 0.
     #pragma unroll
     for (int im = 0; im < nIterM; ++im) {
       #pragma unroll
@@ -1579,8 +1601,8 @@ static inline void launch_mlp1_swiglu_bf16_bucketed_outbf16(
   const __hip_bfloat16* w1_layer, const __hip_bfloat16* b1_layer,
   const int* offsets, const int* blk_offs, int H, int I, int E,
   int total_blocks, float swiglu_limit, hipStream_t stream,
-  // tok_idx != nullptr: a_in la ext_t_bf16 [token][H], hang lay qua tok_idx.
-  // nullptr (mac dinh): a_in la bang [pair][H] da chep san - duong cu.
+  // tok_idx != nullptr: a_in is ext_t_bf16 [token][H], and the row comes from tok_idx.
+  // nullptr (the default): a_in is the pre-copied [pair][H] table - the old path.
   const int* tok_idx = nullptr
 ) {
 
@@ -1593,16 +1615,16 @@ static inline void launch_mlp1_swiglu_bf16_bucketed_outbf16(
   constexpr int CTA = NUM_CTA_MLP1;
   constexpr int THREADS = 64 * WARPS;
   static_assert(WARPS == (BM / WM) * (BN / WN),
-                "WAVES_PER_BLOCK phai bang (BM/WM)*(BN/WN): than kernel cap"
-                " TILE_N = 64*(BM/WM)*(BN/WN) thread, launcher cap 64*WARPS.");
-  // BN_AGG la MOT hang so duy nhat cho ca BNt lan tham so mau cua kernel: truoc
-  // day so 2 duoc viet lai o hai cho, lech nhau la cap phat thieu LDS im lang.
+                "WAVES_PER_BLOCK must equal (BM/WM)*(BN/WN): the kernel body allocates"
+                " TILE_N = 64*(BM/WM)*(BN/WN) threads, the launcher 64*WARPS.");
+  // BN_AGG is ONE constant for both BNt and the kernel's template argument: the 2 used to be
+  // written in two places, and letting them disagree silently under-allocates LDS.
   constexpr int BN_AGG = 2;
   constexpr int BNt = BN * BN_AGG;
   using LdsPlan = Mlp1LdsPlan<BM, BNt, BK, MATMUL_MLP1_LDS_PAD_SLOTS>;
   dim3 block(THREADS);
   dim3 grid((I + BNt - 1) / BNt, total_blocks);
-  // MOT nguon su that cho kich thuoc LDS - dung ke hoach ma than kernel dung.
+  // ONE source of truth for the LDS size - the same plan the kernel body uses.
   size_t shmem = LdsPlan::bytes;
 #if GETP_SMALL_NOSCATTER
   if (tok_idx) {
@@ -1633,10 +1655,10 @@ static inline void launch_mlp2_partial_bf16_bucketed_frombf16(
   constexpr int WARPS = MATMUL_MLP2_WAVES_PER_BLOCK;
   constexpr int THREADS = 64 * WARPS;
   static_assert(WARPS == (BM / WM) * (BN / WN),
-                "WAVES_PER_BLOCK phai bang (BM/WM)*(BN/WN): than kernel cap"
-                " TILE_N = 64*(BM/WM)*(BN/WN) thread, launcher cap 64*WARPS.");
-  // BN_AGG la MOT hang so duy nhat cho ca BNt lan tham so mau cua kernel:
-  // truoc day so 3 duoc viet lai o hai cho, lech nhau la hong tile im lang.
+                "WAVES_PER_BLOCK must equal (BM/WM)*(BN/WN): the kernel body allocates"
+                " TILE_N = 64*(BM/WM)*(BN/WN) threads, the launcher 64*WARPS.");
+  // BN_AGG is ONE constant for both BNt and the kernel's template argument:
+  // the 3 used to be written in two places, and letting them disagree silently corrupts the tile.
   constexpr int BN_AGG = 3;
   constexpr int BNt = BN * BN_AGG;
 
@@ -1657,21 +1679,21 @@ static inline void launch_mlp2_partial_bf16_bucketed_frombf16(
 
   if (splits > 1) {
     int total_pairs = 0;
-    // hipMemcpy DONG BO, khong phai Async: total_pairs duoc dung ngay dong sau
-    // tren host de tinh kich co memset. Ban cu dung Async va chi chay dung vi
-    // ROCm sao chep dong bo khi bo nho host la pageable - dua vao dieu do la sai.
+    // A SYNCHRONOUS hipMemcpy, not Async: total_pairs is used on the host on the very next line
+    // to size the memset. The old code used Async and only worked because ROCm copies
+    // synchronously when the host memory is pageable - relying on that is wrong.
     HIP_CHECK(hipStreamSynchronize(stream));
     HIP_CHECK(hipMemcpy(&total_pairs, offsets + E, sizeof(int), hipMemcpyDeviceToHost));
     HIP_CHECK(hipMemsetAsync(z_partial, 0, (size_t)total_pairs * (size_t)H * sizeof(float), stream));
   }
 
-  // MOT nguon su that cho hinh hoc LDS: dung chinh ke hoach cua than kernel.
+  // ONE source of truth for the LDS geometry: the kernel body's own plan.
   using LdsPlan = Mlp2LdsPlan<BM, BNt, BK, MATMUL_MLP2_LDS_PAD_SLOTS>;
   dim3 block(THREADS);
   dim3 grid(max(1, gx), max(1, gy), splits);
-  // NUM_CTA_MLP2 la so WAVE toi thieu tren moi SIMD (doi so 2 cua
-  // __launch_bounds__), KHONG phai so block tren CU: 2 -> 256 VGPR/lane cho tile
-  // 128x192. LDS lay tu LdsPlan::bytes nen launcher va kernel khong the lech nhau.
+  // NUM_CTA_MLP2 is the minimum number of WAVES per SIMD (the second argument of
+  // __launch_bounds__), NOT blocks per CU: 2 -> 256 VGPRs/lane for the 128x192 tile.
+  // The LDS size comes from LdsPlan::bytes, so launcher and kernel cannot disagree.
   size_t shmem = LdsPlan::bytes;
 
   mlp2_partial_bf16_bucketed_splitk_kernel_inbf16_tuned<BM,BN,BK,WM,WN,BN_AGG,NUM_CTA_MLP2>
@@ -1681,22 +1703,22 @@ static inline void launch_mlp2_partial_bf16_bucketed_frombf16(
 }
 
 
-// Lat cat [own_lo, own_hi) cua e_agg la phan danh cho TOKEN CUA CHINH THIET BI
-// NAY: khong peer nao doc no (peer keo lat cat mang chi so cua PEER tu buffer
-// cua ta). Nen thay vi ghi ra roi de vecadd doc lai, cong thang vao dong du.
-// Nhanh re theo blockIdx.y nen dong nhat trong ca block, khong phan ky.
+// The [own_lo, own_hi) slice of e_agg is the part belonging to THIS DEVICE'S OWN TOKENS: no peer
+// reads it (a peer pulls the slice carrying ITS OWN index out of our buffer). So instead of
+// writing it out for vecadd to read back, add it straight into the residual.
+// The branch is on blockIdx.y, so it is uniform across the block and does not diverge.
 #if GETP_ROWSKIP
-// Mot block, mot lat cat. Quet B hang, danh dau hang khac 0, quet tien to de ra vi tri nen, roi
-// ghi CA HAI chieu anh xa: rank[b] (hang -> vi tri nen, -1 neu la hang 0) va idx[r] (nguoc lai).
-// Ben gui can rank, ben nhan can idx.
+// One block, one slice. Scan B rows, mark the non-zero ones, prefix-scan to get the compacted
+// position, then write BOTH directions of the mapping: rank[b] (row -> compacted position, -1
+// if the row is zero) and idx[r] (the inverse).
 //
-// `in_slice` la lat cat DOC VAO, con `out_base`/`cnt_slot` la cho GHI RA - hai thu nay phai tach
-// nhau: ben nhan doc lat cat cua CHINH MINH nhung ghi ket qua vao o cua tung PEER, neu suy cho
-// ghi tu lat cat doc thi bay peer ghi de len nhau.
+// `in_slice` is the slice READ FROM, while `out_base`/`cnt_slot` say where to WRITE - the two
+// must stay separate: the receiving side reads ITS OWN slice but writes the result into each
+// PEER's bucket, and deriving the write position from the read slice makes seven peers collide.
 template <bool FROM_NLOCAL>
 __global__ __launch_bounds__(256) void getp_rowskip_build_kernel(
     const int *__restrict__ n_local,     // FROM_NLOCAL: [EP*B]
-    const int *__restrict__ topk_i,      // !FROM_NLOCAL: [EP*B, K] id expert toan cuc
+    const int *__restrict__ topk_i,      // !FROM_NLOCAL: [EP*B, K] global expert ids
     int K, int B, int in_slice, int e_lo, int e_hi,
     int *__restrict__ rank, int *__restrict__ idx, int *__restrict__ cnt,
     int out_base, int cnt_slot) {
@@ -1726,7 +1748,7 @@ __global__ __launch_bounds__(256) void getp_rowskip_build_kernel(
       sc[threadIdx.x] += v;
       __syncthreads();
     }
-    const int excl = sc[threadIdx.x] - nz;        // tien to LOAI TRU trong luot nay
+    const int excl = sc[threadIdx.x] - nz;        // EXCLUSIVE prefix within this pass
     const int tail = sc[255];
     if (b < B) {
       const int r = nz ? (sacc + excl) : -1;
@@ -1741,9 +1763,9 @@ __global__ __launch_bounds__(256) void getp_rowskip_build_kernel(
 }
 
 #if GETP_RS_MERGE
-// Y het getp_rowskip_build_kernel nhung mot BLOCK lo mot lat cat, nen ca 7 lat di trong mot lan
-// phong. `skip_slice` la lat cat cua chinh minh - block do thoat ngay.
-// blockIdx.x chay tren so hieu lat cat dich (ben gui) hoac so hieu peer (ben nhan).
+// Identical to getp_rowskip_build_kernel except that one BLOCK handles one slice, so all seven
+// go in a single launch. `skip_slice` is this rank's own slice - that block returns immediately.
+// blockIdx.x runs over destination slice (sender side) or peer index (receiver side).
 template <bool FROM_NLOCAL>
 __global__ __launch_bounds__(256) void getp_rowskip_build_all_kernel(
     const int *__restrict__ n_local, const int *__restrict__ topk_i,
@@ -1752,7 +1774,7 @@ __global__ __launch_bounds__(256) void getp_rowskip_build_all_kernel(
     int *__restrict__ rank, int *__restrict__ idx, int *__restrict__ cnt) {
   const int sl = blockIdx.x;
   if (sl >= ep || sl == skip_slice) return;
-  // Ben gui doc lat cat sl; ben nhan luon doc lat cat cua chinh minh.
+  // The sender reads slice sl; the receiver always reads its own slice.
   const int in_base = (FROM_NLOCAL ? sl : in_slice_fixed) * B;
   const int e_lo = FROM_NLOCAL ? 0 : e_lo_arr[sl];
   const int e_hi = FROM_NLOCAL ? 0 : e_hi_arr[sl];
@@ -1810,8 +1832,9 @@ static inline void getp_rowskip_build_all_recv(const int *topk_i, int K, int B, 
 #endif
 
 #if GETP_AGSKIP
-// Gom cac hang lat cat cua minh ma lat cat dich `sl` can, thanh mot khoi lien tuc.
-// Luoi (EP, B): block (sl, i) lo hang thu i cua danh sach gui cho sl. i >= cnt[sl] thoat ngay.
+// Gather the rows of this rank's own slice that destination slice `sl` needs into one
+// contiguous block. Grid (EP, B): block (sl, i) handles row i of the list for sl;
+// i >= cnt[sl] returns immediately.
 __global__ __launch_bounds__(256) void getp_agskip_gather_kernel(
     const __hip_bfloat16 *__restrict__ src, __hip_bfloat16 *__restrict__ dst,
     const int *__restrict__ idx, const int *__restrict__ cnt, int own, int B, int H) {
@@ -1825,7 +1848,7 @@ __global__ __launch_bounds__(256) void getp_agskip_gather_kernel(
     reinterpret_cast<uint4 *>(dp)[k >> 3] = reinterpret_cast<const uint4 *>(sp)[k >> 3];
   for (int k = H8 + threadIdx.x; k < H; k += blockDim.x) dp[k] = sp[k];
 }
-// Tan khoi lien tuc vua keo ve, tro lai dung hang trong o cua peer.
+// Scatter the contiguous block just pulled back to its proper rows in the peer's bucket.
 __global__ __launch_bounds__(256) void getp_agskip_scatter_kernel(
     __hip_bfloat16 *__restrict__ dst, const __hip_bfloat16 *__restrict__ src,
     const int *__restrict__ idx, int H) {
@@ -1851,8 +1874,28 @@ static inline void getp_rowskip_build_recv(const int *topk_i, int K, int B, int 
       nullptr, topk_i, K, B, in_slice, e_lo, e_hi, rank, idx, cnt, out_slot * B, out_slot);
 }
 
-// dev_x[idx[r]*H + c] += src[r*H + c]. Cung phep cong fp32 tren cung gia tri nhu vecadd cu;
-// cac hang bi bo deu bang 0 nen bo qua chung khong doi ket qua.
+// dev_x[idx[r]*H + c] += src[r*H + c]. The same fp32 addition on the same values as the old
+// vecadd; the skipped rows are all zero, so leaving them out changes nothing.
+#if GETP_EAGG_BF16
+// Identical to getp_rowskip_scatter_add_kernel but with a bf16 source. The addition into dev_x
+// is still fp32.
+__global__ __launch_bounds__(256) void getp_rowskip_scatter_add_bf16_kernel(
+    float *__restrict__ x, const __hip_bfloat16 *__restrict__ src,
+    const int *__restrict__ idx, const int *__restrict__ cnt, int H) {
+  if ((int)blockIdx.y >= *cnt) return;
+  const int c = blockIdx.x * blockDim.x + threadIdx.x;
+  if (c >= H) return;
+  x[(size_t)idx[blockIdx.y] * H + c] += __bfloat162float(src[(size_t)blockIdx.y * H + c]);
+}
+static inline void getp_rowskip_scatter_add_bf16(float *x, const __hip_bfloat16 *src,
+                                                 const int *idx, const int *cnt, int H, int nrow,
+                                                 hipStream_t st) {
+  if (nrow <= 0) return;
+  dim3 blk(256), grd((unsigned)((H + 255) / 256), (unsigned)nrow);
+  getp_rowskip_scatter_add_bf16_kernel<<<grd, blk, 0, st>>>(x, src, idx, cnt, H);
+}
+#endif
+
 __global__ __launch_bounds__(256) void getp_rowskip_scatter_add_kernel(
     float *__restrict__ x, const float *__restrict__ src,
     const int *__restrict__ idx, const int *__restrict__ cnt, int H) {
@@ -1875,9 +1918,10 @@ __global__ void moe_gather_pairs_kernel(float *__restrict__ e_agg,
                                         const float *__restrict__ z_partial,
                                         const int *__restrict__ pair_pos, int H,
                                         int K, int B,
-                                        const int *__restrict__ rowskip_rank) {
+                                        const int *__restrict__ rowskip_rank,
+                                        int b_base, int store_bf16) {
   int row = blockIdx.x * blockDim.x + threadIdx.x;
-  int b = blockIdx.y;
+  int b = blockIdx.y + b_base;
   if (row >= H || b >= B) return;
   int base = b * K;
   float s = 0.f;
@@ -1886,25 +1930,40 @@ __global__ void moe_gather_pairs_kernel(float *__restrict__ e_agg,
     if (pos >= 0) s += z_partial[(size_t)pos * (size_t)H + row];
   }
   if (b >= own_lo && b < own_hi) {
-    // Bit-exact: s la dung so fp32 ma e_agg se chua, va vecadd cung cong
-    // dung mot lan nhu the.
+    // Bit-exact: s is exactly the fp32 value e_agg would have held, and vecadd would have
+    // added it exactly once in the same way.
     x_resid[(size_t)(b - own_lo) * (size_t)H + row] += s;
   } else {
-    // Ghi DE, khong cong don: moi o duoc ghi dung mot lan (luoi phu tron
-    // B x H), nen khong can memset 35,4 MB truoc do nua.
+    // OVERWRITE, do not accumulate: every cell is written exactly once (the B x H grid covers
+    // it completely), so the 35,4 MB memset that used to precede this is no longer needed.
 #if GETP_ROWSKIP
     if (rowskip_rank != nullptr) {
-      // Hang bang 0 thi khong ghi va khong gui. Hang khac 0 don len DAU lat cat cua no, nen
-      // peer chi can keo cnt hang dau tien.
+      // A zero row is neither written nor sent. Non-zero rows are packed to the FRONT of their
+      // slice, so a peer only has to pull the first cnt rows.
       const int r = rowskip_rank[b];
       if (r < 0) return;
       const int Bslice = own_hi - own_lo;
       const int slice = b / Bslice;
-      e_agg[((size_t)slice * Bslice + (size_t)r) * (size_t)H + row] = s;
+      const size_t off = ((size_t)slice * Bslice + (size_t)r) * (size_t)H + (size_t)row;
+#if GETP_EAGG_BF16
+      // A branch predicted on a uniform value; negligible inside a 158 us kernel.
+      if (store_bf16) {
+        reinterpret_cast<__hip_bfloat16 *>(e_agg)[off] = __float2bfloat16(s);
+        return;
+      }
+#endif
+      e_agg[off] = s;
       return;
     }
 #endif
     (void)rowskip_rank;
+#if GETP_EAGG_BF16
+    if (store_bf16) {
+      reinterpret_cast<__hip_bfloat16 *>(e_agg)[(size_t)b * (size_t)H + row] =
+          __float2bfloat16(s);
+      return;
+    }
+#endif
     e_agg[(size_t)b * (size_t)H + row] = s;
   }
 }
@@ -1914,10 +1973,10 @@ static inline void moe_gather_pairs(float *e_agg, const float *z_partial,
                                     hipStream_t stream) {
 
   dim3 blk(256), grd((H + blk.x - 1) / blk.x, B);
-  // own_lo == own_hi: khong hang nao di vao dong du, y het ban cu.
+  // own_lo == own_hi: no row goes into the residual, exactly as before.
   moe_gather_pairs_kernel<<<grd, blk, 0, stream>>>(e_agg, nullptr, 0, 0,
                                                    z_partial, pair_pos,
-                                                   H, K, B, nullptr);
+                                                   H, K, B, nullptr, 0, 0);
 
 }
 
@@ -1926,97 +1985,102 @@ static inline void moe_gather_pairs_acc(float *e_agg, float *x_resid,
                                         const float *z_partial,
                                         const int *pair_pos, int H, int K,
                                         int B, hipStream_t stream,
-                                        const int *rowskip_rank = nullptr) {
-  dim3 blk(256), grd((H + blk.x - 1) / blk.x, B);
+                                        const int *rowskip_rank = nullptr,
+                                        int b_base = 0, int b_count = -1,
+                                        int store_bf16 = 0) {
+  const int n = (b_count < 0) ? B : b_count;
+  if (n <= 0) return;
+  dim3 blk(256), grd((H + blk.x - 1) / blk.x, (unsigned)n);
   moe_gather_pairs_kernel<<<grd, blk, 0, stream>>>(e_agg, x_resid,
                                                    own_lo, own_hi,
                                                    z_partial, pair_pos,
-                                                   H, K, B, rowskip_rank);
+                                                   H, K, B, rowskip_rank,
+                                                   b_base, store_bf16);
 }
 
 // ===========================================================================
-// Bo cuc LDS cua new_matmul_qkv_fused_kernel: KPack = 4 -> tile[k/4][hang][4]
+// new_matmul_qkv_fused_kernel LDS layout: KPack = 4 -> tile[k/4][row][4]
 //
-// Mot O = 4 short = 8 byte = DUNG 4 phan tu k lien tiep ma mot lane can cho
-// v_mfma_f32_16x16x16bf16_1k (A[i][k]: lane L thanh ghi r -> i = L%16,
-// k = 4*(L/16)+r; B[k][j] doi xung). Nen:
-//   doc : 1 x ds_read_b64   thay cho 4 x ds_read_u16
-//   ghi : 2 x ds_write_b64  thay cho 8 x ds_write_b16 (mot uint4 tu HBM)
+// One SLOT = 4 shorts = 8 bytes = EXACTLY the 4 consecutive k elements a lane needs for
+// v_mfma_f32_16x16x16bf16_1k (A[i][k]: lane L register r -> i = L%16,
+// k = 4*(L/16)+r; B[k][j] likewise). So:
+//   read : 1 x ds_read_b64   instead of 4 x ds_read_u16
+//   write: 2 x ds_write_b64 instead of 8 x ds_write_b16 (one uint4 from HBM)
 //
 // Bank (32 bank x 4 byte = 128 byte/chu ky):
-//   DOC  16 lane cua mot pha co CUNG plane k0 (Ak = 4*(lane>>4) khong doi) va
-//        hang = row0 + (lane&15) chay lien tiep:
-//          byte = C + 8*(lane&15) -> 128 byte lien tuc -> phu kin 32 bank dung
-//          mot lan. Khong xung dot VOI MOI gia tri pad.
-//   GHI  loader: a = threadIdx.x % (BK/8) la chunk k, b = threadIdx.x / (BK/8)
-//        la hang. Trong mot pha 16 lane: a in [0,NKC), b in [0,16/NKC).
-//        O ghi thu nhat co chi so o = (2a)*S + b, S = so o tren mot plane k0
+//   READ   the 16 lanes of one phase share the k0 plane (Ak = 4*(lane>>4) is constant) and
+//        row = row0 + (lane&15) runs consecutively:
+//          byte = C + 8*(lane&15) -> 128 contiguous bytes -> covering the 32 banks exactly
+//          once. Conflict-free for EVERY pad value.
+//   WRITE  loader: a = threadIdx.x % (BK/8) is the k chunk, b = threadIdx.x / (BK/8)
+//          is the row. Within one 16-lane phase: a in [0,NKC), b in [0,16/NKC).
+//          The first slot written has index = (2a)*S + b, where S is the number of slots per
 //          -> byte = 16*S*a + 8*b  -> dword = 4*S*a + 2*b.
 //        S = 128 + 2 = 130: 4*130 = 520 == 8 (mod 32) -> bank = 8a + 2b,
-//          a in [0,4), b in [0,4) -> {0,2,...,30}: moi bank dung mot lan.
-//          O thu hai lech them 2*S = 260 == 4 (mod 32) -> van la hoan vi.
-//          => KHONG xung dot ca doc lan ghi.
-//        S = 128 + 0 = 128: 4*128 = 512 == 0 (mod 32) -> bank = 2b: 4 chieu.
-//        S = 128 + 4 = 132: 4*132 = 528 == 16 (mod 32) -> {0,16,0,16}: 2 chieu.
-//        (Bo cuc [hang][k] "phang" cung lam doc sach, nhung ghi thi con 2 chieu
-//         voi MOI pad; bo cuc o nay khong mat gi ma het xung dot ca hai chieu.)
+//          a in [0,4), b in [0,4) -> {0,2,...,30}: each bank used exactly once.
+//          The second slot is a further 2*S = 260 == 4 (mod 32) away -> still a permutation.
+//          => NO conflict on either the read or the write.
+//        S = 128 + 0 = 128: 4*128 = 512 == 0 (mod 32) -> bank = 2b: 4-way.
+//        S = 128 + 4 = 132: 4*132 = 528 == 16 (mod 32) -> {0,16,0,16}: 2-way.
+//        (The 'flat' [row][k] layout also reads cleanly, but its write stays two-dimensional
+//         for EVERY pad; this layout gives up nothing and is conflict-free both ways.)
 //
-// Can le: o 8 byte, goc tile can le 16 byte -> moi dia chi ds_read_b64 /
-// ds_write_b64 deu can le 8 byte. b128 KHONG dung duoc o day (hai o cua mot
-// uint4 cach nhau S o, khong ke nhau) - day la lua chon co y: b64 khong xung
-// dot hon la b128 xung dot.
+// Alignment: 8-byte slots and a 16-byte aligned tile base -> every ds_read_b64 /
+// ds_write_b64 needs 8-byte alignment. b128 is NOT usable here (the two slots of a uint4 are
+// S slots apart, not adjacent) - a deliberate choice: b64 does not conflict.
+// A conflict-free b64 beats a b128 that conflicts.
 // ===========================================================================
 constexpr bool getp_qkv_lds_write_conflict_free(int S, int NKC) {
   if (NKC <= 0 || NKC > 16 || 16 % NKC != 0) return false;
   int seen = 0;
   for (int l = 0; l < 16; ++l) {
-    const int a = l % NKC;                 // chunk k (truc nhanh cua loader)
-    const int b = l / NKC;                 // hang trong pha 16 lane
+    const int a = l % NKC;                 // k chunk (the loader's fast axis)
+    const int b = l / NKC;                 // row within the 16-lane phase
     int bank = (4 * S * a + 2 * b) % 32;
     if (bank < 0) bank += 32;
-    if (bank & 1) return false;            // o phai can le 8 byte
+    if (bank & 1) return false;            // a slot must be 8-byte aligned
     const int bit = 1 << (bank >> 1);
     if (seen & bit) return false;          // hai lane trung bank
     seen |= bit;
   }
-  return seen == 0xFFFF;                   // phu kin 16 bank chan
+  return seen == 0xFFFF;                   // covers all 16 even banks
 }
 
-// Pad tu suy ra: lay gia tri nho nhat hop le nen khong bao gio tra thua LDS.
-// (hang=128, NKC=4) -> 2 ; (hang=128, NKC=2, tuc BK=16) -> 4. Nho vay bo cuc
-// nay tong quat theo BK thay vi khoa cung mot hang so.
+// Derived padding: the smallest valid value, so it never wastes LDS.
+// (row=128, NKC=4) -> 2 ; (row=128, NKC=2, i.e. BK=16) -> 4. That makes this layout
+// general in BK instead of hard-wiring one constant.
 constexpr int getp_qkv_pick_pad_slots(int rows, int NKC) {
   for (int p = 0; p < 16; ++p)
     if (getp_qkv_lds_write_conflict_free(rows + p, NKC)) return p;
   return -1;
 }
 
-// Ke hoach LDS dung CHUNG cho than kernel va launcher.
+// One LDS plan SHARED by the kernel body and the launcher.
 template <int ROWS, int BK_, int PADS_>
 struct GetpQkvLdsTile {
   static constexpr int KP   = 4;                  // short / o = 8 byte
   static constexpr int KSL  = BK_ / KP;           // so plane k0
-  static constexpr int NKC  = BK_ / 8;            // so chunk k cua loader
+  static constexpr int NKC  = BK_ / 8;            // number of loader k chunks
   static constexpr int PADS =
       (PADS_ >= 0) ? PADS_ : getp_qkv_pick_pad_slots(ROWS, NKC);
-  static constexpr int S     = ROWS + PADS;       // o tren mot plane k0
-  static constexpr int slots = KSL * S;           // o cua ca tile
+  static constexpr int S     = ROWS + PADS;       // slots per k0 plane
+  static constexpr int slots = KSL * S;           // slots in the whole tile
   static constexpr size_t bytes =
       (size_t)slots * KP * sizeof(unsigned short);
 
-  static_assert(BK_ % 8 == 0, "loader nap uint4 = 8 short theo truc k");
-  static_assert(BK_ % KP == 0, "BK phai chia het cho KPack = 4");
+  static_assert(BK_ % 8 == 0, "the loader loads a uint4 = 8 shorts along k");
+  static_assert(BK_ % KP == 0, "BK must be a multiple of KPack = 4");
   static_assert(PADS >= 0,
-                "khong pad nao lam ds_write_b64 het xung dot: phai doi loader");
+                "no pad makes ds_write_b64 conflict-free: the loader has to change");
   static_assert(getp_qkv_lds_write_conflict_free(S, NKC),
-                "GETP_QKV_LDS_PAD_SLOTS sai: ds_write_b64 xung dot bank "
-                "(ROWS=128: BK=32 -> dung 2, BK=16 -> dung 4)");
+                "GETP_QKV_LDS_PAD_SLOTS is wrong: ds_write_b64 bank conflict "
+                "(ROWS=128: BK=32 -> takes 2, BK=16 -> takes 4)");
 };
 
-// Hinh khoi cua QKV: MOT ban duy nhat cho ca than kernel lan launcher. Truoc
-// day launcher giu ban sao rieng va DA lech - "const int BK = 16;" o launcher
-// trong khi than kernel dung BK = 32. Bien do chet (chi BM/BN vao grid) nen vo
-// hai, nhung dung la lop loi "hang so cu song sot qua mot lan sua".
+// QKV block geometry: ONE copy for both the kernel body and the launcher. The launcher used to
+// keep its own copy and HAD drifted - 'const int BK = 16;' in the launcher while the kernel
+// body used BK = 32. The variable was dead (only BM/BN feed the grid) so it was harmless, but
+// it is exactly the class of bug where 'an old constant survives an edit'.
 struct GetpQkvTile {
   static constexpr int BM = 128;
   static constexpr int BN = 128;
@@ -2026,13 +2090,13 @@ struct GetpQkvTile {
   static constexpr int THREADS = 256;
 };
 
-// Gop hai dword thanh mot o 4 x bf16. Thuan tuy doi kieu: hai VGPR da nam dung
-// cho nen khong sinh lenh VALU nao (khac 8 lenh trich nua-word cua ban cu).
-// __builtin_bit_cast la cach viet chuan, khong phai union punning.
+// Pack two dwords into one slot of 4 x bf16. A pure retype: both VGPRs are already in place,
+// so it emits no VALU instruction (unlike the old version's 8 half-word extracts).
+// __builtin_bit_cast is the standard spelling, not union punning.
 __device__ __forceinline__ bf16x4 getp_qkv_pack2(unsigned int lo,
                                                  unsigned int hi) {
   struct Pair { unsigned int a, b; };
-  static_assert(sizeof(Pair) == sizeof(bf16x4), "o phai la 8 byte");
+  static_assert(sizeof(Pair) == sizeof(bf16x4), "a slot must be 8 bytes");
   Pair p;
   p.a = lo;
   p.b = hi;
@@ -2046,14 +2110,14 @@ new_matmul_qkv_fused_kernel(
   const __hip_bfloat16 *__restrict__ w, const __hip_bfloat16 *__restrict__ b,
   int n, int q_len, int k_len, int v_len, int batch_size
 #if GETP_ROPE_FUSED
-  // Bang cos/sin do getp_compute_cos_sin sinh MOT lan moi buoc (head_dim/2
-  // phan tu, vai tram byte - nam gon trong L1 sau lan cham dau).
-  // rope_cos == nullptr => tat hoan toan, epilogue chay y nhu duong cu.
+  // The cos/sin table getp_compute_cos_sin builds ONCE per step (head_dim/2 elements, a few
+  // hundred bytes - it sits in L1 after the first touch).
+  // rope_cos == nullptr => fully off, the epilogue runs exactly the old path.
   , const float *rope_cos, const float *rope_sin, int head_dim
-  // Chi doc khi GETP_ROPE_FUSED_KV: khe KV cache cua buoc nay.
+  // Only read under GETP_ROPE_FUSED_KV: this step's KV cache slot.
   , __hip_bfloat16 *__restrict__ k_slot_bf16
   , __hip_bfloat16 *__restrict__ v_slot_bf16
-  // 1/sqrt(head_dim); chi doc khi GETP_Q_BF16. Xem qbf16.
+  // 1/sqrt(head_dim); only read under GETP_Q_BF16. See qbf16.
   , float q_scale
 #endif
 ) {
@@ -2109,38 +2173,38 @@ new_matmul_qkv_fused_kernel(
 
   assert(blockDim.x == BLOCK_SIZE);
 
-  // Hinh khoi phai khop GetpQkvTile - nguon su that dung chung voi launcher.
+  // The block geometry must match GetpQkvTile - the source of truth shared with the launcher.
   static_assert(BM == GetpQkvTile::BM && BN == GetpQkvTile::BN &&
                     BK == GetpQkvTile::BK && WM == GetpQkvTile::WM &&
                     WN == GetpQkvTile::WN &&
                     BLOCK_SIZE == GetpQkvTile::THREADS,
-                "than kernel va GetpQkvTile lech nhau");
+                "the kernel body and GetpQkvTile disagree");
 
-  // Bo cuc LDS [k/4][hang][4] - xem GetpQkvLdsTile. Ten xs/ws bi XOA co y: moi
-  // cho chua chuyen doi se la loi bien dich chu khong phai dia chi sai im lang.
+  // LDS layout [k/4][row][4] - see GetpQkvLdsTile. The names xs/ws are REMOVED deliberately: any
+  // site not yet converted becomes a compile error rather than a silently wrong address.
   using LdsX = GetpQkvLdsTile<BM, BK, GETP_QKV_LDS_PAD_SLOTS>;
   using LdsW = GetpQkvLdsTile<BN, BK, GETP_QKV_LDS_PAD_SLOTS>;
   constexpr int KP = LdsX::KP;    // 4 short / o
-  constexpr int SX = LdsX::S;     // o tren mot plane k0, tile A
-  constexpr int SW = LdsW::S;     // o tren mot plane k0, tile B
-  static_assert(LdsX::KSL == LdsW::KSL, "hai tile phai cung so plane k0");
-  static_assert(LdsX::bytes + LdsW::bytes <= 64 * 1024, "vuot 64 KB LDS / CU");
+  constexpr int SX = LdsX::S;     // slots per k0 plane, tile A
+  constexpr int SW = LdsW::S;     // slots per k0 plane, tile B
+  static_assert(LdsX::KSL == LdsW::KSL, "both tiles must have the same number of k0 planes");
+  static_assert(LdsX::bytes + LdsW::bytes <= 64 * 1024, "exceeds 64 KB of LDS per CU");
 
-  // Afloat/Bfloat va bf16x4 deu la vector 4 x unsigned short (8 byte) nen gan
-  // thang duoc; neu mot ngay nao do lech kieu thi day thanh loi bien dich.
+  // Afloat/Bfloat and bf16x4 are all 4 x unsigned short vectors (8 bytes), so they assign
+  // directly; if the types ever drift apart this becomes a compile error.
   static_assert(sizeof(bf16x4) == sizeof(Afloat) &&
                     sizeof(bf16x4) == sizeof(Bfloat),
-                "toan hang A/B cua MFMA phai la vector 8 byte");
+                "the MFMA A/B operands must be 8-byte vectors");
 
-  // __align__(16) la bao hiem: bf16x4 chi can 8 byte, nhung goc tile can le 16
-  // byte lam MOI dia chi o chac chan can le 8 byte duoi mat LLVM, thay vi chi
-  // "tinh ra la dung". Do la dieu kien de sinh ds_read_b64 / ds_write_b64.
+  // __align__(16) is insurance: bf16x4 only needs 8 bytes, but a 16-byte aligned tile base
+  // makes EVERY slot address provably 8-byte aligned to LLVM, rather than merely
+  // 'correct if you work it out'. That is the precondition for emitting ds_read_b64 / ds_write_b64.
   __shared__ __align__(16) bf16x4 xss[LdsX::slots];
   __shared__ __align__(16) bf16x4 wss[LdsW::slots];
 
 #ifdef DEBUG_LDS_POISON
-  // Do day LDS bang bf16 qNaN: o nao loader khong ghi se thanh NaN. Dung de
-  // chia doi loi khi token agreement khong ra dung 100.00 %.
+  // Fill LDS with bf16 qNaN: any slot the loader fails to write shows up as NaN. Useful for
+  // bisecting when token agreement does not come out at exactly 100.00 %.
   {
     unsigned short *raw_x = reinterpret_cast<unsigned short *>(xss);
     unsigned short *raw_w = reinterpret_cast<unsigned short *>(wss);
@@ -2165,9 +2229,9 @@ new_matmul_qkv_fused_kernel(
     int index_y = BM * blockIdx.y + loadXIdx_y + offset;
     uint4 tmp = index_x < K && index_y < M ?
       *reinterpret_cast<const uint4 *>(&x[index_y * K + index_x]) : make_uint4(0, 0, 0, 0);
-    // 8 short lien tiep theo k cua MOT hang = 2 o ke nhau theo truc plane k0.
-    // Thu tu nua-word giu y nguyen (tmp.x thap = k+0, tmp.x cao = k+1, ...)
-    // nen day la phep doi dia chi thuan tuy: bit-exact.
+    // 8 consecutive shorts along k of ONE row = 2 adjacent slots along the k0 plane axis.
+    // The half-word order is kept exactly (tmp.x low = k+0, tmp.x high = k+1, ...)
+    // so this is a pure address change: bit-exact.
     bf16x4 *dst = &xss[((8 * loadXIdx_x) / KP) * SX + (loadXIdx_y + offset)];
     dst[0]  = getp_qkv_pack2(tmp.x, tmp.y);   // k+0 .. k+3
     dst[SX] = getp_qkv_pack2(tmp.z, tmp.w);   // k+4 .. k+7
@@ -2216,9 +2280,9 @@ new_matmul_qkv_fused_kernel(
       for (int iterWaveM = 0; iterWaveM < nIterWaveM; ++iterWaveM) {
         #pragma unroll
         for (int iterWaveN = 0; iterWaveN < nIterWaveN; ++iterWaveN) {
-          // basek = k + 4*(lane>>4) luon chia het cho 4, nen 4 phan tu k cua
-          // mot hang nam gon trong MOT o -> 1 x ds_read_b64 thay cho 4 x
-          // ds_read_u16. Giu Ak/Bk de anh xa lane cua MFMA van hien ro.
+          // basek = k + 4*(lane>>4) is always a multiple of 4, so a row's 4 k elements fit
+          // inside ONE slot -> 1 x ds_read_b64 instead of 4 x
+          // ds_read_u16. Ak/Bk are kept so the MFMA lane mapping stays visible.
           x_local = xss[((k + Ak) / KP) * SX +
                         (yInBlockTile * WM + MFMA_M * iterWaveM + Ai)];
           w_local = wss[((k + Bk) / KP) * SW +
@@ -2251,23 +2315,23 @@ new_matmul_qkv_fused_kernel(
   }
 
 #if GETP_ROPE_FUSED
-  // ===================== RoPE gap vao epilogue ==========================
-  // waveN0 la goc N cua CA wave: blockIdx.x*BN + WN*xInBlockTile -> boi cua
-  // 64. WN = 64 = head_dim va cac moc vung (0, q_len, q_len+k_len) cung la
-  // boi cua 64 (launcher kiem lai truoc khi bat), nen mot wave nam TRON trong
-  // MOT dau cua MOT vung: nhanh duoi day dong nhat tren toan wave, va ban doi
-  // dim+half luon o cung lane. Cung vi the khong can kiem global_x < N nua:
-  // wave hoac nam tron trong N, hoac ra ngoai han - khi do waveN0 >= N >=
-  // q_len+k_len nen no roi xuong duong cu, noi van con kiem bien day du.
+  // ===================== RoPE folded into the epilogue ==========================
+  // waveN0 is the N origin of the WHOLE wave: blockIdx.x*BN + WN*xInBlockTile -> a multiple
+  // of 64. WN = 64 = head_dim, and the region boundaries (0, q_len, q_len+k_len) are also
+  // multiples of 64 (the launcher re-checks before enabling this), so a wave lies ENTIRELY
+  // inside ONE head of ONE region: the branches below are uniform across the wave, and the
+  // partner at dim+half is always in the same lane. That is also why global_x < N no longer
+  // needs checking: a wave is either wholly inside N or past the end - and then waveN0 >= N >=
+  // q_len+k_len, so it falls through to the old path, which still bounds-checks fully.
   const int waveN0 = blockIdx.x * BN + WN * xInBlockTile;
   constexpr int nPairN = nIterWaveN / 2;
   static_assert(nIterWaveN % 2 == 0,
-                "nua thap/nua cao cua mot dau phai la so tile MFMA chan");
+                "the low/high half of a head must be an even number of MFMA tiles");
   if (rope_cos != nullptr && waveN0 < q_len + k_len) {
     const int half = head_dim >> 1;            // 32
     const int CDj = (laneIdx % 16);
-    // cos/sin chi phu thuoc (iterWaveN, CDj) - bat bien trong ca hai vong
-    // duoi - nen nap mot lan ra thanh ghi thay vi doc lai 32 lan.
+    // cos/sin depend only on (iterWaveN, CDj) - invariant across both loops
+    // below - so load it once into a register instead of re-reading it 32 times.
     float cs[nPairN], sn[nPairN];
     #pragma unroll
     for (int p = 0; p < nPairN; ++p) {
@@ -2275,12 +2339,12 @@ new_matmul_qkv_fused_kernel(
       cs[p] = rope_cos[d];
       sn[p] = rope_sin[d];
     }
-    const bool in_q = (waveN0 < q_len);        // dong nhat tren wave
+    const bool in_q = (waveN0 < q_len);        // uniform across the wave
     #pragma unroll
     for (int iterWaveM = 0; iterWaveM < nIterWaveM; ++iterWaveM) {
       #pragma unroll
       for (int p = 0; p < nPairN; ++p) {
-        // Ban doi o dim+half la tile N thu (p + nPairN): CUNG lane, CUNG i.
+        // The partner at dim+half is N tile (p + nPairN): SAME lane, SAME i.
         const int accLo = iterWaveM * nIterWaveN + p;
         const int accHi = iterWaveM * nIterWaveN + p + nPairN;
         #pragma unroll
@@ -2288,8 +2352,8 @@ new_matmul_qkv_fused_kernel(
           const int CDi = 4 * (laneIdx / 16) + (i % 4);
           const int global_y =
               blockIdx.y * BM + WM * yInBlockTile + iterWaveM * MFMA_M + CDi;
-          const int gx1 = waveN0 + p * MFMA_N + CDj;   // dim thap
-          const int gx2 = gx1 + half;                  // ban doi
+          const int gx1 = waveN0 + p * MFMA_N + CDj;   // low dim
+          const int gx2 = gx1 + half;                  // its partner
           if (global_y < M) {
             float x1 = acc_local[accLo][i];
             float x2 = acc_local[accHi][i];
@@ -2299,14 +2363,14 @@ new_matmul_qkv_fused_kernel(
             }
             const float c = cs[p];
             const float s = sn[p];
-            // Chep NGUYEN VAN tu apply_rotary_emb_kernel: cung thu tu toan
-            // hang, cung thu tu phep tinh -> trinh bien dich gap fma y het.
-            // Doi mot ky tu o hai dong nay la doi ket qua o bit cuoi.
+            // Copied VERBATIM from apply_rotary_emb_kernel: same operand order, same operation
+            // order -> the compiler fuses exactly the same fma.
+            // Changing one character on these two lines changes the last bit of the result.
             float o1 = x1 * c - x2 * s;
             float o2 = x2 * c + x1 * s;
             if (in_q) {
 #if GETP_Q_BF16
-              // q_scale la 2^-3 nen nhan truoc hay sau khi lam tron deu cho cung tung bit.
+              // q_scale is 2^-3, so multiplying before or after rounding gives the same bits.
               unsigned short *dst =
                   reinterpret_cast<unsigned short *>(q_out) + (size_t)global_y * q_len;
               dst[gx1] = f32_to_bf16bits(q_scale * o1);
@@ -2319,8 +2383,8 @@ new_matmul_qkv_fused_kernel(
 #endif
             } else {
 #if GETP_ROPE_FUSED_KV
-              // kv_store_pair_fp32_to_bf16 da bi go: ghi thang bf16 bang DUNG
-              // ham lam tron cu nen gia tri trung tung bit.
+              // kv_store_pair_fp32_to_bf16 has been removed: writing bf16 directly here uses
+              // EXACTLY the old rounding helper, so the values match bit for bit.
               unsigned short *dst =
                   reinterpret_cast<unsigned short *>(k_slot_bf16) +
                   (size_t)global_y * k_len;
@@ -2339,8 +2403,8 @@ new_matmul_qkv_fused_kernel(
   }
 #if GETP_ROPE_FUSED_KV
   else if (rope_cos != nullptr && waveN0 < N) {
-    // Vung v: khong xoay, nhung vi kv_store_pair da bi go nen phai tu doi
-    // bf16 va ghi thang khe cache. v_len == kv_dim nen buoc hang giong het.
+    // The v region: no rotation, but since kv_store_pair is gone this has to convert to bf16
+    // itself and write the cache slot directly. v_len == kv_dim, so the row stride is identical.
     #pragma unroll
     for (int iterWaveM = 0; iterWaveM < nIterWaveM; ++iterWaveM) {
       #pragma unroll
@@ -2401,8 +2465,8 @@ new_matmul_qkv_fused_kernel(
   }
   }
 #if GETP_ROPE_FUSED
-  // Khi chi bat RoPE (khong bat _KV) hai con tro nay khong duoc dung - noi ro
-  // voi trinh bien dich thay vi de mot canh bao troi noi.
+  // With RoPE alone (without _KV) these two pointers are unused - say so explicitly rather
+  // than leaving a warning floating around.
   (void)k_slot_bf16;
   (void)v_slot_bf16;
 #endif
@@ -2416,8 +2480,8 @@ static inline void getp_matmul_qkv_fused_bf16(
     int n, int head_dim, int n_attn_heads, int n_kv_heads, int batch_size,
     hipStream_t stream
 #if GETP_ROPE_FUSED
-    // Khong dat gia tri mac dinh: neu con cho goi nao chua duoc sua thi day
-    // phai la LOI BIEN DICH, chu khong phai im lang chay duong cu.
+    // No default value: if any call site has not been updated, that must be a COMPILE ERROR
+    // rather than a silent fall-through to the old path.
     , const float *rope_cos, const float *rope_sin,
     __hip_bfloat16 *k_slot, __hip_bfloat16 *v_slot
 #endif
@@ -2431,10 +2495,10 @@ static inline void getp_matmul_qkv_fused_bf16(
   const int N = q_len + k_len + v_len;
   const int K = n;
 
-  // MOT nguon su that cho hinh khoi: lay tu chinh hang so than kernel dung.
-  // Ban cu o day co "const int BK = 16;" trong khi than kernel dung BK = 32 -
-  // bien chet nen vo hai, nhung static_assert trong than kernel gio khoa cap
-  // BM/BN/BK/WM/WN/THREADS lai voi nhau.
+  // ONE source of truth for the block geometry: taken from the constants the kernel body uses.
+  // The old code here had 'const int BK = 16;' while the kernel body used BK = 32 -
+  // a dead variable and so harmless, but a static_assert in the kernel body now pins
+  // BM/BN/BK/WM/WN/THREADS to one another.
   const int BN = GetpQkvTile::BN;
   const int BM = GetpQkvTile::BM;
 
@@ -2442,36 +2506,35 @@ static inline void getp_matmul_qkv_fused_bf16(
   dim3 grid((N + BN - 1) / BN, (M + BM - 1) / BM);
 
 #if GETP_ROPE_FUSED
-  // Dieu kien de "mot wave = mot dau" thanh su that. head_dim == WN cho tile N
-  // cua wave trung dung mot dau; q_len/k_len chia het head_dim cho moc dau moi
-  // vung roi vao ranh 64 (nen wave khong bao gio cat qua bien q|k|v); N chia
-  // het head_dim cho mot wave hoac nam tron trong N hoac ra ngoai han. Khong
-  // thoa -> rope_cos = nullptr va epilogue chay nguyen ven duong cu.
+  // The conditions that make 'one wave = one head' true. head_dim == WN puts a wave's N tile
+  // exactly on one head; q_len/k_len divisible by head_dim puts each region's start on a
+  // 64 boundary (so a wave never straddles a q|k|v boundary); N divisible by head_dim means a
+  // wave is either wholly inside N or past the end.
+  // If any of them fails, the check just below stops the run - see why there is no fallback.
   const bool rope_ok = (rope_cos != nullptr) && (rope_sin != nullptr) &&
                        (head_dim == GetpQkvTile::WN) && (head_dim % 2 == 0) &&
                        (q_len % head_dim == 0) && (k_len % head_dim == 0) &&
                        (N % head_dim == 0);
-  // KHONG CO DUONG LUI. Khi GETP_ROPE_FUSED=1 thi hai loi goi
-  // getp_apply_rotary_emb da bi go khoi CA HAI vong lop (cho goi duy nhat cua
-  // chung), nen "rope_cos = nullptr -> chay duong cu" KHONG con nghia la "rope
-  // van duoc lam o kernel rieng" - no co nghia la KHONG AI xoay q/k nua. Mot
-  // hinh dang khong thoa dieu kien vi the phai dung han o day, chu khong duoc
-  // tra ve so sai mot cach im lang. (Voi cau hinh hien tai head_dim=64=WN,
-  // q_len=4096, k_len=512, N=5120 thi rope_ok luon dung; kiem tra nay la de
-  // chan mot model tuong lai co head_dim khac lot qua ma khong ai biet.)
+  // THERE IS NO FALLBACK. With GETP_ROPE_FUSED=1 the two getp_apply_rotary_emb calls have been
+  // removed from BOTH loops (their only call sites), so 'rope_cos = nullptr -> take the old
+  // path' no longer means 'rope still happens in a separate kernel' - it means NOBODY rotates
+  // q/k any more. A shape that fails the conditions must therefore stop here outright, rather
+  // than silently returning wrong numbers. (With the current configuration head_dim=64=WN,
+  // q_len=4096, k_len=512, N=5120, rope_ok is always true; this check exists to stop a future
+  // model with a different head_dim from slipping through unnoticed.)
   if (!rope_ok) {
-    std::cerr << "GETP_ROPE_FUSED: hinh dang qkv khong thoa dieu kien "
-                 "mot-wave-mot-dau (head_dim=" << head_dim
+    std::cerr << "GETP_ROPE_FUSED: the qkv shape does not meet the "
+                 "one-wave-one-head condition (head_dim=" << head_dim
               << ", WN=" << GetpQkvTile::WN << ", q_len=" << q_len
               << ", k_len=" << k_len << ", N=" << N
-              << ") - rope se khong duoc ap dung o dau ca." << std::endl;
+              << ") - rope would not be applied anywhere." << std::endl;
     std::abort();
   }
 #if GETP_ROPE_FUSED_KV
-  // Them mot dieu kien rieng cho bac _KV: kv_store_pair_fp32_to_bf16 cung da
-  // bi go, nen khe KV chi duoc ghi neu hai con tro nay co that.
+  // One more condition specific to the _KV step: kv_store_pair_fp32_to_bf16 is also gone, so
+  // the KV slot may only be written if these two pointers really exist.
   if (k_slot == nullptr || v_slot == nullptr) {
-    std::cerr << "GETP_ROPE_FUSED_KV: thieu con tro khe KV" << std::endl;
+    std::cerr << "GETP_ROPE_FUSED_KV: missing KV slot pointer" << std::endl;
     std::abort();
   }
 #endif
@@ -3154,37 +3217,37 @@ static inline void getp_router_topk_softmax_batch(
     float *topk_v_out, int *topk_i_out, int batch_size, hipStream_t stream) {
 
 #if GETP_SMALL_TOPK
-  // n_experts = 32 (20b) / 128 (120b) nhung khoi van la 1024 thread = 16 wave.
-  // Hai hau qua, ca hai deu la thoi gian chet:
-  //   * chiem dung: 16 wave/khoi, tran 8 wave/SIMD -> 2 khoi/CU -> 208 khoi
-  //     thuong tru tren 1536 -> 7,4 lan chay noi tiep;
-  //   * vong rut gon chay log2(1024) = 10 chang, MOI chang mot __syncthreads
-  //     cua 16 wave, lam lai K = 4 lan -> ~44 hang rao nang moi khoi.
-  // Do duoc 2,5 ms/buoc cho 250 KB luu luong (san bang 0,2 us): gan nhu toan
-  // bo la hang rao va lan chay noi tiep, khong phai bo nho.
+  // n_experts = 32 (20b) / 128 (120b), yet the block was still 1024 threads = 16 waves.
+  // Two consequences, both of them dead time:
+  //   * occupancy: 16 waves/block, capped at 8 waves/SIMD -> 2 blocks/CU -> 208 blocks
+  //     resident out of 1536 -> 7,4 serial passes;
+  //   * the reduction loop runs log2(1024) = 10 stages, EACH with a __syncthreads
+  //     of 16 waves, repeated K = 4 times -> roughly 44 heavy barriers per block.
+  // Measured at 2,5 ms/step for 250 KB of traffic (a floor of 0,2 us): almost all of it is
+  // barriers and serialised execution, not memory.
   //
-  // VI SAO BIT-EXACT khi thu khoi ve BLK = 2^ceil(log2(n_experts)) >= 64:
-  //   (a) Pha rieng tung thread: vong `for (i = tid; i < n_experts; i += blockDim.x)`
-  //       chay DUNG mot vong voi moi BLK >= n_experts -> thread tid giu
-  //       (scores[tid], tid) neu tid < n_experts, nguoc lai giu (-INF, n_experts).
-  //       Khong phu thuoc BLK.
-  //   (b) Cay rut gon: chang stride s ghep trai (vl, il) voi phai (vr, ir).
-  //       Voi MOI chang co stride >= n_experts, ben phai chac chan la o nhan
-  //       roi (vr = -INF, ir = n_experts), va luat chon la
+  // WHY IT IS BIT-EXACT to shrink the block to BLK = 2^ceil(log2(n_experts)) >= 64:
+  //   (a) The per-thread phase: the loop `for (i = tid; i < n_experts; i += blockDim.x)`
+  //       runs EXACTLY one pass for every BLK >= n_experts -> thread tid holds
+  //       (scores[tid], tid) if tid < n_experts, otherwise it keeps (-INF, n_experts).
+  //       Independent of BLK.
+  //   (b) The reduction tree: the stage with stride s merges left (vl, il) with right (vr, ir).
+  //       For EVERY stage with stride >= n_experts, the right-hand side is certainly the
+  //       fall (vr = -INF, ir = n_experts), and the selection rule is
   //           take_r = (vr > vl + thr) || (|vr - vl| <= thr && ir < il),
   //           thr = eps * max(|vr|, |vl|) = eps * INF = INF.
-  //       Nhanh dau: -INF > vl + INF sai voi vl huu han; voi vl = -INF thi
-  //       vl + INF = NaN nen so sanh cung sai. Nhanh sau: |vr - vl| <= INF
-  //       dung, NHUNG ir = n_experts con il <= n_experts nen `ir < il` luon
-  //       SAI. => luon giu ben trai. Moi chang stride >= n_experts la phep
-  //       dong nhat, voi MOI du lieu (lap luan khong gia dinh gi ve vl, nen
-  //       van dung khi scores chua NaN hay +INF).
-  //   Ban 1024 chay chang 512,256,...,1; ban BLK chay BLK/2,...,1. Phan khac
-  //   nhau chi gom cac chang >= n_experts ma (b) vua chung minh la dong nhat;
-  //   cac chang < n_experts trung nhau tung doi mot, cung toan hang, cung thu
-  //   tu, cung phep lam tron -> cung bit.
-  //   Dieu kien can: BLK la luy thua 2 (vong `s = blockDim.x >> 1` moi phu het)
-  //   va BLK >= n_experts. n_experts > 1024 thi giu nguyen 1024 = duong cu.
+  //       First branch: -INF > vl + INF is false for finite vl; for vl = -INF,
+  //       vl + INF = NaN so the comparison is false too. Second branch: |vr - vl| <= INF
+  //       holds, BUT ir = n_experts while il <= n_experts, so `ir < il` is always
+  //       FALSE. => the left side is always kept. Every stage with stride >= n_experts is the
+  //       identity, for ANY data (the argument assumes nothing about vl, so
+  //       still holds when scores contain NaN or +INF).
+  //   The 1024 version runs stages 512,256,...,1; the BLK version runs BLK/2,...,1. The part that
+  //   differ only in stages >= n_experts, which (b) just proved to be the identity;
+  //   the stages < n_experts match pairwise, same operands, same order, same rounding ->
+  //   same bits.
+  //   Preconditions: BLK is a power of 2 (the `s = blockDim.x >> 1` loop only covers it then)
+  //   and BLK >= n_experts. For n_experts > 1024 it stays at 1024 = the old path.
   int BLK = 64;
   while (BLK < n_experts && BLK < 1024) BLK <<= 1;
   const dim3 block(BLK);
@@ -3258,30 +3321,29 @@ void getp_vecadd(float *x, float *y, int size, int batch_size,
 }
 
 // ============================================================================
-// Attention giai ma dung mfma_f32_16x16x16bf16_1k.
+// Decode attention using mfma_f32_16x16x16bf16_1k.
 //
-// Ban cu dat truc K cua phep nhan vao 16 BLOCK cua mfma 4x4x4, nen sau moi lenh
-// MFMA con phai gop 16 block lai bang 4 vong __shfl_down roi phat tan diem so
-// bang 16 lan __shfl nua: 128 lenh cheo lane va 80 lenh __expf cho moi 16 key,
-// doi lay dung 4 lenh MFMA. Phep thu dong chay (thay toan bo phan tinh bang mot
-// phep cong duy nhat, giu nguyen duong nap HBM + LDS + barrier) do duoc 56%
-// thoi gian kernel nam o phan tinh do - tuc no dang la cho ton, khong phai
-// dong du lieu.
+// The old version put the K axis of the product across the 16 BLOCKS of an mfma 4x4x4, so after
+// each MFMA instruction it still had to merge 16 blocks with 4 __shfl_down rounds and then
+// broadcast the score with 16 more __shfl: 128 cross-lane instructions and 80 __expf per 16 keys,
+// in exchange for exactly 4 MFMA instructions. A flow test (replacing the whole compute section
+// with a single add, keeping the HBM + LDS + barrier path intact) measured 56 % of the kernel's
+// time in that compute section - so it was the expensive part, not the memory.
 //
-// Ban nay dat KEY tren truc M va HEAD tren truc N:
+// This version puts KEY on the M axis and HEAD on the N axis:
 //
-//     S^T = K   . Q^T    A = K  [16 key   x 16 chieu]  B = Q^T [16 chieu x 16 head]
-//     O^T = V^T . P^T    A = V^T[16 chieu x 16 key]    B = P^T [16 key   x 16 head]
+//     S^T = K   . Q^T    A = K  [16 key x 16 dim]   B = Q^T [16 dim x 16 head]
+//     O^T = V^T . P^T    A = V^T[16 dim x 16 key]   B = P^T [16 key x 16 head]
 //
-// Diem mau chot: bo cuc ket qua D cua MFMA (lane giu D[4*(lane>>4)+m][lane&15])
-// TRUNG dung bo cuc toan hang B. Nen P^T di thang tu MFMA thu nhat sang MFMA
-// thu hai - khong chuyen vi, khong mot lenh cheo lane nao. Ca tile 16 key chi
-// con 2 lenh __shfl_xor (gop max theo nhom g) va 5 lenh exp.
+// The key point: the MFMA result layout D (lane holds D[4*(lane>>4)+m][lane&15]) MATCHES the
+// B-operand layout exactly. So P^T flows straight from the first MFMA into the second - no
+// transpose, not one cross-lane instruction. A whole 16-key tile is down to 2 __shfl_xor
+// (merging the max across group g) and 5 exp instructions.
 //
-// Gia phai tra: moi wave chi nam HPW head that trong 16 cot cua truc N, so cot
-// con lai dien 0. HPW = 4 giu nguyen cach chia head cu (2 wave/block, 25% cot
-// co ich); HPW = 8 cho mot wave om ca 8 head cua mot kv_head - mot nua so lenh
-// MFMA nhung cung mot nua so thread nap du lieu. Chon bang co bien dich.
+// The price: each wave holds only HPW real heads in the 16 columns of the N axis, so the column
+// the rest is zero-filled. HPW = 4 keeps the old head split (2 waves/block, 25% of the columns
+// are useful); HPW = 8 lets one wave cover all 8 heads of a kv_head - half the MFMA
+// instructions, but also half the threads loading data. Selectable at compile time.
 // ============================================================================
 #ifndef FLASH_HEADS_PER_WAVE
 #define FLASH_HEADS_PER_WAVE 8
@@ -3289,10 +3351,10 @@ void getp_vecadd(float *x, float *y, int size, int batch_size,
 #ifndef FLASH_LDS_PAD
 #define FLASH_LDS_PAD 4
 #endif
-// Tach P thanh hai bf16 (phan cao + phan du) roi cong bang HAI lenh MFMA, cho
-// tich PV co do chinh xac gan fp32 nhu ban cu. Dung de kiem chung gia thuyet
-// "lam tron P la nguyen nhan lech"; chi giu neu that su la nguyen nhan, vi no
-// them 4 lenh MFMA moi tile.
+// Split P into two bf16 values (high part + remainder) and add them with TWO MFMA instructions, so
+// so the PV product keeps close to the old fp32 accuracy. Meant for testing the hypothesis
+// that 'rounding P is the cause of the drift'; keep it only if it really is the cause, since it
+// costs 4 more MFMA instructions per tile.
 #ifndef FLASH_P_HILO
 #define FLASH_P_HILO 0
 #endif
@@ -3309,19 +3371,19 @@ flash_attn_decode_mfma16_kernel(
   int sliding_window, int cache_tcap, float inv_sqrt_d
 ) {
   constexpr int HEAD_DIM   = 64;
-  constexpr int TILE       = 16;                 // = M = N = K cua MFMA
-  constexpr int NCHUNK     = HEAD_DIM / TILE;    // 4 chunk 16 chieu
+  constexpr int TILE       = 16;                 // = M = N = K of the MFMA
+  constexpr int NCHUNK     = HEAD_DIM / TILE;    // 4 chunks of 16 dims
   constexpr int KV_MUL     = 8;
   constexpr int WAVES      = KV_MUL / HPW;
   constexpr int BLOCK_SIZE = 64 * WAVES;
   constexpr int PAD        = FLASH_LDS_PAD;
 
-  // PAD = 4 -> hang dai 68 ushort = 136 byte = 34 bank; 34 mod 32 = 2 nen 16 lane
-  // doc b64 phu kin dung mot lan 32 bank, khong xung dot. Doi lai hang chi con
-  // can 8 byte, nen phan nap ghi hai lenh b64 thay vi mot lenh b128.
-  static_assert(HPW == 4 || HPW == 8, "HPW chi ho tro 4 hoac 8");
-  static_assert(PAD % 4 == 0, "PAD phai chia het 4 de hang con can 8 byte");
-  static_assert(TILE * (HEAD_DIM / 8) % BLOCK_SIZE == 0, "nap KV khong chia deu");
+  // PAD = 4 -> a row is 68 ushorts = 136 bytes = 34 banks; 34 mod 32 = 2, so the 16 lanes
+  // a b64 read covers the 32 banks exactly once, with no conflict. In exchange a row needs only
+  // 8 bytes, so the load path writes two b64 instructions instead of one b128.
+  static_assert(HPW == 4 || HPW == 8, "HPW only supports 4 or 8");
+  static_assert(PAD % 4 == 0, "PAD must be a multiple of 4 so a row still needs only 8-byte alignment");
+  static_assert(TILE * (HEAD_DIM / 8) % BLOCK_SIZE == 0, "the KV load does not divide evenly");
 
   using bf16x4 = __attribute__((__vector_size__(8)))  unsigned short;
   using f32x4  = __attribute__((__vector_size__(16))) float;
@@ -3332,8 +3394,8 @@ flash_attn_decode_mfma16_kernel(
 
   const int waveIdx = threadIdx.x / warpSize;
   const int lane    = threadIdx.x % warpSize;
-  const int ln      = lane & 15;   // truc M cua A, truc N cua B va D
-  const int g       = lane >> 4;   // truc K cua A va B, nhom hang cua D
+  const int ln      = lane & 15;   // M axis of A, N axis of B and D
+  const int g       = lane >> 4;   // K axis of A and B, row group of D
 
   const int kv_h = blockIdx.x;
   const int b    = blockIdx.y;
@@ -3344,31 +3406,31 @@ flash_attn_decode_mfma16_kernel(
   const int n_steps = pos + 1 - t_start;
   const int t_end   = t_start + n_steps;
 
-  // Mot vung LDS duy nhat cho ca ba. `ot` chi song o phan ket, khi ks/vs da
-  // chet, nen cap phat rieng cho no la giu 2 KB suot ca vong lap ma khong dung
-  // - va LDS la thu quyet dinh so workgroup moi CU.
+  // A single LDS region for all three. `ot` only lives in the epilogue, by which time ks/vs are
+  // dead, so giving it its own allocation would hold 2 KB across the whole loop unused -
+  // and LDS is what decides how many workgroups fit per CU.
   constexpr int KV_SHORTS = TILE * (HEAD_DIM + PAD);
   constexpr int OT_SHORTS = WAVES * HPW * HEAD_DIM * 2;   // float = 2 short
   static_assert(OT_SHORTS <= 2 * KV_SHORTS,
-                "ot khong nam gon trong vung ks+vs - phai cap phat rieng lai");
+                "ot does not fit inside the ks+vs region - it needs its own allocation again");
   __shared__ __align__(16) unsigned short kvo[2 * KV_SHORTS];
   unsigned short (*ks)[HEAD_DIM + PAD] =
       reinterpret_cast<unsigned short (*)[HEAD_DIM + PAD]>(kvo);
   unsigned short (*vs)[HEAD_DIM + PAD] =
       reinterpret_cast<unsigned short (*)[HEAD_DIM + PAD]>(kvo + KV_SHORTS);
-  // Cung dia chi voi ks: chi duoc cham vao SAU vong lap.
+  // The same address as ks: may only be touched AFTER the loop.
   float (*ot)[HEAD_DIM] = reinterpret_cast<float (*)[HEAD_DIM]>(kvo);
 
-  // ---- Q^T lam toan hang B: lane giu B[4g+kk][ln] = q[head ln][chunk*16+4g+kk].
-  // Cot ln >= HPW khong ung voi head nao nen dien 0; diem so cua chung bang 0
-  // (huu han, khong sinh NaN) va khong bao gio duoc ghi ra. Chi so head duoc
-  // kep lai de con tro khong bao gio ra ngoai mang q.
+  // ---- Q^T as the B operand: lane holds B[4g+kk][ln] = q[head ln][chunk*16+4g+kk].
+  // Columns ln >= HPW correspond to no head, so they are filled with 0; their scores are 0
+  // (finite, no NaN) and are never written out. The head index is clamped so the pointer never
+  // leaves the q array.
   const int hg_self = kv_h * KV_MUL + waveIdx * HPW + (ln < HPW ? ln : 0);
   bf16x4 qB[NCHUNK];
   {
 #if GETP_Q_BF16
-    // Epilogue qkv da ghi san bf16 DA NHAN inv_sqrt_d. Phep ba ngoi phai GIU: bo no thi cac
-    // cot don (ln >= HPW) nhan phai q that cua dau 0 thay vi so 0.
+    // The qkv epilogue already wrote bf16 ALREADY MULTIPLIED by inv_sqrt_d. The ternary must
+    // STAY: without it the padding columns (ln >= HPW) get head 0's real q instead of zero.
     (void)inv_sqrt_d;
     const unsigned short *qrow =
         reinterpret_cast<const unsigned short *>(q) +
@@ -3398,8 +3460,8 @@ flash_attn_decode_mfma16_kernel(
   const int ly = threadIdx.x / (HEAD_DIM / 8);
   const int lx = threadIdx.x % (HEAD_DIM / 8);
 
-  // Hang LDS chi can 8 byte (136 = 8 x 17) nen mot lenh b128 se lech can chinh;
-  // hai lenh b64 chuyen du 16 byte ma van hop le.
+  // An LDS row only needs 8 bytes (136 = 8 x 17), so a b128 instruction would be misaligned;
+  // two b64 instructions move the same 16 bytes and stay valid.
   auto put16 = [](unsigned short *dst, uint4 v) {
     *reinterpret_cast<uint2 *>(dst)     = make_uint2(v.x, v.y);
     *reinterpret_cast<uint2 *>(dst + 4) = make_uint2(v.z, v.w);
@@ -3448,7 +3510,7 @@ flash_attn_decode_mfma16_kernel(
       }
     }
 
-    // ---- S^T = K . Q^T : A[key][chieu] doc mot lenh b64 moi chunk
+    // ---- S^T = K . Q^T : A[key][dim] read with one b64 instruction per chunk
     f32x4 st;
     #pragma unroll
     for (int i = 0; i < 4; ++i) st[i] = 0.f;
@@ -3460,17 +3522,17 @@ flash_attn_decode_mfma16_kernel(
       st = __builtin_amdgcn_mfma_f32_16x16x16bf16_1k(kA, qB[c], st, 0, 0, 0);
     }
 
-    // ---- mat na duoi. Hang ks ngoai pham vi bi dien 0 nen cho diem 0, ma
-    // exp(0 - m) > 0 se lam hong tong -> phai ep ve -INFINITY.
+    // ---- the lower mask. Out-of-range ks rows are zero-filled and so score 0, and
+    // exp(0 - m) > 0 would corrupt the sum -> they have to be forced to -INFINITY.
     const int kbase = bt + 4 * g;
     #pragma unroll
     for (int m = 0; m < 4; ++m)
       if (kbase + m >= t_end) st[m] = -INFINITY;
 
-    // ---- max cua tile, dung chung cho ca 4 nhom g cua cung mot head. Bat buoc
-    // phai gop truoc khi tinh m_new: mot nhom g co the khong co key hop le nao
-    // (m_tile = -INF) va se sinh NaN neu tu tinh lay. Sau khi gop thi moi tile
-    // chac chan co it nhat mot key hop le nen m_tile huu han.
+    // ---- the tile max, shared by all 4 g groups of the same head. Merging BEFORE computing
+    // m_new is mandatory: one g group may hold no valid key at all (m_tile = -INF) and would
+    // produce NaN if it computed its own. After the merge, every tile
+    // is guaranteed to hold at least one valid key, so m_tile is finite.
     float m_tile = fmaxf(fmaxf(st[0], st[1]), fmaxf(st[2], st[3]));
     m_tile = fmaxf(m_tile, __shfl_xor(m_tile, 16));
     m_tile = fmaxf(m_tile, __shfl_xor(m_tile, 32));
@@ -3478,7 +3540,7 @@ flash_attn_decode_mfma16_kernel(
     const float m_new = fmaxf(m_run, m_tile);
     const float alpha = __expf(m_run - m_new);
 
-    // ---- P^T = exp(S^T - m_new), lam tron bf16 de lam toan hang B ngay.
+    // ---- P^T = exp(S^T - m_new), rounded to bf16 straight away to serve as the B operand.
     bf16x4 pB;
 #if FLASH_P_HILO
     bf16x4 pLo;
@@ -3494,8 +3556,8 @@ flash_attn_decode_mfma16_kernel(
 #endif
     }
 
-    // l giu rieng theo nhom g; vi ca 4 nhom dung chung m_new nen cong lai mot
-    // lan o phan ket la du - gop moi tile la thua.
+    // l is kept per g group; since all 4 groups share m_new, adding them up once in the
+    // epilogue is enough - merging per tile would be redundant.
     l_run = l_run * alpha + lsum;
     m_run = m_new;
 
@@ -3524,9 +3586,9 @@ flash_attn_decode_mfma16_kernel(
     __syncthreads();
   }
 
-  // ---- gop l qua 4 nhom g (mot lan duy nhat)
-  // Barrier truoc khi dung lai vung LDS cua ks/vs lam `ot`: moi wave phai doc
-  // xong tile cuoi cung truoc khi co wave nao ghi de len no.
+  // ---- merge l across the 4 g groups (once only)
+  // Barrier before reusing the ks/vs LDS region as `ot`: every wave must have finished reading
+  // the last tile before any wave overwrites it.
   __syncthreads();
   l_run += __shfl_xor(l_run, 16);
   l_run += __shfl_xor(l_run, 32);
@@ -3545,13 +3607,13 @@ flash_attn_decode_mfma16_kernel(
   }
   __syncthreads();
 
-  // ---- chuyen vi qua LDS roi ghi lien mach: moi head 256 byte lien nhau,
-  // thay cho 16 lane ghi rai rac sang cac hang head khac nhau.
-  // Ghi THANG bf16: consumer duy nhat cua tb la matmul attn_o, va no chi doc
-  // bf16. Viec lam tron nam TRONG lane - moi lane dang giu dung 4 float lien
-  // tiep cua mot head - nen khong can them mot trao doi LDS nao. Cap so hoc
-  // giong het fp32_to_bf16_kernel: no doc lai chinh 4 float nay tu HBM roi goi
-  // f32_to_bf16bits. Mot vong doc-ghi HBM cua ca tensor bien mat.
+  // ---- transpose through LDS, then write contiguously: each head is 256 contiguous bytes,
+  // instead of 16 lanes scattering writes across different head rows.
+  // Write bf16 DIRECTLY: tb's only consumer is the attn_o matmul, and it only reads bf16. The
+  // rounding happens INSIDE the lane - each lane already holds exactly 4 consecutive floats of
+  // one head - so no extra LDS exchange is needed. The arithmetic is identical to
+  // fp32_to_bf16_kernel: that kernel re-read these same 4 floats from HBM and called
+  // f32_to_bf16bits. One full HBM read-and-write pass over the tensor disappears.
   unsigned short *obase = reinterpret_cast<unsigned short *>(tb_bf16) +
                           (size_t)b * n_attn_heads * head_dim;
   #pragma unroll
@@ -3568,7 +3630,7 @@ flash_attn_decode_mfma16_kernel(
         (size_t)(kv_h * KV_MUL + waveIdx * HPW + hh) * head_dim + d4 * 4;
     *reinterpret_cast<uint2 *>(obase + off) = packed;
 #if GETP_DUMP_ATTN
-    // Duong go roi: van giu ban fp32 de getp_dump_attn so sanh duoc.
+    // Debug path: the fp32 copy is kept so getp_dump_attn can compare.
     *reinterpret_cast<float4 *>(
         tb_f32 + (size_t)b * n_attn_heads * head_dim + off) = v;
 #endif
@@ -3654,8 +3716,8 @@ flash_attn_decode_even_layer_bf16_matrix_core_kernel(
   Afloat q_values[HEAD_DIM / (MFMA_BLOCK * MFMA_K)];
   for (int i = 0; i < HEAD_DIM / (MFMA_BLOCK * MFMA_K); ++i) {
     for (int j = 0; j < MFMA_K; ++j) {
-      // inv_sqrt_d gap vao day thay vi nhan vao tung diem so sau __shfl,
-      // noi gia tri dong nhat ca wave nen 63/64 lane bi phi. Bit-exact vi
+      // inv_sqrt_d is folded in here rather than multiplied into each score after the __shfl,
+      // where the value is wave-uniform so 63 of 64 lanes are wasted. Bit-exact because
       // head_dim == 64 -> inv_sqrt_d = 2^-3.
       q_values[i][j] =
         f32_to_bf16bits(
@@ -3682,8 +3744,8 @@ flash_attn_decode_even_layer_bf16_matrix_core_kernel(
       uint4 tmp_k = *reinterpret_cast<const uint4 *>(kptr);
       uint4 tmp_v = *reinterpret_cast<const uint4 *>(vptr);
 
-      // Mot ghi LDS 128-bit thay cho 8 ghi 16-bit: 8 short nay lien nhau tren
-      // truc thu hai va cot bat dau luon chia het 16 byte.
+      // One 128-bit LDS store instead of 8 16-bit stores: these 8 shorts are adjacent on the
+      // second axis and the starting column is always a multiple of 16 bytes.
       *reinterpret_cast<uint4 *>(&ks[loadKVIdx_y + offset][loadKVIdx_x * 8]) = tmp_k;
 
       *reinterpret_cast<uint4 *>(&vs[loadKVIdx_y + offset][loadKVIdx_x * 8]) = tmp_v;
@@ -3743,8 +3805,8 @@ flash_attn_decode_even_layer_bf16_matrix_core_kernel(
         }
       }
 
-      // Softmax truc tuyen theo TILE thay vi theo tung key. Voi moi i: mot lan
-      // rescale accumulator va 1 + MFMA_N lan exp, thay cho 4 rescale va 8 exp.
+      // Online softmax per TILE instead of per key. For each i: one accumulator rescale and
+      // 1 + MFMA_N exp calls, instead of 4 rescales and 8 exp calls.
       int nvalid = 0;
       #pragma unroll
       for (int j = 0; j < MFMA_N; ++j)
@@ -3757,8 +3819,8 @@ flash_attn_decode_even_layer_bf16_matrix_core_kernel(
           float m_tile = -INFINITY;
           #pragma unroll
           for (int j = 0; j < MFMA_N; ++j) {
-            // Hang ks ngoai pham vi bi zero-pad nen cho diem 0, ma exp(0) = 1
-            // se lam hong tong -> phai ep ve -INFINITY.
+            // Out-of-range ks rows are zero-padded and so score 0, and exp(0) = 1
+            // would corrupt the sum -> they have to be forced to -INFINITY.
             s[j] = (j < nvalid) ? (__shfl(acc[i], j)) : -INFINITY;
             m_tile = fmaxf(m_tile, s[j]);
           }
@@ -3790,8 +3852,8 @@ flash_attn_decode_even_layer_bf16_matrix_core_kernel(
         uint4 tmp_k = regK[i];
         uint4 tmp_v = regV[i];
 
-        // Mot ghi LDS 128-bit thay cho 8 ghi 16-bit: 8 short nay lien nhau tren
-        // truc thu hai va cot bat dau luon chia het 16 byte.
+        // One 128-bit LDS store instead of 8 16-bit stores: these 8 shorts are adjacent on the
+        // second axis and the starting column is always a multiple of 16 bytes.
         *reinterpret_cast<uint4 *>(&ks[loadKVIdx_y + offset][loadKVIdx_x * 8]) = tmp_k;
 
         *reinterpret_cast<uint4 *>(&vs[loadKVIdx_y + offset][loadKVIdx_x * 8]) = tmp_v;
@@ -3895,8 +3957,8 @@ flash_attn_decode_odd_layer_bf16_matrix_core_kernel(
   Afloat q_values[HEAD_DIM / (MFMA_BLOCK * MFMA_K)];
   for (int i = 0; i < HEAD_DIM / (MFMA_BLOCK * MFMA_K); ++i) {
     for (int j = 0; j < MFMA_K; ++j) {
-      // inv_sqrt_d gap vao day thay vi nhan vao tung diem so sau __shfl,
-      // noi gia tri dong nhat ca wave nen 63/64 lane bi phi. Bit-exact vi
+      // inv_sqrt_d is folded in here rather than multiplied into each score after the __shfl,
+      // where the value is wave-uniform so 63 of 64 lanes are wasted. Bit-exact because
       // head_dim == 64 -> inv_sqrt_d = 2^-3.
       q_values[i][j] =
         f32_to_bf16bits(
@@ -3923,8 +3985,8 @@ flash_attn_decode_odd_layer_bf16_matrix_core_kernel(
       uint4 tmp_k = *reinterpret_cast<const uint4 *>(kptr);
       uint4 tmp_v = *reinterpret_cast<const uint4 *>(vptr);
 
-      // Mot ghi LDS 128-bit thay cho 8 ghi 16-bit: 8 short nay lien nhau tren
-      // truc thu hai va cot bat dau luon chia het 16 byte.
+      // One 128-bit LDS store instead of 8 16-bit stores: these 8 shorts are adjacent on the
+      // second axis and the starting column is always a multiple of 16 bytes.
       *reinterpret_cast<uint4 *>(&ks[loadKVIdx_y + offset][loadKVIdx_x * 8]) = tmp_k;
 
       *reinterpret_cast<uint4 *>(&vs[loadKVIdx_y + offset][loadKVIdx_x * 8]) = tmp_v;
@@ -3984,8 +4046,8 @@ flash_attn_decode_odd_layer_bf16_matrix_core_kernel(
         }
       }
 
-      // Softmax truc tuyen theo TILE thay vi theo tung key. Voi moi i: mot lan
-      // rescale accumulator va 1 + MFMA_N lan exp, thay cho 4 rescale va 8 exp.
+      // Online softmax per TILE instead of per key. For each i: one accumulator rescale and
+      // 1 + MFMA_N exp calls, instead of 4 rescales and 8 exp calls.
       int nvalid = 0;
       #pragma unroll
       for (int j = 0; j < MFMA_N; ++j)
@@ -3998,8 +4060,8 @@ flash_attn_decode_odd_layer_bf16_matrix_core_kernel(
           float m_tile = -INFINITY;
           #pragma unroll
           for (int j = 0; j < MFMA_N; ++j) {
-            // Hang ks ngoai pham vi bi zero-pad nen cho diem 0, ma exp(0) = 1
-            // se lam hong tong -> phai ep ve -INFINITY.
+            // Out-of-range ks rows are zero-padded and so score 0, and exp(0) = 1
+            // would corrupt the sum -> they have to be forced to -INFINITY.
             s[j] = (j < nvalid) ? (__shfl(acc[i], j)) : -INFINITY;
             m_tile = fmaxf(m_tile, s[j]);
           }
@@ -4031,8 +4093,8 @@ flash_attn_decode_odd_layer_bf16_matrix_core_kernel(
         uint4 tmp_k = regK[i];
         uint4 tmp_v = regV[i];
 
-        // Mot ghi LDS 128-bit thay cho 8 ghi 16-bit: 8 short nay lien nhau tren
-        // truc thu hai va cot bat dau luon chia het 16 byte.
+        // One 128-bit LDS store instead of 8 16-bit stores: these 8 shorts are adjacent on the
+        // second axis and the starting column is always a multiple of 16 bytes.
         *reinterpret_cast<uint4 *>(&ks[loadKVIdx_y + offset][loadKVIdx_x * 8]) = tmp_k;
 
         *reinterpret_cast<uint4 *>(&vs[loadKVIdx_y + offset][loadKVIdx_x * 8]) = tmp_v;
@@ -4063,13 +4125,13 @@ flash_attn_decode_odd_layer_bf16_matrix_core_kernel(
 #ifndef FLASH_DECODE_TILE_T
 #define FLASH_DECODE_TILE_T 16
 #endif
-// 1 = kernel attention mfma 16x16x16 (xem chu thich o dinh nghia),
-// 0 = duong cu mfma 4x4x4. Giu ca hai de con A/B duoc.
+// 1 = the mfma 16x16x16 attention kernel (see the note at its definition),
+// 0 = the old mfma 4x4x4 path. Both are kept so they can still be A/B'd.
 #ifndef FLASH_MFMA16
 #define FLASH_MFMA16 1
 #endif
-// Bat rieng tung lop de chia doi loi: neu chi mot phia sai thi loi nam o
-// duong co mat na truot, khong phai o phep nhan.
+// Enable one layer at a time to bisect: if only one side is wrong, the fault is in
+// in the sliding-mask path, not in the multiply.
 #ifndef FLASH_MFMA16_EVEN
 #define FLASH_MFMA16_EVEN FLASH_MFMA16
 #endif
@@ -4078,10 +4140,10 @@ flash_attn_decode_odd_layer_bf16_matrix_core_kernel(
 #endif
 #if FLASH_MFMA16_EVEN || FLASH_MFMA16_ODD
 static_assert(FLASH_DECODE_TILE_T == 16,
-              "kernel mfma 16x16x16 buoc tile phai la 16");
+              "the mfma 16x16x16 kernel needs a tile step of 16");
 #endif
-// Ghi tb ra file de so so hoc giua hai ban kernel. Chi bat khi GETP_DUMP_ATTN=1
-// luc bien dich VA co bien moi truong GETP_DUMP_FILE luc chay.
+// Dump tb to a file to compare the arithmetic between the two kernel versions. Only under GETP_DUMP_ATTN=1
+// at compile time AND the GETP_DUMP_FILE environment variable at run time.
 #if GETP_DUMP_ATTN
 #include <cstdlib>
 static inline void getp_dump_attn(const float *tb, int batch_size,
@@ -4267,6 +4329,17 @@ static inline void getp_matmul_router_bf16(float *xout, float *x, __hip_bfloat16
 #ifndef MATMUL_ATTN_O_BLOCK_ROWS
 #define MATMUL_ATTN_O_BLOCK_ROWS 128
 #endif
+// The macro tile below is used only with GETP_ATTN_O_AUTO_TILE=0. By default the launcher picks
+// between BN 128 / WN 64 and BN 64 / WN 32 at run time, because no single tile suits both models:
+// the grid is (N/BN, BATCH_SIZE/BM) and the two models run different batch sizes. Measured, paired:
+//   120B (BATCH_SIZE 768):  BN 128 -> 64  +0,6 %    (138 workgroups -> 270)
+//   20B  (BATCH_SIZE 1536): BN 128 -> 64  -2,7 %    (276 workgroups -> 540)
+// At BN 128 the kernel runs at 3 waves/SIMD, i.e. 3 workgroups per CU, 312 slots on 104 CUs, so the
+// 120B fills 44 % of the machine and the 20B 88 %. The rule is to halve the tile when the wide one
+// would fill less than half the resident slots; see getp_matmul_attn_o_bf16_acc.
+#ifndef GETP_ATTN_O_AUTO_TILE
+#define GETP_ATTN_O_AUTO_TILE 1
+#endif
 #ifndef MATMUL_ATTN_O_BLOCK_COLS
 #define MATMUL_ATTN_O_BLOCK_COLS 128
 #endif
@@ -4280,40 +4353,40 @@ static inline void getp_matmul_router_bf16(float *xout, float *x, __hip_bfloat16
 #define MATMUL_ATTN_O_WARP_TILE_N 64
 #endif
 #ifndef MATMUL_ATTN_O_WAVES_PER_BLOCK
-// Suy tu tile: than kernel dung TILE_N = 64 * (BM/WM)*(BN/WN) thread.
-// Ghi de bang -D chi duoc phep neu van bang bieu thuc nay (co static_assert).
+// Derived from the tile: the kernel body uses TILE_N = 64 * (BM/WM)*(BN/WN) threads.
+// Overriding with -D is only allowed if it still equals this expression (there is a static_assert).
 #define MATMUL_ATTN_O_WAVES_PER_BLOCK (((MATMUL_ATTN_O_BLOCK_ROWS) / (MATMUL_ATTN_O_WARP_TILE_M)) * ((MATMUL_ATTN_O_BLOCK_COLS) / (MATMUL_ATTN_O_WARP_TILE_N)))
 #endif
 
 // ===========================================================================
-// LDS cua attn_o: tu k-major [BK][BM+GETP_LDS_PAD] sang layout O (slot) 8 byte.
+// attn_o LDS: from k-major [BK][BM+GETP_LDS_PAD] to the 8-byte SLOT layout.
 //
-//   O (k0, row) chua 4 short k = 4*k0 .. 4*k0+3 cua CUNG mot hang.
-//   * Mot manh MFMA (A[i][k] hoac B[k][j]) = dung 4 short k lien tiep cua mot
-//     hang  ->  MOT ds_read_b64 thay cho BON ds_read_u16.
-//   * Mot uint4 nap tu HBM = 8 short k lien tiep = hai o  ->  HAI ds_write_b64
-//     thay cho TAM ds_write_b16.
+//   Slot (k0, row) holds the 4 shorts k = 4*k0 .. 4*k0+3 of the SAME row.
+//   * One MFMA fragment (A[i][k] or B[k][j]) = exactly 4 consecutive k shorts of one
+//     row  ->  ONE ds_read_b64 instead of FOUR ds_read_u16.
+//   * One uint4 loaded from HBM = 8 consecutive k shorts = two slots  ->  TWO ds_write_b64
+//     instead of EIGHT ds_write_b16.
 //
-// Bank (32 bank x 4 byte = 128 byte/chu ky; b64 phuc vu theo pha 16 lane, moi
-// lane chiem MOT cap bank chan/le, khong xung dot <=> 16 lane phu kin 16 cap):
+// Bank (32 banks x 4 bytes = 128 bytes/cycle; b64 is served in 16-lane phases, each
+// lane taking ONE even/odd bank pair, conflict-free <=> the 16 lanes cover all 16 pairs):
 //
-//   DOC   16 lane cua mot pha co cung k0 (k0 chi phu thuoc lane>>4) va 16 hang
-//         lien tiep (Ai = Bj = lane&15):
-//             byte = C + 8*(lane&15)  ->  128 byte lien tuc  ->  32 bank, moi
-//         bank dung mot lan. DUNG VOI MOI PADS - doc khong rang buoc pad.
+//   READ   the 16 lanes of one phase share k0 (k0 depends only on lane>>4) and take 16 rows
+//         consecutive (Ai = Bj = lane&15):
+//             byte = C + 8*(lane&15)  ->  128 contiguous bytes  ->  32 banks, each
+//          each bank used once. TRUE FOR EVERY PADS - the read puts no constraint on the pad.
 //
-//   GHI   16 lane cua mot pha co a = lane % NKC (chunk k, truc nhanh loader) va
-//         b = lane / NKC (hang), NKC = BK/8. O dich la k0 = 2a (va 2a+1), nen
-//             dword = 2*(k0*S + row),  S = BM + PADS (hoac BN + PADS)
+//   WRITE  the 16 lanes of one phase have a = lane % NKC (k chunk, the loader's fast axis) and
+//          b = lane / NKC (row), NKC = BK/8. The destination slot is k0 = 2a (and 2a+1), so
+//             dword = 2*(k0*S + row),  S = BM + PADS (or BN + PADS)
 //             bank  = (4*S*a + 2*b) mod 32.
-//         Pad phai lam 16 lane phu kin 16 bank chan:
+//         The pad has to make the 16 lanes cover the 16 even banks:
 //             BK=16 (NKC=2): 4S == 16 (mod 32) -> S == 4 (mod 8) -> PADS 4, 12
 //             BK=32 (NKC=4): 4S == 8 hay 24    -> S == 2 hay 6   -> PADS 2, 6, 10, 14
 //             BK=64 (NKC=8): 4S == 4,12,20,28  -> S le           -> PADS 1, 3, 5, 7
-//         KHONG co hang so dung cho moi BK, nen PADS phai TU SUY theo BK
-//         (mac dinh cua kernel nay la BK=16, co thang la BK=32, sweep co BK=64).
+//          there is NO constant that works for every BK, so PADS has to be DERIVED from BK
+//          (this kernel defaults to BK=16, the winning config is BK=32, sweeps use BK=64).
 //
-// Kich thuoc LDS KHONG tang: BK*(BM+BN+2*PADS)*2 byte, bang hoac nho hon ban cu
+// The LDS size does NOT grow: BK*(BM+BN+2*PADS)*2 bytes, equal to or smaller than the old
 // BK*(BM+BN+2*GETP_LDS_PAD)*2 vi PADS <= 4.
 //     BK=16 PADS=4:  8448 B  (cu  8448 B)
 //     BK=32 PADS=2: 16640 B  (cu 16896 B)
@@ -4323,19 +4396,19 @@ constexpr bool attn_o_lds_write_conflict_free(int S, int NKC) {
   if (NKC <= 0 || NKC > 16 || 16 % NKC != 0) return false;
   int seen = 0;
   for (int l = 0; l < 16; ++l) {
-    const int a = l % NKC;                 // chunk k cua loader
-    const int b = l / NKC;                 // hang trong pha
+    const int a = l % NKC;                 // loader k chunk
+    const int b = l / NKC;                 // row within the phase
     int bank = (4 * S * a + 2 * b) % 32;
     if (bank < 0) bank += 32;
-    if (bank & 1) return false;            // o phai can le 8 byte
+    if (bank & 1) return false;            // a slot must be 8-byte aligned
     const int bit = 1 << (bank >> 1);
-    if (seen & bit) return false;          // hai lane cung cap bank
+    if (seen & bit) return false;          // two lanes on the same bank pair
     seen |= bit;
   }
-  return seen == 0xFFFF;                   // phu kin 16 cap bank
+  return seen == 0xFFFF;                   // covers all 16 bank pairs
 }
 
-// PADS nho nhat hop le cho CA HAI tile (X dung S = BM+PADS, W dung S = BN+PADS).
+// The smallest valid PADS for BOTH tiles (X uses S = BM+PADS, W uses S = BN+PADS).
 constexpr int attn_o_lds_pad_slots(int BM_, int BN_, int NKC) {
   for (int p = 0; p < 16; ++p)
     if (attn_o_lds_write_conflict_free(BM_ + p, NKC) &&
@@ -4344,28 +4417,28 @@ constexpr int attn_o_lds_pad_slots(int BM_, int BN_, int NKC) {
   return -1;
 }
 
-// Pad RIENG cua attn_o - KHONG dung chung GETP_LDS_PAD (macro do van thuoc ve
-// qkv:1392-1393 va logits:3656-3657). Hai macro dem hai thu khac nhau:
-//   GETP_LDS_PAD                : so SHORT dem tren truc HANG cua mot mat k;
-//                                 nhan gia tri tuy y, chi doi hieu nang
+// attn_o's OWN pad - NOT shared with GETP_LDS_PAD (that macro still belongs to
+// qkv:1392-1393 and logits:3656-3657). The two macros count two different things:
+//   GETP_LDS_PAD                : a count of SHORTS along the ROW axis of one k plane;
+//                                 any value is valid, it only changes performance;
 //                                 (autotune.sh:38-40 va run2.sh:35-37 quet
 //                                 2 / 8 / 16).
-//   MATMUL_ATTN_O_LDS_PAD_SLOTS : so O 8-BYTE dem tren truc hang cua mot mat o;
-//                                 co rang buoc CUNG theo BK (bang tren). Dua
-//                                 2 / 8 / 16 vao day se hoac loi bien dich hoac
-//                                 thanh xung dot ghi 2 chieu bi do nham la nhieu.
-// -1 = tu suy theo (BM, BN, BK). Chi dat tay khi muon quet 6/10/14 o BK=32.
+//   MATMUL_ATTN_O_LDS_PAD_SLOTS : a count of 8-BYTE SLOTS along the row axis of one slot plane;
+//                                 constrained, and the constraint depends on BK (table above).
+//                                 Putting 2 / 8 / 16 here either fails to compile or turns into
+//                                 a two-dimensional write conflict that reads as measurement noise.
+// -1 = derive from (BM, BN, BK). Only set it by hand to sweep 6/10/14 at BK=32.
 #ifndef MATMUL_ATTN_O_LDS_PAD_SLOTS
 #define MATMUL_ATTN_O_LDS_PAD_SLOTS (-1)
 #endif
 
-// Gop hai dword lien tiep cua uint4 thanh mot o 4 x bf16. Thuan tuy doi kieu:
-// hai VGPR da nam dung cho (ket qua global_load_dwordx4) nen KHONG sinh lenh
-// VALU nao - khac han 4 lenh trich nua-word (& 0xFFFF / >> 16) cua ban cu.
-// __builtin_bit_cast thay cho union punning: cung codegen, dung chuan.
+// Pack two consecutive dwords of a uint4 into one slot of 4 x bf16. A pure retype:
+// both VGPRs are already in place (the result of global_load_dwordx4), so it emits NO
+// VALU instruction - unlike the old version's 4 half-word extracts (& 0xFFFF / >> 16).
+// __builtin_bit_cast rather than union punning: same codegen, standard spelling.
 __device__ __forceinline__ bf16x4 attn_o_pack2(unsigned int lo, unsigned int hi) {
   struct Pair { unsigned int a, b; };
-  static_assert(sizeof(Pair) == sizeof(bf16x4), "pack2: kich thuoc lech");
+  static_assert(sizeof(Pair) == sizeof(bf16x4), "pack2: size mismatch");
   Pair p; p.a = lo; p.b = hi;
   return __builtin_bit_cast(bf16x4, p);
 }
@@ -4398,14 +4471,14 @@ matmul_attn_o_bf16_kernel_tuned(
 
   const int waveIdx = threadIdx.x >> 6;
   const int laneIdx = threadIdx.x & 63;
-  // SUA LOI TIEM AN (cung lop voi forward.hip:1371-1372 cua qkv): xInBlockTile
-  // chay tren truc N nen phai chia theo BN/WN; yInBlockTile chay tren truc M nen
-  // la thuong cua cung mau so do. Ban cu dung (BM/WM) cho ca hai - vo hai khi
-  // BM/WM == BN/WN (moi cau hinh dang chay, ke ca -DMATMUL_ATTN_O_BLOCK_DEPTH=32)
-  // nhung SAI voi attno_cfg.txt dong 5 (bm256) va dong 8 (bk32_bm256): BM/WM=4,
-  // BN/WN=2 -> xInBlockTile toi 3 -> col = 3*64+63 = 255 >= BN=128, doc ngoai
-  // tile W va ghi sai cot, dong thoi chi mot nua so hang duoc tinh. Hai dong nay
-  // sinh MA Y HET ban cu o moi cau hinh co BM/WM == BN/WN.
+  // LATENT BUG FIXED (the same class as forward.hip:1371-1372 in qkv): xInBlockTile runs along
+  // the N axis so it must divide by BN/WN; yInBlockTile runs along the M axis so it is the
+  // quotient by the same denominator. The old code used (BM/WM) for both - harmless when
+  // BM/WM == BN/WN (every configuration in use, including -DMATMUL_ATTN_O_BLOCK_DEPTH=32)
+  // but WRONG for attno_cfg.txt line 5 (bm256) and line 8 (bk32_bm256): there BM/WM=4,
+  // BN/WN=2 -> xInBlockTile reaches 3 -> col = 3*64+63 = 255 >= BN=128, a read outside
+  // tile W and writes the wrong column, and only half the rows get computed. These two lines
+  // generate IDENTICAL CODE to the old version for every configuration with BM/WM == BN/WN.
   const int xInBlockTile = waveIdx % (BN / WN);
   const int yInBlockTile = waveIdx / (BN / WN);
 
@@ -4420,40 +4493,40 @@ matmul_attn_o_bf16_kernel_tuned(
   constexpr int nbLoadsW = BN * (BK / 8) / THREADS;
   const int loadWIdx_y = threadIdx.x / (BK / 8);
   const int loadWIdx_x = threadIdx.x % (BK / 8);
-  const int loadW_k0   = 2 * loadWIdx_x;      // o dau cua uint4 trong tile W
+  const int loadW_k0   = 2 * loadWIdx_x;      // slot at the start of the uint4 within tile W
   constexpr int strideW = THREADS / (BK / 8);
-  // Da xoa nbLoadsX / loadXIdx_x / loadXIdx_y / strideX: chung KHONG BAO GIO
-  // duoc dung (duong nap X di qua bo bien *_x8 ben duoi). Giu lai chung dung la
-  // lop "stride cu song sot qua mot lan sua".
+  // Removed nbLoadsX / loadXIdx_x / loadXIdx_y / strideX: they were NEVER
+  // used (the X load path goes through the *_x8 variables below). Keeping them is exactly the
+  // 'an old stride survives an edit' class of bug.
 
   constexpr int KP   = 4;             // short / o = 8 byte = 1 ds_read_b64
   constexpr int KSL  = BK / KP;       // so mat o (k0)
-  constexpr int NKC  = BK / 8;        // so chunk k cua loader (uint4 = 8 short)
+  constexpr int NKC  = BK / 8;        // number of loader k chunks (uint4 = 8 shorts)
   constexpr int PADS = (MATMUL_ATTN_O_LDS_PAD_SLOTS >= 0)
                          ? MATMUL_ATTN_O_LDS_PAD_SLOTS
                          : attn_o_lds_pad_slots(BM, BN, NKC);
-  static_assert(BK % 8 == 0, "loader nap uint4 = 8 short theo truc k");
-  static_assert(BK % KP == 0, "BK phai chia het cho KP = 4");
+  static_assert(BK % 8 == 0, "the loader loads a uint4 = 8 shorts along k");
+  static_assert(BK % KP == 0, "BK must be a multiple of KP = 4");
   static_assert(PADS >= 0,
-                "khong tim duoc PADS nao lam ds_write_b64 het xung dot bank; "
-                "xem attn_o_lds_pad_slots()");
+                "no PADS value makes ds_write_b64 free of bank conflicts; "
+                "see attn_o_lds_pad_slots()");
   static_assert(attn_o_lds_write_conflict_free(BM + PADS, NKC),
-                "MATMUL_ATTN_O_LDS_PAD_SLOTS sai: ds_write_b64 tile X xung dot "
+                "MATMUL_ATTN_O_LDS_PAD_SLOTS is wrong: ds_write_b64 conflict on tile X "
                 "bank (BK=16 -> 4, BK=32 -> 2, BK=64 -> 1)");
   static_assert(attn_o_lds_write_conflict_free(BN + PADS, NKC),
-                "MATMUL_ATTN_O_LDS_PAD_SLOTS sai: ds_write_b64 tile W xung dot "
+                "MATMUL_ATTN_O_LDS_PAD_SLOTS is wrong: ds_write_b64 conflict on tile W "
                 "bank (BK=16 -> 4, BK=32 -> 2, BK=64 -> 1)");
   static_assert(sizeof(bf16x4) == 8 && sizeof(Afloat) == 8 &&
-                sizeof(Bfloat) == 8, "manh MFMA phai la 8 byte");
+                sizeof(Bfloat) == 8, "an MFMA fragment must be 8 bytes");
 
-  // Ten moi (xsT/wsT) co chu dich: moi vi tri xs[..][..] chua doi se la LOI BIEN
-  // DICH chu khong phai mot dia chi sai im lang.
-  // Kieu phan tu la bf16x4 (alignment 8) nen MOI truy cap la mot ds_read_b64 /
-  // ds_write_b64 - khong can reinterpret_cast o bat ky cho nao. __align__(16)
-  // bao dam goc mang: mang __shared__ kieu unsigned short chi duoc canh 2 byte.
+  // The new names (xsT/wsT) are deliberate: any remaining xs[..][..] site becomes a COMPILE
+  // ERROR rather than a silently wrong address.
+  // The element type is bf16x4 (alignment 8), so EVERY access is one ds_read_b64 /
+  // ds_write_b64 - no reinterpret_cast needed anywhere. __align__(16)
+  // guarantees the array base: a __shared__ unsigned short array is only 2-byte aligned.
   __shared__ __align__(16) bf16x4 xsT[KSL][BM + PADS];
   __shared__ __align__(16) bf16x4 wsT[KSL][BN + PADS];
-  static_assert(sizeof(xsT) + sizeof(wsT) <= 64 * 1024, "LDS > 64 KB moi CU");
+  static_assert(sizeof(xsT) + sizeof(wsT) <= 64 * 1024, "LDS > 64 KB per CU");
 
   CDfloat acc_local[nIterWaveM * nIterWaveN] = {0};
 
@@ -4461,17 +4534,17 @@ matmul_attn_o_bf16_kernel_tuned(
   constexpr int X_LOAD_VEC = 8;
   const int loadX_x8 = threadIdx.x % (BK / X_LOAD_VEC);
   const int loadX_y8 = threadIdx.x / (BK / X_LOAD_VEC);
-  const int loadX_k0 = 2 * loadX_x8;          // o dau cua uint4 trong tile X
+  const int loadX_k0 = 2 * loadX_x8;          // slot at the start of the uint4 within tile X
   constexpr int strideX8 = THREADS / (BK / X_LOAD_VEC);
   constexpr int nbLoadsX8 = BM * (BK / X_LOAD_VEC) / THREADS;
-  // Loader phai phu kin tile. Khong co hai assert nay thi wm32/wn32 o BK=16 cho
-  // nbLoadsX8 = 128*2/512 = 0, va bm256 o BK=16 cho nbLoadsW = 128*2/512 = 0:
-  // tile khong duoc nap va ket qua sai IM LANG (va nhanh hon). Ba dong cau hinh
-  // do trong attno_cfg.txt phai di kem -DMATMUL_ATTN_O_BLOCK_DEPTH=32 tro len.
+  // The loader has to cover the tile. Without these two asserts, wm32/wn32 at BK=16 leaves part
+  // nbLoadsX8 = 128*2/512 = 0, and bm256 at BK=16 gives nbLoadsW = 128*2/512 = 0:
+  // of the tile unloaded and the result is SILENTLY wrong (and faster). Three config lines
+  // in attno_cfg.txt must be paired with -DMATMUL_ATTN_O_BLOCK_DEPTH=32 or higher.
   static_assert(nbLoadsX8 >= 1 && (BM * (BK / X_LOAD_VEC)) % THREADS == 0,
-                "loader X khong phu kin tile: BM*(BK/8) phai chia het THREADS");
+                "loader X does not cover the tile: BM*(BK/8) must be a multiple of THREADS");
   static_assert(nbLoadsW >= 1 && (BN * (BK / 8)) % THREADS == 0,
-                "loader W khong phu kin tile: BN*(BK/8) phai chia het THREADS");
+                "loader W does not cover the tile: BN*(BK/8) must be a multiple of THREADS");
 
   #pragma unroll
   for (int i = 0; i < nbLoadsX8; ++i) {
@@ -4486,9 +4559,9 @@ matmul_attn_o_bf16_kernel_tuned(
       const uint4* p = reinterpret_cast<const uint4*>(x + (size_t)rg * K + kk);
       const uint4 v = *p;
 
-      // 8 short k lien tiep = hai o -> hai ds_write_b64 (truoc: 8 ds_write_b16).
-      // Thu tu nua-word giu NGUYEN: v.x thap = k+0, v.x cao = k+1, v.y thap =
-      // k+2, ... -> cung anh byte -> bit-exact.
+      // 8 consecutive k shorts = two slots -> two ds_write_b64 (was: 8 ds_write_b16).
+      // The half-word order is kept EXACTLY: v.x low = k+0, v.x high = k+1, v.y low =
+      // k+2, ... -> the same byte image -> bit-exact.
       xsT[loadX_k0 + 0][row_tile] = attn_o_pack2(v.x, v.y);
       xsT[loadX_k0 + 1][row_tile] = attn_o_pack2(v.z, v.w);
     } else {
@@ -4560,23 +4633,23 @@ matmul_attn_o_bf16_kernel_tuned(
     // MFMA compute loop - fully unrolled for maximum ILP
     #pragma unroll
     for (int k = 0; k < BK; k += MFMA_K) {
-      // base_k = k + Ak la boi cua 4 (k boi cua 16, Ak = 4*(lane>>4)) nen ca 4
-      // short k nam GON trong mot o -> chi so o = base_k >> 2. Chi so giu 32-bit:
-      // dia chi LDS la 32-bit, khong dua (size_t) vao vong nong.
+      // base_k = k + Ak is a multiple of 4 (k a multiple of 16, Ak = 4*(lane>>4)), so all 4
+      // k shorts fit INSIDE one slot -> slot index = base_k >> 2. The index stays 32-bit:
+      // LDS addresses are 32-bit, so no (size_t) goes into the hot loop.
       const int ak0 = (k + Ak) >> 2;
       const int bk0 = (k + Bk) >> 2;
 
       #pragma unroll
       for (int im = 0; im < nIterWaveM; ++im) {
         const int row = yInBlockTile * WM + MFMA_M * im + Ai;
-        // MOT ds_read_b64 (truoc: 4 ds_read_u16 buoc BM+GETP_LDS_PAD).
+        // ONE ds_read_b64 (was: 4 ds_read_u16 with stride BM+GETP_LDS_PAD).
         const Afloat av = xsT[ak0][row];
 
         #pragma unroll
         for (int in = 0; in < nIterWaveN; ++in) {
           const int col = xInBlockTile * WN + MFMA_N * in + Bj;
 
-          // MOT ds_read_b64 (truoc: 4 ds_read_u16 buoc BN+GETP_LDS_PAD).
+          // ONE ds_read_b64 (was: 4 ds_read_u16 with stride BN+GETP_LDS_PAD).
           const Bfloat bv = wsT[bk0][col];
 
           const int idx = im * nIterWaveN + in;
@@ -4627,10 +4700,10 @@ matmul_attn_o_bf16_kernel_tuned(
         if (gx < N && gy < M) {
           float v = acc_local[acc_index][i];
           if (b) v += __bfloat162float(b[gx]);
-          // ACC: cong thang vao dong du (dev_x) thay vi ghi ra tb2 roi de
-          // vecadd doc lai. Moi o (gy,gx) do DUNG MOT thread sinh ra - khong
-          // co split-k trong kernel nay - nen doc-sua-ghi la an toan, khong
-          // can atomic. Bit-exact: v la dung so fp32 ma tb2 se chua.
+          // ACC: add straight into the residual (dev_x) instead of writing tb2 for vecadd to
+          // read back. Every cell (gy,gx) is produced by EXACTLY ONE thread - there is no
+          // split-k in this kernel - so read-modify-write is safe without an atomic.
+          // Bit-exact: v is exactly the fp32 value tb2 would have held.
           if constexpr (ACC) xout[(size_t)gy * N + gx] += v;
           else               xout[(size_t)gy * N + gx]  = v;
         }
@@ -4653,10 +4726,9 @@ static inline void getp_matmul_attn_o_bf16(
   constexpr int WN = MATMUL_ATTN_O_WARP_TILE_N;
   constexpr int WARPS = MATMUL_ATTN_O_WAVES_PER_BLOCK;
 
-  // Ghi chu __launch_bounds__: doi so THU HAI cua HIP la SO WAVE TOI THIEU MOI
-  // SIMD, khong phai so block moi CU. Kernel nay chi truyen mot doi so (THREADS)
-  // nen khong bi anh huong; neu ai do them doi so thu hai thi so workgroup duoc
-  // hua la 4*CTA/WARPS chu khong phai CTA.
+  // Note on __launch_bounds__: HIP's SECOND argument is the MINIMUM NUMBER OF WAVES PER SIMD,
+  // not blocks per CU. This kernel passes only one argument (THREADS) so it is unaffected; if
+  // anyone adds a second argument, the promised workgroup count is 4*CTA/WARPS, not CTA.
   dim3 block(64 * WARPS);
   dim3 grid((N + BN - 1) / BN, (M + BM - 1) / BM);
 
@@ -4665,8 +4737,8 @@ static inline void getp_matmul_attn_o_bf16(
 
 }
 
-// Nhu tren nhung CONG vao xout (dong du fp32) thay vi ghi de. Bo hoan toan
-// tensor tb2: mot lan ghi 17,7 MB va mot lan doc 17,7 MB moi lop.
+// As above but ADDS into xout (the fp32 residual) instead of overwriting. Removes the tb2
+// tensor entirely: one 17,7 MB write and one 17,7 MB read per layer.
 static inline void getp_matmul_attn_o_bf16_acc(
     float *x_resid, const __hip_bfloat16 *x_bf16,
     const __hip_bfloat16 *w, const __hip_bfloat16 *b,
@@ -4675,9 +4747,40 @@ static inline void getp_matmul_attn_o_bf16_acc(
   const int M = batch_size, N = d, K = n;
 
   constexpr int BM = MATMUL_ATTN_O_BLOCK_ROWS;
-  constexpr int BN = MATMUL_ATTN_O_BLOCK_COLS;
   constexpr int BK = MATMUL_ATTN_O_BLOCK_DEPTH;
   constexpr int WM = MATMUL_ATTN_O_WARP_TILE_M;
+#if GETP_ATTN_O_AUTO_TILE
+  // Wide = BN 128 / WN 64, narrow = BN 64 / WN 32; both are 4 waves = 256 threads.
+  constexpr int BNW = 128, WNW = 64, WARPSW = (BM / WM) * (BNW / WNW);
+  constexpr int BNN = 64, WNN = 32, WARPSN = (BM / WM) * (BNN / WNN);
+  static_assert(WARPSW == WARPSN, "both tiles must keep the same block size");
+  // Resident workgroup slots for the WIDE kernel, asked of the runtime once per thread (one
+  // thread per device) rather than hard-wired, so the rule survives a tile or GPU change.
+  static thread_local int slots = 0;
+  if (slots == 0) {
+    int dev = 0, per_cu = 0;
+    HIP_CHECK(hipGetDevice(&dev));
+    hipDeviceProp_t prop;
+    HIP_CHECK(hipGetDeviceProperties(&prop, dev));
+    HIP_CHECK(hipOccupancyMaxActiveBlocksPerMultiprocessor(
+        &per_cu, matmul_attn_o_bf16_kernel_tuned<BM, BNW, BK, WM, WNW, WARPSW, true>,
+        64 * WARPSW, 0));
+    slots = (per_cu > 0 ? per_cu : 1) * prop.multiProcessorCount;
+  }
+  const int rows = (M + BM - 1) / BM;
+  const int wide = ((N + BNW - 1) / BNW) * rows;
+  if (2 * wide < slots) {
+    // Less than half the machine: twice as many, half-width workgroups keep more CUs busy.
+    matmul_attn_o_bf16_kernel_tuned<BM, BNN, BK, WM, WNN, WARPSN, true>
+        <<<dim3((N + BNN - 1) / BNN, rows), dim3(64 * WARPSN), 0, stream>>>(
+            x_resid, x_bf16, w, b, M, N, K);
+  } else {
+    matmul_attn_o_bf16_kernel_tuned<BM, BNW, BK, WM, WNW, WARPSW, true>
+        <<<dim3((N + BNW - 1) / BNW, rows), dim3(64 * WARPSW), 0, stream>>>(
+            x_resid, x_bf16, w, b, M, N, K);
+  }
+#else
+  constexpr int BN = MATMUL_ATTN_O_BLOCK_COLS;
   constexpr int WN = MATMUL_ATTN_O_WARP_TILE_N;
   constexpr int WARPS = MATMUL_ATTN_O_WAVES_PER_BLOCK;
 
@@ -4686,11 +4789,12 @@ static inline void getp_matmul_attn_o_bf16_acc(
 
   matmul_attn_o_bf16_kernel_tuned<BM,BN,BK,WM,WN,WARPS,true>
       <<<grid, block, 0, stream>>>(x_resid, x_bf16, w, b, M, N, K);
+#endif
 }
 
 
-// Anh xa float -> uint32 giu nguyen thu tu, de so sanh so thuc tro thanh so
-// sanh so nguyen khong dau: so khong am duoc dua len nua tren, so am bi lat het.
+// Map float -> uint32 preserving order, so a floating-point comparison becomes an
+// unsigned integer comparison: non-negative numbers move to the upper half, negatives are flipped.
 __device__ inline unsigned int order_preserving_bits(float v) {
   unsigned int b = __float_as_uint(v);
   return (b & 0x80000000u) ? ~b : (b | 0x80000000u);
@@ -4698,9 +4802,9 @@ __device__ inline unsigned int order_preserving_bits(float v) {
 __device__ inline float order_preserving_bits_inv(unsigned int k) {
   return __uint_as_float((k & 0x80000000u) ? (k & 0x7fffffffu) : ~k);
 }
-// Khoa don dieu theo (gia tri, -idx): gia tri lon thang, hoa thi idx NHO thang.
-// Nho vay argmax chi con la mot lenh atomicMax, khong con vong CAS va khong con
-// phu thuoc thu tu block den.
+// A monotone key on (value, -idx): a larger value wins, and on a tie the SMALLER idx wins.
+// That reduces the argmax to a single atomicMax - no CAS loop and no
+// dependence on block arrival order.
 __device__ inline unsigned long long pack_val_idx(float v, unsigned int idx) {
   return (static_cast<unsigned long long>(order_preserving_bits(v)) << 32) |
          static_cast<unsigned long long>(0xffffffffu - idx);
@@ -4723,11 +4827,11 @@ __device__ inline float atomicMaxFloat(float* addr, float val) {
   return oldf;
 }
 __device__ inline void atomic_update_max_pair(unsigned long long* addr, float v, unsigned int idx) {
-  // Truoc day day la mot vong CAS voi phep so sanh dung nguong TUONG DOI
-  // (1e-6 * max(|v|,|ov|)), tuc mot quan he KHONG BAC CAU: A ~ B va B ~ C khong
-  // suy ra A ~ C. Voi hang nghin block cot cung tranh mot o, ke thang phu thuoc
-  // thu tu den, va ket qua doi giua hai lan chay cung mot binary. Khoa don dieu
-  // o tren bien viec nay thanh mot atomicMax duy nhat, co thu tu toan phan chat.
+  // This used to be a CAS loop whose comparison used a RELATIVE tolerance
+  // (1e-6 * max(|v|,|ov|)), which is NOT a transitive relation: A ~ B and B ~ C do not
+  // imply A ~ C. With thousands of column blocks racing for one cell, the winner depended on
+  // arrival order, and the result changed between two runs of the same binary. The monotone key
+  // above turns this into a single atomicMax with a strict total order.
   atomicMax(addr, pack_val_idx(v, idx));
 }
 __global__ void init_argmax_pairs(unsigned long long* pairs, int B, int V) {
@@ -4739,23 +4843,23 @@ __global__ void extract_argmax_pairs(const unsigned long long* pairs, int* out, 
   if (i < B) out[i] = static_cast<int>(unpack_idx(pairs[i]));
 }
 
-// Swizzle theo nhom cho logits: G khoi HANG chay nhanh nhat trong moi nhom, de G block dung
-// chung mot tile trong so trong L2. G phai du nho de G tile X con vua L2 (xem lgswzg).
+// Group swizzle for the logits: G ROW blocks run fastest within each group, so that G blocks
+// share one weight tile in L2. G has to be small enough that G X tiles still fit L2 (see lgswzg).
 #ifndef GETP_LOGITS_SWZ
-#define GETP_LOGITS_SWZ 1   // mac dinh BAT; dat 0 de A/B
+#define GETP_LOGITS_SWZ 1   // on by default; set 0 to A/B
 #endif
 #ifndef GETP_LOGITS_SWZ_G
-// Tap X cua mot nhom la G x BM x K x (4 hay 2) byte, va G toi uu la cho no vua L2 8 MB.
-// Voi X fp32 (1,47 MB/tile) dinh o G=2; doi X sang bf16 (737 KB/tile) thi dinh doi sang G=6.
-//   X fp32:  G=2 20.783 | G=3 21.071 | G=4 21.455 | G=6 22.467   (doi chung 21.521)
+// A group's X working set is G x BM x K x (4 or 2) bytes, and the best G is the one that keeps
+// it inside the 8 MB L2. With fp32 X (1,47 MB/tile) the peak is at G=2; with bf16 X (737 KB/tile) it moves to G=6.
+//   X fp32:  G=2 20.783 | G=3 21.071 | G=4 21.455 | G=6 22.467   (control 21.521)
 //   X bf16:  G=0 18.125 | G=2 15.903 | G=3 15.487 | G=4 15.312 | G=6 15.178 | G=12 15.182
 #define GETP_LOGITS_SWZ_G 6
 #endif
 
-// Doi X cua logits sang bf16 mot lan moi buoc thay vi doc fp32 roi vut nua so bit trong
-// kernel. Xem dau file lgxbf16: no la dieu kien de swizzle nhom di xa hon.
+// Convert the logits' X to bf16 once per step instead of reading fp32 and throwing half the
+// bits away inside the kernel. See lgxbf16: it is what lets the group swizzle go further.
 #ifndef GETP_LOGITS_XBF16
-#define GETP_LOGITS_XBF16 1   // mac dinh BAT; dat 0 de A/B
+#define GETP_LOGITS_XBF16 1   // on by default; set 0 to A/B
 #endif
 
 #ifndef MATMUL_LOGITS_BLOCK_ROWS
@@ -4774,68 +4878,68 @@ __global__ void extract_argmax_pairs(const unsigned long long* pairs, int* out, 
 #define MATMUL_LOGITS_WARP_TILE_N 64
 #endif
 #ifndef MATMUL_LOGITS_WAVES_PER_BLOCK
-// Suy tu tile: than kernel dung TILE_N = 64 * (BM/WM)*(BN/WN) thread.
-// Ghi de bang -D chi duoc phep neu van bang bieu thuc nay (co static_assert).
+// Derived from the tile: the kernel body uses TILE_N = 64 * (BM/WM)*(BN/WN) threads.
+// Overriding with -D is only allowed if it still equals this expression (there is a static_assert).
 #define MATMUL_LOGITS_WAVES_PER_BLOCK (((MATMUL_LOGITS_BLOCK_ROWS) / (MATMUL_LOGITS_WARP_TILE_M)) * ((MATMUL_LOGITS_BLOCK_COLS) / (MATMUL_LOGITS_WARP_TILE_N)))
 #endif
 
 // ---------------------------------------------------------------------------
-// Hinh hoc LDS cua kernel logits (LM head).
+// LDS geometry of the logits kernel (LM head).
 //
-// Tile duoc xep theo [row][k] - k LIEN TIEP trong mot hang - nen "padding" o
-// day la pad cua MOT HANG k, KHONG phai pad cua mot mat k nhu GETP_LDS_PAD.
-// Hai dai luong nay cung ten nhung khac nghia, khac dieu kien hop le va khac
-// don vi, nen kernel nay phai co macro pad RIENG. GETP_LDS_PAD giu nguyen
-// nghia cu va van phuc vu hai kernel con lai o bo [k][row]: qkv (:1392-1393)
+// The tile is laid out as [row][k] - k CONSECUTIVE within a row - so 'padding' here pads ONE
+// k ROW, NOT a k plane the way GETP_LDS_PAD does.
+// The two quantities share a name but mean different things, have different validity conditions
+// and different units, so this kernel needs its OWN pad macro. GETP_LDS_PAD keeps its old
+// meaning and still serves the two remaining kernels on the [k][row] layout: qkv (:1392-1393)
 // va attn_o (:3324-3325).
 //
-//   Buoc mot hang  = (BK+PAD) short = 2*(BK+PAD) byte = (BK+PAD)/2 bank.
+//   Row stride = (BK+PAD) shorts = 2*(BK+PAD) bytes = (BK+PAD)/2 banks.
 //   Mot fragment MFMA = 4 short = 8 byte = 2 bank = 1 "double-bank".
-//   16 lane cua mot phase ds_read_b64 chuyen 16*8 = 128 byte = dung 32 bank.
-//   Trong mot phase, L/16 la HANG SO nen basek co dinh va row = row0 + (L&15)
-//   chay tren 16 hang lien tiep, tuc db(i) = (S*i + c) mod 16 voi S = (BK+PAD)/4.
-//   Trai het 32 bank <=> gcd(S,16) = 1 <=> S LE.
-//   BK boi 16 (static_assert san co) => BK/4 chan => S = BK/4 + PAD/4 le <=>
-//   PAD/4 le. Vay PAD = 4 dung cho MOI BK hop le (BK=16 -> S=5; 32 -> S=9;
-//   64 -> S=17) va la gia tri RE NHAT; 12/20/28 cung hop le nhung chi ton them
-//   LDS ma khong bot duoc mot xung dot nao.
+//   The 16 lanes of one ds_read_b64 phase move 16*8 = 128 bytes = exactly 32 banks.
+//   Within a phase, L/16 is CONSTANT so basek is fixed and row = row0 + (L&15)
+//   runs over 16 consecutive rows, i.e. db(i) = (S*i + c) mod 16 with S = (BK+PAD)/4.
+//   Spread over all 32 banks <=> gcd(S,16) = 1 <=> S ODD.
+//   BK a multiple of 16 (an existing static_assert) => BK/4 even => S = BK/4 + PAD/4 odd <=>
+//   PAD/4 odd. So PAD = 4 works for EVERY valid BK (BK=16 -> S=5; 32 -> S=9;
+//   64 -> S=17) and is the CHEAPEST value; 12/20/28 are also valid but only cost more
+//   LDS without removing a single conflict.
 //
-// Vi du BK=32 (co trong co build dang thang): KPAD = 36 short = 72 byte
-// = 18 bank = 9 double-bank. Bank DAU cua 16 lane trong mot phase (row0=0,
-// basek=0) la 18*i mod 32 = 18,4,22,8,26,12,30,16,2,20,6,24,10,28,14,0 - doi
-// mot khac nhau, moi lane chiem cap bank {b, b+1} -> phu dung 32 bank mot lan,
-// KHONG xung dot. Duong GHI van con xung dot 2-way va khong pad nao chua duoc:
-// ghi X can {0,S} + {0..7} phu Z16 => S = 8 (mod 16) => S CHAN; ghi W can
-// {0,S,2S,3S} = {a,a+8,b,b+8} => 2S = 8 (mod 16) => S CHAN; ca hai deu mau
-// thuan voi dieu kien DOC (S le). Da quet can PAD 0..64.
+// Example BK=32 (the flag in the winning build): KPAD = 36 shorts = 72 bytes
+// = 18 banks = 9 double-banks. The FIRST bank of the 16 lanes in a phase (row0=0,
+// basek=0) is 18*i mod 32 = 18,4,22,8,26,12,30,16,2,20,6,24,10,28,14,0 - pairwise
+// distinct, and each lane occupies the bank pair {b, b+1} -> covering all 32 banks exactly once,
+// with NO conflict. The WRITE path still has a 2-way conflict that no pad can fix:
+// writing X needs {0,S} + {0..7} to cover Z16 => S = 8 (mod 16) => S EVEN; writing W needs
+// {0,S,2S,3S} = {a,a+8,b,b+8} => 2S = 8 (mod 16) => S EVEN; both contradict
+// the READ condition (S odd). Every PAD in 0..64 was scanned exhaustively.
 #ifndef MATMUL_LOGITS_LDS_KPAD
 #define MATMUL_LOGITS_LDS_KPAD 4
 #endif
 
-// Epilogue argmax gom trong thanh ghi truoc khi cham LDS (xem dau file logitsx.py).
-// 0 = duong cu, bit-identical. Bat bang -DGETP_LOGITS_EPI=1.
+// The argmax epilogue reduces in registers before touching LDS (see the head of logitsx.py).
+// 0 = the old path, bit-identical. Enable with -DGETP_LOGITS_EPI=1.
 #ifndef GETP_LOGITS_EPI
-#define GETP_LOGITS_EPI 1   // mac dinh BAT (do e2e: -0,35 ms/buoc); dat 0 de A/B
+#define GETP_LOGITS_EPI 1   // on by default (measured end to end: -0,35 ms/step); set 0 to A/B
 #endif
 
-// Mot nguon su that duy nhat cho hinh hoc tile logits.
+// A single source of truth for the logits tile geometry.
 constexpr int logits_lds_kpad(int BK, int PAD) { return BK + PAD; }
 constexpr size_t logits_lds_shorts(int BM, int BN, int BK, int PAD) {
   // xsT[BM][KPAD] + wsT[BN][KPAD]
   return (size_t)(BM + BN) * (size_t)logits_lds_kpad(BK, PAD);
 }
 
-// 8 bf16 lien tiep theo k (mot uint4 tu HBM) -> 2 x ds_write_b64.
-// Sao chep NGUYEN dword: trong mot dword, nua thap la k+0 va nua cao la k+1,
-// dung y het ban cu, nen ket qua bit-exact VA khong ton mot lenh VALU nao
-// (khong con & 0xFFFF / >> 16). Cung khuon mau voi put16 cua flash attn (:2418).
+// 8 consecutive bf16 along k (one uint4 from HBM) -> 2 x ds_write_b64.
+// Copy the dword VERBATIM: within a dword the low half is k+0 and the high half is k+1,
+// exactly as before, so the result is bit-exact AND it costs no VALU instruction at all
+// (no more & 0xFFFF / >> 16). The same pattern as flash attn's put16 (:2418).
 __device__ __forceinline__ void logits_lds_store8(unsigned short* dst, const uint4 v) {
   *reinterpret_cast<uint2*>(dst + 0) = make_uint2(v.x, v.y);
   *reinterpret_cast<uint2*>(dst + 4) = make_uint2(v.z, v.w);
 }
 
-// 4 float -> 4 bf16 lien tiep theo k -> 1 x ds_write_b64. f32_to_bf16bits duoc
-// goi tren dung nhung gia tri cu, theo dung thu tu cu; chi dia chi LDS doi.
+// 4 floats -> 4 bf16 consecutive along k -> 1 x ds_write_b64. f32_to_bf16bits still
+// sees the same values in the same order; only the LDS address changes.
 __device__ __forceinline__ void logits_lds_store4(unsigned short* dst, const float4 v) {
   const bf16x4 p = { f32_to_bf16bits(v.x), f32_to_bf16bits(v.y),
                      f32_to_bf16bits(v.z), f32_to_bf16bits(v.w) };
@@ -4843,7 +4947,7 @@ __device__ __forceinline__ void logits_lds_store4(unsigned short* dst, const flo
 }
 
 #if GETP_LOGITS_XBF16
-// 4 fp32 -> 4 bf16 lien tiep. Cung ham chuyen doi ma kernel logits van goi, nen tung bit trung.
+// 4 fp32 -> 4 consecutive bf16. The same conversion helper the logits kernel still calls, so the bits match.
 __global__ void logits_x_to_bf16_kernel(bf16x4* __restrict__ out,
                                         const float4* __restrict__ in, size_t n4) {
   const size_t i = (size_t)blockIdx.x * blockDim.x + threadIdx.x;
@@ -4853,7 +4957,7 @@ __global__ void logits_x_to_bf16_kernel(bf16x4* __restrict__ out,
                      f32_to_bf16bits(v.z), f32_to_bf16bits(v.w) };
   out[i] = p;
 }
-// 4 bf16 = 8 byte = dung mot ds_write_b64, y het duong fp32 nhung khong ton lenh VALU nao.
+// 4 bf16 = 8 bytes = exactly one ds_write_b64, the same as the fp32 path but with no VALU instruction.
 __device__ __forceinline__ void logits_lds_storeX(unsigned short* dst, const uint2 v) {
   *reinterpret_cast<uint2*>(dst) = v;
 }
@@ -4871,32 +4975,33 @@ template<
   int WARPS_PER_BLOCK,
   int THREADS = 64 * WARPS_PER_BLOCK
 >
-// __launch_bounds__ chi truyen MOT doi so o day. Neu sau nay them doi so thu
-// hai thi luu y: trong HIP do la so wave TOI THIEU tren moi SIMD, khong phai
-// so block tren moi CU; so workgroup/CU tuong ung la 4*CTA/WARPS_PER_BLOCK.
+// __launch_bounds__ takes only ONE argument here. If a second is ever added, note that in HIP
+// it is the MINIMUM number of waves per SIMD, not blocks per CU; the corresponding
+// workgroups/CU figure is 4*CTA/WARPS_PER_BLOCK.
 __global__ void __launch_bounds__(THREADS)
 matmul_logits_argmax_bf16_kernel_tuned(
     const float* __restrict__ x,
-    const unsigned short* __restrict__ xb,   // ban bf16 cua x; chi dung khi GETP_LOGITS_XBF16
+    const unsigned short* __restrict__ xb,   // bf16 copy of x; only used under GETP_LOGITS_XBF16
     const __hip_bfloat16* __restrict__ w,
     int M, int N, int K,
     unsigned long long* __restrict__ pairs) {
 
-  // Anh xa block -> (khoi hang, khoi cot). Mac dinh giu nguyen thu tu cu.
+  // Map block -> (row block, column block). The default keeps the old order.
   const int nrow_blk = (M + BM - 1) / BM;
 #if GETP_LOGITS_SWZ
-  // Luoi mot chieu, tach lai: trong moi nhom GZ khoi hang, khoi HANG chay nhanh nhat. GZ block
-  // ke nhau doc CUNG mot tile trong so nen no ve tu HBM mot lan roi nam trong L2 cho ca nhom.
+  // A one-dimensional grid, split again: within each group of GZ row blocks, the ROW block runs
+  // fastest. GZ adjacent blocks read the SAME weight tile, so it comes from HBM once and then
+  // stays in L2 for the whole group.
   constexpr int GZ = GETP_LOGITS_SWZ_G;
-  static_assert(GZ >= 1, "G phai duong");
+  static_assert(GZ >= 1, "G must be positive");
   const int ncol_blk = (N + BN - 1) / BN;
   const int perg = GZ * ncol_blk;
   const int gz = (int)blockIdx.x / perg;
   const int tz = (int)blockIdx.x - gz * perg;
   const int blk_row = gz * GZ + (tz % GZ);
   const int blk_col = tz / GZ;
-  // Khoi thua khi nrow_blk khong chia het GZ. blk_row dong deu trong block nen ca block cung
-  // thoat, va cho nay nam truoc moi __syncthreads.
+  // Leftover blocks when nrow_blk is not a multiple of GZ. blk_row is block-uniform so the whole
+  // block exits together, and this sits before any __syncthreads.
   if (blk_row >= nrow_blk) return;
 #else
   const int blk_row = (int)blockIdx.y;
@@ -4918,11 +5023,11 @@ matmul_logits_argmax_bf16_kernel_tuned(
 
   const int waveIdx = threadIdx.x >> 6;
   const int laneIdx = threadIdx.x & 63;
-  // Wave -> (tile COT, tile HANG). xInBlockTile danh chi so cot nen mau so phai
-  // la BN/WN. Ban cu chia BM/WM: bang nhau o cau hinh dang ship (2 == 2) nen
-  // thay doi nay BIT-EXACT, nhung sai im lang - va doc ngoai tile LDS - voi cac
-  // dong sweep bm256 / bn256 / wm32 / wn32 / bk32_wn32 trong logits_cfg.txt.
-  // Cung LOP LOI voi :1371-1372 cua qkv.
+  // Wave -> (COLUMN tile, ROW tile). xInBlockTile indexes columns so the denominator must be
+  // BN/WN. The old code divided by BM/WM: equal in the shipping configuration (2 == 2), so this
+  // change is BIT-EXACT, but it was silently wrong - and read outside the LDS tile - for other
+  // sweep lines bm256 / bn256 / wm32 / wn32 / bk32_wn32 in logits_cfg.txt.
+  // The same CLASS OF BUG as qkv's :1371-1372.
   constexpr int splitN = BN / WN;
   const int xInBlockTile = waveIdx % splitN;
   const int yInBlockTile = waveIdx / splitN;
@@ -4944,20 +5049,20 @@ matmul_logits_argmax_bf16_kernel_tuned(
   constexpr int strideX = THREADS / (BK / 4);
   constexpr int strideW = THREADS / (BK / 8);
 
-  // Tile LDS theo [row][k]: 4 phan tu k ma MOT lane can cho mfma nam lien tiep
-  // -> mot ds_read_b64 thay vi 4 ds_read_u16, va 8 short nap tu HBM thanh
-  // 2 ds_write_b64 thay vi 8 ds_write_b16. Doi ten xs/ws -> xsT/wsT co chu dich:
-  // moi cho con doc theo bo cu [k][row] se la LOI BIEN DICH, khong phai mot dia
-  // chi sai im lang. Chi so trong vong lap giu 32-bit (dia chi LDS la 32-bit).
+  // LDS tile as [row][k]: the 4 k elements ONE lane needs for an mfma are consecutive
+  // -> one ds_read_b64 instead of 4 ds_read_u16, and the 8 shorts loaded from HBM become
+  // 2 ds_write_b64 instead of 8 ds_write_b16. Renaming xs/ws -> xsT/wsT is deliberate:
+  // any site still reading the old [k][row] layout becomes a COMPILE ERROR, not a silently
+  // wrong address. Loop indices stay 32-bit (LDS addresses are 32-bit).
   constexpr int PAD  = MATMUL_LOGITS_LDS_KPAD;
   constexpr int KPAD = logits_lds_kpad(BK, PAD);
   static_assert(KPAD % 4 == 0,
-                "KPAD phai boi 4 short: ds_read_b64/ds_write_b64 can align 8 byte.");
+                "KPAD must be a multiple of 4 shorts: ds_read_b64/ds_write_b64 need 8-byte alignment.");
   static_assert((KPAD / 4) % 2 == 1,
-                "(BK+PAD)/4 phai LE thi 16 lane cua mot phase b64 moi trai het 32 bank.");
+                "(BK+PAD)/4 must be ODD for the 16 lanes of a b64 phase to spread over all 32 banks.");
   static_assert(logits_lds_shorts(BM, BN, BK, PAD) * sizeof(unsigned short)
                     + sizeof(float) * BM + sizeof(int) * BM <= 64 * 1024,
-                "Tile LDS + smax/sidx vuot 64 KB LDS moi CU.");
+                "The LDS tile + smax/sidx exceeds 64 KB of LDS per CU.");
 
   __shared__ __align__(16) unsigned short xsT[BM][KPAD];
   __shared__ __align__(16) unsigned short wsT[BN][KPAD];
@@ -4965,13 +5070,13 @@ matmul_logits_argmax_bf16_kernel_tuned(
   __shared__ int sidx[BM];
 
 #ifdef DEBUG_LDS_POISON
-  // Kiem launch: than kernel gia dinh dung THREADS thread.
+  // Launch check: the kernel body assumes exactly THREADS threads.
   if (blockDim.x != THREADS) {
     if (threadIdx.x == 0)
-      printf("BAD LAUNCH: blockDim=%d nhung THREADS=%d\n", (int)blockDim.x, (int)THREADS);
+      printf("BAD LAUNCH: blockDim=%d but THREADS=%d\n", (int)blockDim.x, (int)THREADS);
     return;
   }
-  // Do day tile bang bf16 qNaN: o nao loader khong ghi se thanh NaN.
+  // Fill the tile with bf16 qNaN: any slot the loader fails to write shows up as NaN.
   {
     unsigned short* raw = &xsT[0][0];
     for (int i = threadIdx.x; i < BM * KPAD; i += blockDim.x) raw[i] = 0x7FC0;
@@ -5003,8 +5108,8 @@ matmul_logits_argmax_bf16_kernel_tuned(
 #else
     float4 tmp = (kk < K && rg < M) ? *reinterpret_cast<const float4 *>(&x[(size_t)rg * K + kk]) : make_float4(0,0,0,0);
 #endif
-    // dia chi = 2*(ry*KPAD + 4*loadXIdx_x) byte: KPAD boi 4 va chunk boi 4
-    // => boi 8 => hop le cho ds_write_b64.
+    // address = 2*(ry*KPAD + 4*loadXIdx_x) bytes: KPAD a multiple of 4 and the chunk a multiple of 4
+    // => a multiple of 8 => valid for ds_write_b64.
     logits_lds_storeX(&xsT[ry][4 * loadXIdx_x], tmp);
   }
   for (int i = 0; i < nbLoadsW; ++i) {
@@ -5044,10 +5149,10 @@ matmul_logits_argmax_bf16_kernel_tuned(
         for (int in = 0; in < nIterWaveN; ++in) {
           const int row = yInBlockTile * WM + MFMA_M * im + Ai;
           const int col = xInBlockTile * WN + MFMA_N * in + Bj;
-          // Lane L can A[i = L%16][k = 4*(L/16)+r], r = 0..3: BON phan tu k lien
-          // tiep cua CUNG mot hang -> mot ds_read_b64 (dia chi boi 8 vi KPAD boi
-          // 4, k boi 16 va Ak/Bk boi 4). Afloat/Bfloat la vector 8 byte nen cast
-          // nay chinh la thu bao cho LLVM duoc phat mot lenh duy nhat.
+          // Lane L needs A[i = L%16][k = 4*(L/16)+r], r = 0..3: FOUR consecutive k elements
+          // of the SAME row -> one ds_read_b64 (the address is a multiple of 8 because KPAD is a
+          // multiple of 4, k of 16 and Ak/Bk of 4). Afloat/Bfloat are 8-byte vectors, so this
+          // cast is precisely what tells LLVM it may emit a single instruction.
           const Afloat av = *reinterpret_cast<const Afloat*>(&xsT[row][k + Ak]);
           const Bfloat bv = *reinterpret_cast<const Bfloat*>(&wsT[col][k + Bk]);
           CDfloat acc = acc_local[im * nIterWaveN + in];
@@ -5074,36 +5179,36 @@ matmul_logits_argmax_bf16_kernel_tuned(
   }
 
 #if GETP_LOGITS_EPI
-  // ---- Epilogue argmax: gom trong THANH GHI truoc khi cham vao LDS -----------------
+  // ---- argmax epilogue: reduce in REGISTERS before touching LDS -----------------
   //
-  // Hang cua mot phan tu acc,
+  // The row of an acc element,
   //     ly = WM*yInBlockTile + MFMA_M*im + 4*(laneIdx>>4) + i,
-  // KHONG phu thuoc `in` va KHONG phu thuoc (laneIdx & 15). Nen ban cu doi 4 gia tri
-  // `in` cua cung mot (im,i) vao DUNG MOT o smax[ly], va ca 16 lane cua cung mot nhom
-  // (laneIdx>>4) cung doi vao chinh o do: moi ds_cmpst_rtn_b32 cua vong CAS trong
-  // atomicMaxFloat (:4162) la xung dot 16-way tren MOT dia chi - LDS tuan tu hoa 16 lan,
-  // va vong while con quay lai vi ke thua cuoc phai thu lai. 64 chuoi phu thuoc
-  // doc->CAS->nhanh moi thread, nam sau vong k nen khong MFMA nao che duoc.
+  // does NOT depend on `in` and does NOT depend on (laneIdx & 15). So the old version pushed the
+  // 4 `in` values of one (im,i) into EXACTLY ONE smax[ly] slot, and all 16 lanes of the same
+  // group (laneIdx>>4) pushed into that same slot: every ds_cmpst_rtn_b32 of the CAS loop inside
+  // atomicMaxFloat (:4162) was a 16-way conflict on ONE address - LDS serialises it 16 times,
+  // and the while loop spins again because the losers must retry. 64 dependent
+  // read->CAS->branch chains per thread, sitting after the k loop where no MFMA can hide them.
   //
-  // Rut gon theo dung hai truc do truoc khi cham LDS:
-  //   (1) theo `in`: thuan thanh ghi, 3 v_max_f32;
-  //   (2) theo 16 lane trong nhom: 4 lan __shfl_xor mask 1,2,4,8 - mask < 16 nen phep
-  //       xor khong bao gio ra khoi nhom 16 lane, khong can tham so width (cung cach
-  //       flash attn dung o :2923).
-  // Chi lane (laneIdx&15)==0 ghi LDS: 16 atomic moi thread thay vi 64, va moi atomic con
-  // 4 lane tren 4 dia chi KHAC nhau -> het xung dot, vong CAS xong ngay vong dau.
+  // Reduce along exactly those two axes before touching LDS:
+  //   (1) across `in`: register-only, 3 v_max_f32;
+  //   (2) across the 16 lanes of a group: 4 x __shfl_xor with masks 1,2,4,8 - masks < 16, so the
+  //       xor never leaves the 16-lane group and no width argument is needed (the same way
+  //       flash attn uses at :2923).
+  // Only lane (laneIdx&15)==0 writes LDS: 16 atomics per thread instead of 64, and each atomic is
+  // now 4 lanes on 4 DIFFERENT addresses -> no conflict, and the CAS loop finishes on its first pass.
   //
-  // Bit-exact: max/min ket hop + giao hoan nen thu tu gop khong doi ket qua; o bi che
-  // duoc thay bang phan tu don vi (-INFINITY / INT_MAX) nen khong bao gio thang, dung
-  // nhu ban cu bo qua chung. Khong them thanh ghi song: acc_local da phai song qua ca
-  // hai pha o ca hai ban, nen 3 block/CU giu nguyen.
+  // Bit-exact: max/min are associative and commutative so the merge order does not change the
+  // result; masked slots are replaced by the identity element (-INFINITY / INT_MAX) so they can
+  // never win, exactly as the old version skipped them. No extra live registers: acc_local
+  // already had to live across both phases in both versions, so 3 blocks/CU is unchanged.
   //
-  // Cho ho duy nhat la cap (+0,-0): `val > oldf` cua vong CAS giu o khong DEN TRUOC,
-  // con v_max_f32 giu o khong o mot vi tri co dinh - va khac biet do KHONG bi nuot vi
-  // order_preserving_bits(+0)=0x80000000 khac order_preserving_bits(-0)=0x7FFFFFFF.
-  // Cho ho nay khong dat toi duoc: acc_local khoi tao +0.0 va MFMA tich luy o RN, ma
-  // trong RN `a + b = -0.0` chi khi a = b = -0.0; bat dau tu +0.0 thi khong bao gio
-  // ra -0.0. Vay acc_local khong bao gio chua -0.0.
+  // The only gap is the (+0,-0) pair: the CAS loop's `val > oldf` keeps whichever zero ARRIVES
+  // FIRST, while v_max_f32 keeps the zero in a fixed position - and that difference is NOT
+  // swallowed, because order_preserving_bits(+0)=0x80000000 differs from order_preserving_bits(-0)=0x7FFFFFFF.
+  // This gap is unreachable: acc_local starts at +0.0 and MFMA accumulates in RN, and under RN
+  // `a + b = -0.0` only when a = b = -0.0; starting from +0.0 that never
+  // yields -0.0. So acc_local never holds -0.0.
   {
     const int lane16 = laneIdx & 15;
     const int gbase  = blk_col * BN + WN * xInBlockTile;
@@ -5119,18 +5224,18 @@ matmul_logits_argmax_bf16_kernel_tuned(
         for (int in = 0; in < nIterWaveN; ++in) {
           const int gx = gbase + in * MFMA_N + lane16;
           const bool ok = (gx < N) && (gy < M);
-          // fmaxf -> v_max_f32 (IEEE maxNum): toan tu NaN thua toan tu khong-NaN, dung
-          // nhu `val > oldf` cua vong CAS cu khong bao gio cho NaN thang.
+          // fmaxf -> v_max_f32 (IEEE maxNum): a NaN operand loses to a non-NaN operand, exactly
+          // as the old CAS loop's `val > oldf` never let a NaN win.
           v = fmaxf(v, ok ? acc_local[im * nIterWaveN + in][i] : -INFINITY);
         }
-        // Butterfly trong nhom 16 lane: sau 4 buoc moi lane giu max cua ca nhom.
+        // A butterfly within the 16-lane group: after 4 steps every lane holds the group max.
         v = fmaxf(v, __shfl_xor(v, 1));
         v = fmaxf(v, __shfl_xor(v, 2));
         v = fmaxf(v, __shfl_xor(v, 4));
         v = fmaxf(v, __shfl_xor(v, 8));
-        // v == -INFINITY <=> khong o hop le nao (hoac tat ca deu -INFINITY). Ca hai
-        // truong hop atomicMaxFloat cu cung la khong-lam-gi vi `val > oldf` sai, nen bo
-        // qua la TUONG DUONG chu khong phai xap xi.
+        // v == -INFINITY <=> no valid slot (or all of them are -INFINITY). In both
+        // case the old atomicMaxFloat was also a no-op because `val > oldf` is false, so skipping
+        // it is EQUIVALENT, not an approximation.
         if (lane16 == 0 && v > -INFINITY) atomicMaxFloat(&smax[ly], v);
       }
     }
@@ -5146,9 +5251,9 @@ matmul_logits_argmax_bf16_kernel_tuned(
         const int CDi = 4 * (laneIdx >> 4) + (i & 3);
         const int ly  = WM * yInBlockTile + MFMA_M * im + CDi;
         const int gy  = blk_row * BM + ly;
-        // Hoist: smax[ly] khong phu thuoc `in`, nen 64 ds_read_b32 -> 16. Doc vo dieu
-        // kien la an toan (ly < BM luon dung, smax da khoi tao -INFINITY); khi gy >= M
-        // khong lane nao dong gop nen gia tri doc ra khong bao gio duoc dung den.
+        // Hoist: smax[ly] does not depend on `in`, so 64 ds_read_b32 -> 16. The unconditional read
+        // is safe (ly < BM always holds, smax is initialised to -INFINITY); when gy >= M
+        // no lane contributes, so the value read back is never used.
         const float mv = smax[ly];
         int cand = INT_MAX;
         #pragma unroll
@@ -5159,13 +5264,13 @@ matmul_logits_argmax_bf16_kernel_tuned(
           const bool hit = (gx < N) && (gy < M) && (fabsf(v - mv) <= thr);
           if (hit && gx < cand) cand = gx;
         }
-        // Cung butterfly, phep min. Tach ra bien tam de moi mask chi mot ds_bpermute.
+        // The same butterfly with min. Split into a temporary so each mask costs one ds_bpermute.
         int o;
         o = __shfl_xor(cand, 1); cand = (o < cand) ? o : cand;
         o = __shfl_xor(cand, 2); cand = (o < cand) ? o : cand;
         o = __shfl_xor(cand, 4); cand = (o < cand) ? o : cand;
         o = __shfl_xor(cand, 8); cand = (o < cand) ? o : cand;
-        // sidx khoi tao INT_MAX nen atomicMin(INT_MAX) la khong-lam-gi: bo qua = tuong duong.
+        // sidx starts at INT_MAX so atomicMin(INT_MAX) is a no-op: skipping it is equivalent.
         if (lane16 == 0 && cand != INT_MAX) atomicMin(&sidx[ly], cand);
       }
     }
@@ -5230,8 +5335,8 @@ static inline void getp_matmul_logits_argmax_bf16(
 
   dim3 block(64 * WARPS);
 #if GETP_LOGITS_SWZ
-  // Luoi mot chieu; kernel tach lai thanh (hang, cot). So khoi hang lam tron len boi cua G
-  // thi phep tach moi la song anh - phan thua la block rong, thoat ngay.
+  // A one-dimensional grid; the kernel splits it back into (row, column). Rounding the row-block
+  // count up to a multiple of G is what makes the split a bijection - the surplus blocks are empty and exit at once.
   const int nrow_up = (((M + BM - 1) / BM + GETP_LOGITS_SWZ_G - 1) / GETP_LOGITS_SWZ_G)
                       * GETP_LOGITS_SWZ_G;
   dim3 grid(((N + BN - 1) / BN) * nrow_up);
@@ -5239,8 +5344,8 @@ static inline void getp_matmul_logits_argmax_bf16(
   dim3 grid((N + BN - 1) / BN, (M + BM - 1) / BM);
 #endif
 
-  // hipFree dong bo ca thiet bi, nen cap phat/giai phong moi buoc la mot lan
-  // dung hoan toan moi buoc cho mot buffer 12 KB co kich thuoc khong doi.
+  // hipFree synchronises the whole device, so allocating and freeing every step is one full
+  // stall per step for a fixed-size 12 KB buffer.
   static thread_local unsigned long long *pairs = nullptr;
   static thread_local int pairs_cap = 0;
   if (pairs_cap < M) {
@@ -5252,11 +5357,11 @@ static inline void getp_matmul_logits_argmax_bf16(
   init_argmax_pairs<<<gi, bi, 0, stream>>>(pairs, M, N);
 
 #if GETP_LOGITS_XBF16
-  // Cung ly do voi `pairs` o tren: hipFree dong bo ca thiet bi nen bo dem nay giu lai.
+  // Same reason as `pairs` above: hipFree synchronises the whole device, so this buffer is kept.
   static thread_local unsigned short *xb = nullptr;
   static thread_local size_t xb_cap = 0;
   const size_t xn = (size_t)M * (size_t)K;
-  // xn = M*K luon chia het 4 vi K (hidden_dim) chia het 4; khong can chot chay.
+  // xn = M*K is always a multiple of 4 because K (hidden_dim) is; no tail handling needed.
   if (xb_cap < xn) {
     if (xb) HIP_CHECK(hipFree(xb));
     HIP_CHECK(hipMalloc(&xb, sizeof(unsigned short) * xn));
@@ -5276,7 +5381,7 @@ static inline void getp_matmul_logits_argmax_bf16(
       <<<grid, block, 0, stream>>>(x, xb, w, M, N, K, pairs);
 
   extract_argmax_pairs<<<gi, bi, 0, stream>>>(pairs, out, M);
-  // (pairs duoc giu lai cho buoc sau)
+  // (pairs is kept for the next step)
 
 }
 
@@ -5333,35 +5438,40 @@ static inline void getp_argmax_rows(const float *logits, int V, int *out, int B,
 
 }
 
-// Bat mac dinh, nhung chi co tac dung khi EXPERT_PARALLELISM <= 2 - xem ghi chu trong
-// sync_workers_dev. Dat -DGETP_DEVSYNC=0 de quay lai hang rao cu o moi cau hinh.
+// On by default, but it only has an effect at EXPERT_PARALLELISM <= 2 - see the note in
+// sync_workers_dev. Pass -DGETP_DEVSYNC=0 to go back to the old barrier in every configuration.
 #ifndef GETP_DEVSYNC
 #define GETP_DEVSYNC 1
 #endif
 
 #if GETP_DEVSYNC
-// Event "da toi diem nay" cua tung thiet bi, mot khe cho moi (lop, pha). Thiet bi khac cho tren
-// event nay bang hipStreamWaitEvent thay vi doi host vat can hang doi.
+// Each device's 'reached this point' event, one slot per (layer, phase). Other devices wait on
+// it with hipStreamWaitEvent instead of having the host act as the queue's throttle.
 #if GETP_AGSKIP
-// Ca 8 rank la thread cung mot tien trinh, nen bang nay di qua bo nho host binh thuong.
-// Viet truoc hang rao sp1, doc sau no => chinh hang rao dam bao thay, khong can dong bo them.
-static __hip_bfloat16 *g_ag_send[MAXIMUM_GPU];   // [thiet bi] -> [EP][B][H] da nen theo dich
-static int *g_ag_idx[MAXIMUM_GPU];               // [thiet bi] -> rr_idx [EP][B]
-static int g_ag_cnt[MAXIMUM_GPU][MAXIMUM_GPU];   // [lat cat gui][lat cat nhan]
+// All eight ranks are threads of one process, so this table goes through ordinary host memory.
+// Written before the sp1 barrier and read after it => the barrier itself makes it visible, with no extra sync.
+static __hip_bfloat16 *g_ag_send[MAXIMUM_GPU];   // [device] -> [EP][B][H] packed by destination
+static int *g_ag_idx[MAXIMUM_GPU];               // [device] -> rr_idx [EP][B]
+static int g_ag_cnt[MAXIMUM_GPU][MAXIMUM_GPU];   // [sending slice][receiving slice]
 #endif
 
 #if GETP_EVAGG
-// Su kien "e_agg cua toi da ghi xong", mot o moi lop. sp1 van la hang rao nen hai rank khong
-// bao gio cach nhau qua mot lop, 128 o la du xa.
+// The 'my e_agg is written' event, one slot per layer. sp1 is still a barrier, so two ranks are
+// never more than one layer apart and 128 slots is far more than enough.
 static hipEvent_t g_ev_eagg[MAXIMUM_GPU][128];
+#if GETP_GPSLICE
+// Fires as soon as JUST the slice the first puller wants is done, without waiting for all eight.
+static hipEvent_t g_ev_eagg_first[MAXIMUM_GPU][128];
+#endif
 #endif
 
 #define GETP_SYNC_SLOTS 128
 static hipEvent_t g_ev_sync[MAXIMUM_GPU][GETP_SYNC_SLOTS];
 static bool g_ev_sync_ready[MAXIMUM_GPU] = {false};
 
-// rec_stream: stream da GHI du lieu ma peer sap doc. wait_stream: stream se DOC du lieu cua peer
-// (o day la memory_stream, noi cac hipMemcpyPeerAsync chay) - cho tren dung stream do moi dung.
+// rec_stream: the stream that WROTE the data a peer is about to read. wait_stream: the stream
+// that will READ the peer's data (here memory_stream, where the hipMemcpyPeerAsync calls run) -
+// waiting on that exact stream is what makes it correct.
 static inline void sync_workers_dev(hipStream_t rec_stream, hipStream_t wait_stream,
                                     Barrier &sync_point,
                                     int dev, int n_dev, int base_dev, int slot) {
@@ -5370,12 +5480,13 @@ static inline void sync_workers_dev(hipStream_t rec_stream, hipStream_t wait_str
       HIP_CHECK(hipEventCreateWithFlags(&g_ev_sync[dev][i], hipEventDisableTiming));
     g_ev_sync_ready[dev] = true;
     HIP_CHECK(hipStreamSynchronize(rec_stream));
-    sync_point.wait();          // moi thiet bi da tao xong event cua minh
+    sync_point.wait();          // every device has created its events
   }
-  // Chi dung duong event khi IT peer. Do 8 GPU / 1024 buoc: voi EXPERT_PARALLELISM = 2 (20b)
-  // no nhanh hon 0,7 % (63.788 -> 64.361); voi EXPERT_PARALLELISM = 8 (120b) no CHAM 15 %
-  // (20.003 -> 16.931), vi moi diem dong bo xep 7 hipStreamWaitEvent len memory_stream va
-  // host khong con vat can nen hang doi cua no sau dan. Nhieu peer thi vat can lai re hon.
+  // Only take the event path when there are FEW peers. Measured on 8 GPUs over 1024 steps: at
+  // EXPERT_PARALLELISM = 2 (20b) it is 0,7 % faster (63.788 -> 64.361); at EXPERT_PARALLELISM =
+  // 8 (120b) it is 15 % SLOWER (20.003 -> 16.931), because each sync point queues 7
+  // hipStreamWaitEvent on memory_stream and, with the host no longer throttling, that queue
+  // grows deeper and deeper. With many peers the throttle is the cheaper option.
   if (n_dev > 2) {
     HIP_CHECK(hipStreamSynchronize(rec_stream));
     sync_point.wait();
@@ -5383,7 +5494,7 @@ static inline void sync_workers_dev(hipStream_t rec_stream, hipStream_t wait_str
   }
   const int k = slot % GETP_SYNC_SLOTS;
   HIP_CHECK(hipEventRecord(g_ev_sync[dev][k], rec_stream));
-  sync_point.wait();            // chi dong bo HOST: moi thread da phat event cua no
+  sync_point.wait();            // a HOST-only sync: every thread has issued its event
   for (int i = 0; i < n_dev; ++i) {
     const int pd = base_dev + i;
     if (pd != dev) HIP_CHECK(hipStreamWaitEvent(wait_stream, g_ev_sync[pd][k], 0));
@@ -5430,8 +5541,8 @@ int *getp_forward_120b(Transformer * /*transformer*/,
 
   HIP_CHECK(hipSetDevice(device_index));
 
-  // Truoc day 5 event duoc tao MOI BUOC va khong bao gio huy. Gio tao mot lan
-  // cho moi thread (moi GPUWorker mot thread, moi thread mot thiet bi).
+  // These 5 events used to be created EVERY STEP and never destroyed. Now they are created once
+  // per thread (one thread per GPUWorker, one device per thread).
   static thread_local hipEvent_t event_rmsnorm = nullptr;
   static thread_local hipEvent_t event_router_topk = nullptr;
   static thread_local hipEvent_t events_e_agg[MAXIMUM_GPU] = {};
@@ -5446,7 +5557,7 @@ int *getp_forward_120b(Transformer * /*transformer*/,
   }
 
 #if GETP_ROWSKIP
-  // Chi bat khi EP > 2 (xem diem 2 o dau file). Bo dem nho: 3 mang EP*B int, ~150 KB.
+  // Only on at EP > 2 (see point 2 at the head of the file). Small buffers: 3 arrays of EP*B int, ~150 KB.
   const bool rs_on = (EXPERT_PARALLELISM > 2);
   static thread_local int *rs_rank = nullptr, *rs_idx = nullptr, *rs_cnt = nullptr;
   static thread_local int *rr_idx = nullptr, *rr_rank = nullptr, *rr_cnt = nullptr;
@@ -5457,7 +5568,7 @@ int *getp_forward_120b(Transformer * /*transformer*/,
   static thread_local int *ag_ridx = nullptr;
 #endif
 #if GETP_RS_MERGE
-  // Khoang expert cua tung lat cat, co dinh ca lan chay nen day len mot lan.
+  // Each slice's expert range; fixed for the whole run, so upload it once.
   static thread_local int *rs_elo = nullptr, *rs_ehi = nullptr;
   if (rs_on && rs_elo == nullptr) {
     int hlo[MAXIMUM_GPU], hhi[MAXIMUM_GPU];
@@ -5480,7 +5591,7 @@ int *getp_forward_120b(Transformer * /*transformer*/,
     HIP_CHECK(hipMalloc(&rr_cnt,  sizeof(int) * EXPERT_PARALLELISM));
     HIP_CHECK(hipHostMalloc(&rs_hcnt, sizeof(int) * EXPERT_PARALLELISM, hipHostMallocDefault));
 #if GETP_AGSKIP
-    // Cong bo cho cac thread khac. Doc chi xay ra sau hang rao sp1 nen an toan.
+    // Publish for the other threads. Reads only happen after the sp1 barrier, so this is safe.
     HIP_CHECK(hipMalloc(&ag_send, sizeof(__hip_bfloat16) * (size_t)EXPERT_PARALLELISM *
                                       BATCH_SIZE * hidden_dim));
     HIP_CHECK(hipMalloc(&ag_recv, sizeof(__hip_bfloat16) * (size_t)EXPERT_PARALLELISM *
@@ -5491,6 +5602,10 @@ int *getp_forward_120b(Transformer * /*transformer*/,
 #if GETP_EVAGG
     for (int q = 0; q < 128; ++q)
       HIP_CHECK(hipEventCreateWithFlags(&g_ev_eagg[device_index][q], hipEventDisableTiming));
+#if GETP_GPSLICE
+    for (int q = 0; q < 128; ++q)
+      HIP_CHECK(hipEventCreateWithFlags(&g_ev_eagg_first[device_index][q], hipEventDisableTiming));
+#endif
 #endif
 #endif
   }
@@ -5522,8 +5637,8 @@ int *getp_forward_120b(Transformer * /*transformer*/,
   const int own_slice = device_index - base_device_index;
 
   for (unsigned long long l = 0; l < p->n_layers; l++) {
-    // rmsnorm ghi THANG bf16 vao pre_qkv_bf16: ban fp32 (dev_s->t) khong con
-    // consumer nao trong duong 120b.
+    // rmsnorm writes bf16 DIRECTLY into pre_qkv_bf16: the fp32 form (dev_s->t) no longer
+    // has any consumer on the 120b path.
     getp_rmsnorm_bf16(ext->pre_qkv_bf16, dev_x,
                       dev_w->rms_attn_w + 1ll * l * hidden_dim,
                       BATCH_SIZE, hidden_dim, compute_stream);
@@ -5560,11 +5675,11 @@ int *getp_forward_120b(Transformer * /*transformer*/,
         dev_w->b_qkv_bf16 +
         1ll * l * (head_dim * p->n_attn_heads + 2 * head_dim * p->n_kv_heads);
 #if GETP_ROPE_FUSED
-    // RoPE da nam trong epilogue cua qkv (va voi GETP_ROPE_FUSED_KV thi ca
-    // buoc doi bf16 xuong khe cache). dev_cos_vals/dev_sin_vals duoc sinh
-    // truoc vong lop lop tren CUNG stream nen thu tu van dung; pham vi song
-    // cua hai bang khong doi - truoc day apply_rotary_emb doc chung o DUNG
-    // cho nay, ngay sau qkv va truoc MoE cua lop.
+    // RoPE now lives in the qkv epilogue (and with GETP_ROPE_FUSED_KV so does the
+    // bf16 conversion into the cache slot). dev_cos_vals/dev_sin_vals are generated
+    // before the layer loop on the SAME stream, so the ordering still holds; the live range
+    // of the two tables is unchanged - apply_rotary_emb used to read them at EXACTLY
+    // this point, right after qkv and before the layer's MoE.
     getp_matmul_qkv_fused_bf16(dev_s->q, k_step, v_step, ext->pre_qkv_bf16,
                                dev_w_qkv, dev_b_qkv, hidden_dim, head_dim,
                                p->n_attn_heads, p->n_kv_heads, BATCH_SIZE,
@@ -5606,13 +5721,13 @@ int *getp_forward_120b(Transformer * /*transformer*/,
     __hip_bfloat16 *dev_w_o =
         dev_w->w_o_bf16 + 1ll * l * (head_dim * p->n_attn_heads) * hidden_dim;
     __hip_bfloat16 *dev_b_o = dev_w->b_o_bf16 + 1ll * l * hidden_dim;
-    // attention da ghi bf16 vao attn_o_bf16; matmul cong thang vao dev_x.
+    // attention has already written bf16 into attn_o_bf16; the matmul adds straight into dev_x.
     getp_matmul_attn_o_bf16_acc(dev_x, ext->attn_o_bf16, dev_w_o, dev_b_o,
                                 head_dim * p->n_attn_heads, hidden_dim,
                                 BATCH_SIZE, compute_stream);
 
-    // Router doc ext_t fp32, peer copy doc ext_t_bf16: sinh ca hai trong mot
-    // luot, thay cho mot kernel doi kieu rieng tren memory_stream.
+    // The router reads ext_t fp32 and the peer copy reads ext_t_bf16: produce both in one
+    // pass, instead of a separate conversion kernel on memory_stream.
     getp_rmsnorm_f32_bf16(
         ext->ext_t + (size_t)own_slice * BATCH_SIZE * hidden_dim,
         ext->ext_t_bf16 + (size_t)own_slice * BATCH_SIZE * hidden_dim,
@@ -5636,8 +5751,8 @@ int *getp_forward_120b(Transformer * /*transformer*/,
         BATCH_SIZE, compute_stream);
     HIP_CHECK(hipEventRecord(event_router_topk, compute_stream));
 #if GETP_AGSKIP
-    // Danh sach nay chi doc topk cua LAT CAT MINH, co san tu :5542 - khong can doi peer nao.
-    // Voi lat cat dich sl no liet ke cac hang cua ta ma sl so huu expert: dung thu sl se keo.
+    // This list only reads the top-k of OUR OWN SLICE, available since :5542 - it waits for no peer.
+    // For destination slice sl it lists the rows of ours that sl owns an expert for: exactly what sl will pull.
     if (ag_on) {
       getp_rowskip_build_all_recv(ext->ext_topk_i, p->experts_per_token, BATCH_SIZE,
                                   EXPERT_PARALLELISM, own_slice, own_slice,
@@ -5649,18 +5764,20 @@ int *getp_forward_120b(Transformer * /*transformer*/,
     }
 #endif
 
-    // ext_t_bf16 da duoc rmsnorm ghi trong compute_stream truoc event_rmsnorm.
-    // Trao doi hidden-state va top-k bang PULL sau barrier, khong PUSH truoc barrier.
-    // Push (peer copy vao buffer cua ta tren memory_stream cua PEER, roi barrier host)
-    // de lai mot cua so hiem trong do ta doc ext_t_bf16/topk cu: do bang hash 11 moc/lop
-    // tren 2 lan chay 8 GPU, moi lan ~4 su kien, luon theo cap EP cung (buoc, lop), lech
-    // dau tien o a_in sau scatter trong khi topk va attention cua chinh no khop. Acquire
-    // phia nhan (wait event cua peer) va bo nho fine-grained deu khong chua. Pull tren
-    // queue cua thiet bi nhan + event la mau ma duong e_agg dung va do sach.
+    // ext_t_bf16 was written by rmsnorm on compute_stream before event_rmsnorm.
+    // The hidden-state and top-k exchange is a PULL after the barrier, not a PUSH before it.
+    // The push (a peer copy into our buffer on the PEER's memory_stream, then a host barrier)
+    // left a rare window in which we read the previous step's ext_t_bf16/topk: measured by
+    // hashing 11 points per layer across 2 eight-GPU runs, about 4 events per run, always on a
+    // matching (step, layer) pair of EP ranks, first diverging at a_in after the scatter while
+    // that rank's own topk and attention still matched. Acquiring on the receiving side and
+    // fine-grained memory both failed to fix it. Pulling on the receiving device's own queue
+    // plus an event is the pattern the e_agg path already used, and it measures clean.
 #if GETP_AGSKIP
     if (ag_on) {
-      // Y het nhanh EP > 2 cua sync_workers_dev, chen them mot lan doc so hang vao GIUA:
-      // stream vua can nen rr_cnt da xong, va hang rao ngay sau se cong bo no cho moi rank.
+      // Identical to the EP > 2 branch of sync_workers_dev, with one row-count read inserted in
+      // BETWEEN: the stream has just drained so rr_cnt is final, and the barrier right after
+      // publishes it to every rank.
       HIP_CHECK(hipStreamSynchronize(compute_stream));
       HIP_CHECK(hipMemcpy(g_ag_cnt[own_slice], rr_cnt, sizeof(int) * EXPERT_PARALLELISM,
                           hipMemcpyDeviceToHost));
@@ -5685,7 +5802,7 @@ int *getp_forward_120b(Transformer * /*transformer*/,
       const size_t ps = (size_t)(peer_device_index - base_device_index);
 #if GETP_AGSKIP
       if (ag_on) {
-        // Chi nhung hang ta so huu expert. So hang da biet tu truoc hang rao sp1.
+        // Only the rows we own an expert for. The count has been known since before the sp1 barrier.
         const int nrow = g_ag_cnt[ps][own_slice];
         if (nrow > 0) {
           HIP_CHECK(hipMemcpyPeerAsync(
@@ -5744,25 +5861,25 @@ int *getp_forward_120b(Transformer * /*transformer*/,
 #if GETP_ROWSKIP
     if (rs_on) {
 #if GETP_RS_MERGE
-      // Mot lan phong cho ca bay lat cat, thay vi bay lan cach nhau 60 us.
+      // One launch for all seven slices, instead of seven sitting 60 us apart.
       getp_rowskip_build_all_send(ext->n_local, BATCH_SIZE, EXPERT_PARALLELISM, own_slice,
                                   rs_rank, rs_idx, rs_cnt, compute_stream);
 #if GETP_AGSKIP
-      // Da dung truoc diem dong bo 1 cho chieu all-gather; rr_* con nguyen, dung lai luon.
+      // Already built before sync point 1 for the all-gather direction; rr_* is intact, so reuse it.
       if (!ag_on)
 #endif
       getp_rowskip_build_all_recv(ext->ext_topk_i, p->experts_per_token, BATCH_SIZE,
                                   EXPERT_PARALLELISM, own_slice, own_slice,
                                   rs_elo, rs_ehi, rr_rank, rr_idx, rr_cnt, compute_stream);
 #else
-      // Ben GUI: mot danh sach cho moi lat cat KHONG phai cua minh - do la cac lat se gui di.
+      // SENDER side: one list per slice that is NOT ours - those are the slices we will send.
       for (int sd = 0; sd < EXPERT_PARALLELISM; ++sd) {
         if (sd == own_slice) continue;
         getp_rowskip_build_send(ext->n_local, BATCH_SIZE, sd,
                                 rs_rank, rs_idx, rs_cnt, compute_stream);
       }
-      // Ben NHAN: doc lat cat cua CHINH MINH nhung ghi vao o cua tung peer. Ben gui suy tu
-      // n_local cua no, ben nhan suy tu topk + khoang expert cua peer - cung mot tap hop.
+      // RECEIVER side: read OUR OWN slice but write into each peer's bucket. The sender derives
+      // it from its n_local, the receiver from topk plus the peer's expert range - the same set.
       for (int d = 1; d < EXPERT_PARALLELISM; ++d) {
         GPUWorker *pw = &workers[(device_index + d) % EXPERT_PARALLELISM];
         const int ps = pw->device_index - base_device_index;
@@ -5793,31 +5910,31 @@ int *getp_forward_120b(Transformer * /*transformer*/,
       hidden_dim, compute_stream);
 #endif
 
-  // (memset 35,4 MB da bo: moe_gather_pairs gio ghi de toan bo vung nay)
+  // (the 35,4 MB memset is gone: moe_gather_pairs now overwrites this whole region)
 
   __hip_bfloat16 *w1_base = dev_w->w_mlp1 + 1ll * l * experts_per_device * 2 * p->intermediate_dim * hidden_dim;
   __hip_bfloat16 *b1_base = dev_w->b_mlp1 + 1ll * l * experts_per_device * 2 * p->intermediate_dim;
 
 #if GETP_SMALL_NOSCATTER
-  // RAW: hipMemcpyPeerAsync keo ext_t_bf16 ve tren memory_stream da duoc
-  // hipStreamWaitEvent dua vao compute_stream TRUOC map_global_to_local o tren;
-  // lat cat cua chinh minh do rmsnorm(l) ghi truoc do tren compute_stream.
-  // Kernel chep (ban vua bo) doc dung vung nho nay, ngay tai cho nay.
+  // RAW: the hipMemcpyPeerAsync pulling ext_t_bf16 back on memory_stream was tied into
+  // compute_stream by hipStreamWaitEvent BEFORE map_global_to_local above; our own slice was
+  // written by rmsnorm(l) earlier on compute_stream.
+  // The copy kernel (just removed) read this same memory, at this same point.
   //
-  // WAR - day moi la cho thay doi that su, va no KHONG hien nhien: mlp1 doc
-  // ext_t_bf16 muon hon kernel chep rat nhieu (49 ms sau, thay vi 1,4 ms), con
-  // pull cua LOP l+1 thi GHI de len cac lat cat peer cua chinh buffer nay, tren
-  // memory_stream, ma memory_stream khong he cho tren compute_stream cua ta
-  // (sync_workers_dev chi cho tren event cua PEER). An toan la nho mot day
-  // bac cau, voi EXPERT_PARALLELISM = 2:
-  //   pullT(l+1) [memory_D]  sau  E_P(2l+2)            (hipStreamWaitEvent)
-  //   E_P(2l+2)              sau  vecadd_P(l)          (cung compute_P)
-  //   vecadd_P(l)            sau  event e_agg_P(l)     (hipStreamWaitEvent)
-  //   e_agg copy [memory_P]  sau  E_D(2l+1)            (hipStreamWaitEvent)
-  //   E_D(2l+1)              sau  gather_D(l) va mlp1_D(l)  (cung compute_D)
-  // => mlp1(l) xong han truoc khi pull(l+1) bat dau ghi. Voi n_dev > 2 va voi
+  // WAR - this is where the real change is, and it is NOT obvious: mlp1 reads ext_t_bf16 far
+  // later than the copy kernel did (49 ms later, rather than 1,4 ms), while LAYER l+1's pull
+  // OVERWRITES the peer slices of this same buffer, on memory_stream - and memory_stream never
+  // waits on our compute_stream (sync_workers_dev only waits on the PEERS' events). Safety
+  // comes from a transitive chain
+  // of happens-before edges, with EXPERT_PARALLELISM = 2:
+  //   pullT(l+1) [memory_D]  after  E_P(2l+2)            (hipStreamWaitEvent)
+  //   E_P(2l+2)              after  vecadd_P(l)          (same compute_P)
+  //   vecadd_P(l)            after  event e_agg_P(l)     (hipStreamWaitEvent)
+  //   e_agg copy [memory_P]  after  E_D(2l+1)            (hipStreamWaitEvent)
+  //   E_D(2l+1)              after gather_D(l) and mlp1_D(l)  (same compute_D)
+  // => mlp1(l) is fully done before pull(l+1) starts writing. For n_dev > 2, and for
   // GETP_DEVSYNC=0, sync_workers* goi hipStreamSynchronize(compute_stream)
-  // ngay tai diem dong bo nen ket luan con manh hon.
+  // right at the sync point, so the conclusion is even stronger.
   launch_mlp1_swiglu_bf16_bucketed_outbf16(
       ext->gate_up_bf16, ext->ext_t_bf16, w1_base, b1_base, ext->e_offsets,
       ext->blk_offsets, hidden_dim, p->intermediate_dim, experts_per_device,
@@ -5833,9 +5950,9 @@ int *getp_forward_120b(Transformer * /*transformer*/,
   __hip_bfloat16 *b2_base = dev_w->b_mlp2 + 1ll * l * experts_per_device * hidden_dim;
 
 #if MATMUL_MLP2_BLOCK_ROWS != MATMUL_MLP1_BLOCK_ROWS
-  // mlp2 giai ma blk_offsets bang BM cua rieng no, nen khi hai BM khac nhau thi
-  // phai co lich rieng. Ghi de cung buffer la an toan: moi thu tren compute_stream,
-  // nen kernel nay khong the chay truoc khi mlp1 doc xong.
+  // mlp2 decodes blk_offsets with its own BM, so when the two BMs differ it needs its own
+  // schedule. Overwriting the same buffer is safe: everything is on compute_stream, so this
+  // kernel cannot run before mlp1 has finished reading.
   int total_blocks_mlp2 = build_moe_block_schedule(
       ext->e_offsets, experts_per_device, MATMUL_MLP2_BLOCK_ROWS,
       ext->blk_counts, ext->blk_offsets,
@@ -5849,29 +5966,61 @@ int *getp_forward_120b(Transformer * /*transformer*/,
       ext->e_offsets, ext->blk_offsets, ext->e_dev, p->intermediate_dim,
       hidden_dim, experts_per_device, total_blocks_mlp2, compute_stream);
 
-    // Lat cat own_slice di thang vao dev_x; cac lat cat khac van ra ext_e_agg
-    // vi peer se keo chung. Bo han mot vecadd (doc 17,7 MB + ghi 17,7 MB).
-    // Xen ke hai buffer theo parity lop - xem ghi chu o RunStateExt::ext_e_agg2.
-    // Do o 8 GPU / 1024 buoc: cung mot binary chay hai lan tu-khop 49,5 % dong
-    // voi mot buffer, 89,8 % voi hai; throughput khong doi.
+    // The own_slice slice goes straight into dev_x; the other slices still go to ext_e_agg
+    // because peers will pull them. That removes one vecadd entirely (17,7 MB read + 17,7 MB written).
+    // The two buffers alternate by layer parity - see the note on RunStateExt::ext_e_agg2.
+    // Measured on 8 GPUs over 1024 steps: the same binary run twice self-matched on 49,5 % of
+    // lines with one buffer and 89,8 % with two; throughput unchanged.
     float *eagg_out = (l & 1) ? ext->ext_e_agg2 : ext->ext_e_agg;
+#if GETP_ROWSKIP
+    const int *gp_rank = rs_on ? rs_rank : nullptr;
+#else
+    const int *gp_rank = nullptr;
+#endif
+#if GETP_EAGG_BF16
+    // Gated on rs_on: EP = 2 (20b) never enables it, so md5 720709b86d36 stays intact.
+    const int gp_bf16 = rs_on ? 1 : 0;
+#else
+    const int gp_bf16 = 0;
+#endif
+    (void)gp_bf16;
+#if GETP_GPSLICE
+    // The rank that pulls from us first is D-1, and it wants its own slice. Emit that slice
+    // separately first and fire an early event, so the pull chain need not wait for all 6144 tokens.
+    const int gp_first = (own_slice + EXPERT_PARALLELISM - 1) % EXPERT_PARALLELISM;
+    if (ag_on) {
+      moe_gather_pairs_acc(eagg_out, dev_x, own_slice * BATCH_SIZE,
+                           own_slice * BATCH_SIZE + BATCH_SIZE, ext->z_partial, ext->pair_pos,
+                           hidden_dim, p->experts_per_token, EXPERT_PARALLELISM * BATCH_SIZE,
+                           compute_stream, gp_rank, gp_first * BATCH_SIZE, BATCH_SIZE, gp_bf16);
+      HIP_CHECK(hipEventRecord(g_ev_eagg_first[device_index][(int)(l % 128)], compute_stream));
+      if (gp_first > 0)
+        moe_gather_pairs_acc(eagg_out, dev_x, own_slice * BATCH_SIZE,
+                             own_slice * BATCH_SIZE + BATCH_SIZE, ext->z_partial, ext->pair_pos,
+                             hidden_dim, p->experts_per_token, EXPERT_PARALLELISM * BATCH_SIZE,
+                             compute_stream, gp_rank, 0, gp_first * BATCH_SIZE, gp_bf16);
+      if (gp_first + 1 < EXPERT_PARALLELISM)
+        moe_gather_pairs_acc(eagg_out, dev_x, own_slice * BATCH_SIZE,
+                             own_slice * BATCH_SIZE + BATCH_SIZE, ext->z_partial, ext->pair_pos,
+                             hidden_dim, p->experts_per_token, EXPERT_PARALLELISM * BATCH_SIZE,
+                             compute_stream, gp_rank,
+                             (gp_first + 1) * BATCH_SIZE,
+                             (EXPERT_PARALLELISM - gp_first - 1) * BATCH_SIZE, gp_bf16);
+    } else
+#endif
     moe_gather_pairs_acc(eagg_out, dev_x,
                          own_slice * BATCH_SIZE,
                          own_slice * BATCH_SIZE + BATCH_SIZE,
                          ext->z_partial, ext->pair_pos, hidden_dim,
                          p->experts_per_token, EXPERT_PARALLELISM * BATCH_SIZE,
-                         compute_stream,
-#if GETP_ROWSKIP
-                         rs_on ? rs_rank : nullptr);
-#else
-                         nullptr);
-#endif
+                         compute_stream, gp_rank, 0, -1, gp_bf16);
 
 #if GETP_EVAGG
     const int ev_k = (int)(l % 128);
     if (ag_on) {
-      // Khong drain. Hang rao chi de chac rang moi thread DA PHAT event cua minh: cho tren mot
-      // event chua ghi se tra ve ngay va ta doc phai e_agg cua buoc truoc.
+      // No drain. The barrier is only there to be sure every thread has ISSUED its event:
+      // waiting on an event that has not been recorded returns at once and we would read the
+      // previous step's e_agg.
       HIP_CHECK(hipEventRecord(g_ev_eagg[device_index][ev_k], compute_stream));
       sync_point.wait();
     } else
@@ -5885,9 +6034,9 @@ int *getp_forward_120b(Transformer * /*transformer*/,
 #endif
     }
 #if GETP_ROWSKIP
-    // Mien phi o EP > 2: sync_workers_dev vua goi hipStreamSynchronize nen stream da can.
-    // Voi EVAGG khong con drain nua, nhung cung khong con can lan doc nay: agskip da dat cung
-    // nhung con so do vao g_ag_cnt[own_slice][*] tu truoc hang rao sp1.
+    // Free at EP > 2: sync_workers_dev has just called hipStreamSynchronize, so the stream is drained.
+    // With EVAGG there is no drain any more, but this read is no longer needed either: agskip
+    // already put those same numbers into g_ag_cnt[own_slice][*] before the sp1 barrier.
 #if GETP_EVAGG
     if (rs_on && !ag_on)
 #else
@@ -5908,9 +6057,33 @@ int *getp_forward_120b(Transformer * /*transformer*/,
       RunStateExt *peer_ext = ext_get(peer_device_index);
       if (peer_device_index != device_index) {
 #if GETP_EVAGG
-        // Thay cho hang rao: chi cho DUNG peer nay ghi xong, khong cho ca 8.
+        // Instead of a barrier: wait only for THIS peer to finish writing, not for all eight.
         if (ag_on)
+#if GETP_GPSLICE
+          // delta == 1 is the peer we pull from first: it fired an early event for our slice alone.
+          HIP_CHECK(hipStreamWaitEvent(memory_stream,
+                                       (delta == 1 ? g_ev_eagg_first : g_ev_eagg)
+                                           [peer_device_index][ev_k], 0));
+#else
           HIP_CHECK(hipStreamWaitEvent(memory_stream, g_ev_eagg[peer_device_index][ev_k], 0));
+#endif
+#endif
+#if GETP_EAGG_BF16
+        // The same number of ROWS, half the BYTES. gp_bf16 implies rs_on, so the rowskip size formula applies.
+        if (gp_bf16) {
+          const size_t ebs = (size_t)BATCH_SIZE * (size_t)hidden_dim;
+          __hip_bfloat16 *ebdst =
+              reinterpret_cast<__hip_bfloat16 *>(ext->peer_e_agg) + (size_t)j * ebs;
+          const __hip_bfloat16 *ebsrc = reinterpret_cast<const __hip_bfloat16 *>(
+              (l & 1) ? peer_ext->ext_e_agg2 : peer_ext->ext_e_agg)
+              + (size_t)(device_index - base_device_index) * ebs;
+          HIP_CHECK(hipMemcpyPeerAsync(
+              ebdst, device_index, ebsrc, peer_device_index,
+              sizeof(__hip_bfloat16)
+                  * (size_t)rs_hcnt[peer_device_index - base_device_index]
+                  * (size_t)hidden_dim,
+              memory_stream));
+        } else
 #endif
         HIP_CHECK(hipMemcpyPeerAsync(
             ext->peer_e_agg + (size_t)j * BATCH_SIZE * hidden_dim, device_index,
@@ -5938,6 +6111,16 @@ int *getp_forward_120b(Transformer * /*transformer*/,
 #if GETP_ROWSKIP
         if (rs_on) {
           const int ps = peer_device_index - base_device_index;
+#if GETP_EAGG_BF16
+          if (gp_bf16)
+            getp_rowskip_scatter_add_bf16(
+                dev_x,
+                reinterpret_cast<const __hip_bfloat16 *>(ext->peer_e_agg)
+                    + (size_t)j * BATCH_SIZE * hidden_dim,
+                rr_idx + (size_t)ps * BATCH_SIZE, rr_cnt + ps, hidden_dim, rs_hcnt[ps],
+                compute_stream);
+          else
+#endif
           getp_rowskip_scatter_add(dev_x,
                                    ext->peer_e_agg + (size_t)j * BATCH_SIZE * hidden_dim,
                                    rr_idx + (size_t)ps * BATCH_SIZE, rr_cnt + ps,
@@ -6054,11 +6237,11 @@ int *getp_forward_20b(Transformer * /*transformer*/,
     tensor_fp32_to_bf16(ext->pre_qkv_bf16, dev_s->t,
                         batch_size * hidden_dim, nullptr);
 #if GETP_ROPE_FUSED
-    // RoPE da nam trong epilogue cua qkv (va voi GETP_ROPE_FUSED_KV thi ca
-    // buoc doi bf16 xuong khe cache). dev_cos_vals/dev_sin_vals duoc sinh
-    // truoc vong lop lop tren CUNG stream nen thu tu van dung; pham vi song
-    // cua hai bang khong doi - truoc day apply_rotary_emb doc chung o DUNG
-    // cho nay, ngay sau qkv va truoc MoE cua lop.
+    // RoPE now lives in the qkv epilogue (and with GETP_ROPE_FUSED_KV so does the
+    // bf16 conversion into the cache slot). dev_cos_vals/dev_sin_vals are generated
+    // before the layer loop on the SAME stream, so the ordering still holds; the live range
+    // of the two tables is unchanged - apply_rotary_emb used to read them at EXACTLY
+    // this point, right after qkv and before the layer's MoE.
     getp_matmul_qkv_fused_bf16(dev_s->q, k_step, v_step, ext->pre_qkv_bf16,
                                dev_w_qkv, dev_b_qkv, hidden_dim, head_dim,
                                p->n_attn_heads, p->n_kv_heads, batch_size,

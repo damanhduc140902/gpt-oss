@@ -22,11 +22,11 @@ struct RunStateExt {
   // float *ext_gate_up;
   float *ext_t;
   float *ext_e_agg;
-  // Ban thu hai cua ext_e_agg, dung xen ke theo parity lop. Peer keo lat cat
-  // cua no tu buffer nay bang hipMemcpyPeerAsync tren memory_stream, va khong
-  // co gi chan gather cua lop ke tiep ghi de len khi ban sao chua xong. Hai
-  // buffer + barrier moi lop la du: gather(L+2) chi chay sau khi moi peer da
-  // qua barrier cua lop L+1, tuc sau khi ban sao cua lop L da hoan tat.
+  // A second copy of ext_e_agg, alternated by layer parity. A peer pulls its slice out of this
+  // buffer with hipMemcpyPeerAsync on memory_stream, and nothing stops the next layer's gather
+  // from overwriting it while that copy is still in flight. Two buffers plus the per-layer
+  // barrier are enough: gather(L+2) only runs after every peer has passed the layer L+1
+  // barrier, i.e. after layer L's copy has completed.
   float *ext_e_agg2;
   float *peer_e_agg;
 

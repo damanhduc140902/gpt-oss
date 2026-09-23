@@ -23,7 +23,7 @@ hipBLAS, no RCCL, no MPI. Every kernel, every collective and the tokenizer are w
 this repository. The only dependency is the HIP runtime itself.
 
 It began from [llama2.c](https://github.com/karpathy/llama2.c) and grew into a complete inference system.
-On a single node of 8 AMD MI250 GPUs it serves **69,309 tokens per second on the 20B model and 24,315 on
+On a single node of 8 AMD MI250 GPUs it serves **69,309 tokens per second on the 20B model and 25,994 on
 the 120B model**, while keeping the generated text faithful to a CPU reference.
 
 Two things are measured, and both have to hold:
@@ -225,7 +225,7 @@ Measured on one node of 8× AMD MI250 in batch (`getp`) mode.
 | Model          | Requests | Warm-up (s) | Inference (s) | Throughput (TPS) | METEOR | BERTScore |
 | -------------- | -------: | ----------: | ------------: | ---------------: | -----: | --------: |
 | `gpt-oss-20b`  |    12288 |          23 |           176 |        **69309** |  0.535 |     0.978 |
-| `gpt-oss-120b` |     6144 |         176 |           250 |        **24315** |  0.561 |     0.981 |
+| `gpt-oss-120b` |     6144 |          31 |           235 |        **25994** |  0.560 |     0.981 |
 
 Where those numbers came from, one optimisation at a time on the 20B model:
 
@@ -259,14 +259,22 @@ is not the same one:
 | Only the non-zero rows sent in the expert-output exchange               |      22760 | +11.4% |
 | The fourteen row-list launches per layer merged into two                |      23136 |  +1.4% |
 | Only the rows each peer needs sent in the expert-input exchange         |      23910 |  +3.9% |
-| The second sync point on per-peer events instead of a barrier           |  **24341** |  +1.8% |
+| The second sync point on per-peer events instead of a barrier           |      24341 |  +1.8% |
+| The expert output emitted one destination slice at a time               |      24685 |  +1.5% |
+| The attention-out tile chosen at run time from how full the GPU is      |      24902 |  +0.6% |
+| The expert-output exchange sent as bf16 instead of fp32 †               |  **26033** |  +4.5% |
 
 Each percentage is a paired measurement: the two builds run alternately in one session, twice each,
 against the same input. Absolute throughput moves about 1 % between sessions, so the rows are not
 strictly comparable across the table - the number that stands behind the summary above is the
-verification run of the shipped build, which measured 24,257 and 24,373 tok/s with no flags set,
-METEOR 0.561 and BERTScore 0.981. Those two scores are unchanged because the output is unchanged:
-every optimisation below is bit-exact and the 120B still hashes to `efe1096ff64c`.
+verification run of the shipped build, which measured 26,088 and 25,900 tok/s with no flags set.
+
+† Every row but the last is bit-exact. The last is not: the expert partial sums now cross the
+interconnect as bf16, so the 120B's output changes and it hashes to `18a57667bd03` where it used to
+hash to `efe1096ff64c`. It was therefore accepted on its scores rather than its hash - METEOR 0.5608
+to 0.5603 and BERTScore 0.9814 to 0.9805, against thresholds of 0.3 and 0.9 - and it is still
+reproducible from run to run. It is gated on `EXPERT_PARALLELISM > 2`, so the 20B never takes that
+path and still hashes to `720709b86d36`.
 
 At expert parallelism 8 the 120B spent 63% of every step with the GPUs idle, nearly all of it waiting
 on the expert exchange. The output half was seven dense 8.85 MB blocks per layer, one per peer,
@@ -311,13 +319,22 @@ optimisations in it, so they are not the ones those scores were computed from �
 scored without a GPU: `./run.sh eval 20b` reports METEOR 0.533 and BERTScore 0.978 on them, a hair
 under the table's METEOR and the same BERTScore.
 
-Repeating a run still moves throughput by over a percent — the two runs behind the 120B figure came in at 22,583 and 22,938, 1.6% apart — but it no longer moves the completions at all.
+Repeating a run still moves throughput - by about 1 % between sessions, less within one: the two runs behind the 120B figure came in at 26,088 and 25,900 - but it very rarely moves the completions.
 That was not always true: before the expert exchange was made pull-based, a receiver could read a peer's
 buffer while it was still being written, so two runs of the _same binary_ at 8 GPUs agreed on only about
-50 % to 95 % of output lines, run pair by run pair. With the pull in place the engine is reproducible, and every optimisation listed above
-was checked by hashing the output rather than by scoring it - the 20B against 720709b86d36 and the 120B
-against efe1096ff64c, both with zero differing lines. A hash is a far sharper instrument than METEOR
-when the claim is that a change moved no numbers, and it is what makes a 0.6% win safe to accept.
+50 % to 95 % of output lines, run pair by run pair. With the pull in place the 120B reproduces its hash from run to run, and every optimisation listed above
+but one was checked by hashing the output rather than by scoring it - the 20B against 720709b86d36 and
+the 120B against efe1096ff64c, both with zero differing lines. The exception is the bf16 return leg,
+which changes the 120B's numbers by design; it was judged on METEOR and BERTScore instead, and its
+output still hashes identically from one run to the next. A hash is a far sharper instrument than
+METEOR when the claim is that a change moved no numbers, and it is what makes a 0.6% win safe to accept.
+
+The 20B is not quite there. Of its last twelve full-length runs on the reference input, eleven hashed
+identically; the twelfth differed in 7 of its 12,288 lines, all of them requests served by the same
+GPU, and that same binary then gave the usual hash three times in a row. A change that altered the
+numbers would do so every time, so this is a rare ordering race still left somewhere on the 20B's
+two-device exchange path, and it has not been found yet. The 16-step gate behind 720709b86d36 has never missed;
+a single full-length 20B run that disagrees is rerun before it is read as evidence.
 
 ---
 

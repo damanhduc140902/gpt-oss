@@ -469,7 +469,7 @@ itself. The `yield()` is the concession to correctness if that assumption breaks
 Each 20B model group allocates its own `Barrier` on the heap, so the four groups never touch each
 other's cache lines. The 120B path builds one on the stack per 6144-request chunk.
 
-The composite primitive is `sync_workers_dev` ([`forward.hip:5216`](../src/hip/forward.hip)), which is what both per-layer sync points call in the default build (`GETP_DEVSYNC` defaults to 1 at [`forward.hip:5203-5205`](../src/hip/forward.hip); call sites [`5466`](../src/hip/forward.hip) and [`5620`](../src/hip/forward.hip)). It reduces to the drain-then-barrier form below whenever `EXPERT_PARALLELISM > 2` ([`forward.hip:5230-5234`](../src/hip/forward.hip)), which is the 120B configuration, and the older `sync_workers` function itself is on the live path only when the file is compiled with `-DGETP_DEVSYNC=0` ([`5469`](../src/hip/forward.hip), [`5623`](../src/hip/forward.hip)):
+The composite primitive is `sync_workers_dev` in [`forward.hip`](../src/hip/forward.hip), which is what the per-layer sync points call in the default build (`GETP_DEVSYNC` defaults to 1). On the 20B it serves both sync points. On the 120B the two are handled differently. Sync point 1 is the drain-then-barrier form below, with the row counts that `GETP_AGSKIP` needs read back in between. Sync point 2 no longer drains at all under `GETP_EVAGG`: each rank records an event after writing its expert output, a host barrier only guarantees that every rank has issued that record, and each pull waits on the one peer event it depends on. The older `sync_workers` function itself is on the live path only when the file is compiled with `-DGETP_DEVSYNC=0`:
 
 ```cpp
 inline void sync_workers(hipStream_t stream, Barrier &sync_point) {
@@ -484,7 +484,7 @@ reading a buffer a peer just wrote by `hipMemcpyPeerAsync`. At `EXPERT_PARALLELI
 configuration ([`run.cpp:54`](../src/getp/run.cpp)) — `sync_workers_dev` establishes the same
 precondition without the drain: it records an event on the stream that wrote the data, uses the
 barrier only to establish that every thread has issued its event, and makes the reading stream wait
-on each peer's event ([`forward.hip:5235-5241`](../src/hip/forward.hip)); see "Host synchronisations
+on each peer's event (the `n_dev <= 2` branch of `sync_workers_dev`); see "Host synchronisations
 on the critical path" below. Either way the sync point runs twice per layer: once before the
 hidden-state and top-k exchange, once after the MoE aggregate.
 
@@ -606,14 +606,14 @@ which took a `hipFree`, and with it a full-device synchronisation, off the criti
 token step.
 
 `hipEvent_t` objects are created once per thread, on the first call to `getp_forward_120b`, and never
-destroyed: `hipEvent_t` objects are created once per thread, on the first call to `getp_forward_120b`, and never
 destroyed: `2 + 2 × EXPERT_PARALLELISM` per thread — `event_rmsnorm`, `event_router_topk`, and one
-`events_e_agg` plus one `events_pull` for every peer ([`forward.hip:5286-5297`](../src/hip/forward.hip))
+`events_e_agg` plus one `events_pull` for every peer (created next to `getp_forward_120b`'s streams)
 — so 6 for the 20B model and 18 for the 120B model. On top of that the first `sync_workers_dev` call
 creates `GETP_SYNC_SLOTS = 128` events for its device and never destroys them
-([`forward.hip:5219-5221`](../src/hip/forward.hip)). That loop runs before the `n_dev > 2` early return,
-so the 120B configuration allocates all 128 and then never uses them — at `EXPERT_PARALLELISM > 2` the
-function falls back to the host barrier. With one thread per device that is 134 events for the 20B model
+(at the top of `sync_workers_dev`). That loop runs before the `n_dev > 2` early return, so the 120B
+configuration allocates all 128 and never uses them there. The 120B does use two other blocks of 128
+per device, `g_ev_eagg` and `g_ev_eagg_first`, for the event-ordered second sync point; sync point 1
+stays a barrier, which keeps two ranks within one layer of each other, so 128 slots is ample. With one thread per device that is 134 events for the 20B model
 and 146 for the 120B. Still a fixed, one-off cost per thread for the whole run, not a per-step leak.
 ([`forward.hip`](../src/hip/forward.hip)). That is a fixed handful per thread for the whole run, not
 a per-step leak.
@@ -680,7 +680,7 @@ shipped one runs. Working backwards from the published figures:
 | ----------------------------------------------------- | ----------- | ----------- |
 | Sequences in flight                                   | 12288       | 6144        |
 | Forward passes (`-n 1024`, `while (pos + 1 < steps)`) | 1023        | 1023        |
-| Measured throughput                                   | 69309 tok/s | 24315 tok/s |
+| Measured throughput                                   | 69309 tok/s | 25994 tok/s |
 | Implied token-step time                               | 172 ms      | 261 ms      |
 | Barrier crossings per step                            | 49          | 73          |
 | Host stream syncs per step                            | 1           | 73          |

@@ -375,7 +375,14 @@ bytes above, about 35 million carry nothing but zeros, and adding zero is exactl
 | In (reduce-scatter), non-zero rows only | fp32 | ~3,800,000 | ~26,600,000 |
 
 That is 93 MB per layer down to about 58 MB, and it measured 20,426 to 22,760 tok/s, +11.4 %, with the
-output hash unchanged.
+output hash unchanged. The receiver is not told how many rows are coming. After phase one it holds
+every slice of `ext_topk_i`, and expert ownership is the contiguous range `[expert_start, expert_end)`,
+so it derives the same row set the sender derived — the sender from its own `n_local`, the receiver
+from the top-k and the sender's range. `hipMemcpyPeerAsync` does still need the byte count on the host.
+It used to be read back right after sync point 2, where the stream had just been drained so the read
+cost nothing; `GETP_EVAGG` (below) removed that drain, and the count now comes from the table
+`GETP_AGSKIP` fills before sync point 1. The whole path disables itself at EP = 2, where the 20B would
+gain nothing from it in any case, since only 3 % of its rows are zero.
 
 `GETP_AGSKIP` (default 1) then does the same to the outbound direction, which `GETP_ROWSKIP` left
 alone. The all-gather was broadcasting all `BATCH_SIZE` rows to every peer, and the test for whether
@@ -386,15 +393,27 @@ it changes nothing. Measured on the real routing, 326 of 768 rows per peer pair,
 layer down to 13.2 MB. The list is the one `getp_rowskip_build_all_recv` already builds, moved above
 sync point 1 — it reads only this rank's own slice of the top-k, so it needs nothing from a peer —
 and the row counts reach the other ranks through plain host memory, since all eight ranks are threads
-of one process and the sync-point-1 barrier already orders the write against the reads. The receiver is not told how many rows are coming. After phase one it holds
-every slice of `ext_topk_i`, and expert ownership is the contiguous range `[expert_start, expert_end)`,
-so it derives the same row set the sender derived — the sender from its own `n_local`, the receiver
-from the top-k and the sender's range. `hipMemcpyPeerAsync` does still need the byte count on the host,
-which would normally force a stream sync; at EP > 2 it does not, because `sync_workers_dev` takes the
-`n_dev > 2` branch and has already called `hipStreamSynchronize`. Reading 32 bytes back at that exact
-point is free. That is also why the whole path disables itself at EP = 2, where the sync point uses
-events instead and a blocking copy would cost the overlap — and the 20B would gain nothing from it in
-any case, since only 3 % of its rows are zero.
+of one process and the sync-point-1 barrier already orders the write against the reads.
+
+`GETP_EVAGG` (default 1) orders the return leg with events instead of a barrier. Sync point 2 used to
+drain the stream and meet at a host barrier, so the GPU finished the expert output, then waited for the
+host to wake, for seven other threads, and for the host to issue the pulls - a round trip that sat in a
+1.57 ms gap per layer, 39 % of all idle time. Now each rank records an event after its expert output,
+the host barrier only guarantees every rank has issued that record (waiting on an event not yet recorded
+returns at once), and each pull waits on the one peer it depends on. Sync point 1 keeps its drain on
+purpose: it is cheap, 0.20 ms against 0.86 ms, and it keeps two ranks within one layer of each other,
+so an event slot is never reused while someone still waits on it. `GETP_GPSLICE` (default 1) then
+narrows that wait further: rank D pulls from D+1 first, and D+1 owes it slice D, so each rank computes
+that one slice first and records an early event for it, instead of making its first puller wait for
+all 6144 tokens. Both are bit-exact and measured +1.8 % and +1.5 %.
+
+`GETP_EAGG_BF16` (default 1) halves what is left of the reduce-scatter. After the two row-skips the
+return leg was the larger direction purely because of its element type - fp32 partial sums against
+bf16 activations, 26.6 MB against 13.2 MB per layer - so it now crosses as bf16 and is widened back to
+fp32 as it is added into `dev_x`; a rank's own slice never leaves the device and still adds in fp32.
+This is the one exchange change that is not bit-exact, so it was accepted on METEOR (0.5608 to 0.5603)
+and BERTScore (0.9814 to 0.9805) rather than on a hash, and it measured +4.5 %. It is gated on
+`EXPERT_PARALLELISM > 2`, so the 20B never takes it and keeps its exact-output gate.
 
 **`gpt-oss-20b`** — EP = 2, `BATCH_SIZE` = 1536, 1 peer:
 
@@ -410,17 +429,17 @@ Over a full decode step:
 |                                                             | `gpt-oss-20b` | `gpt-oss-120b` |
 | ----------------------------------------------------------- | ------------: | -------------: |
 | Layers                                                      |            24 |             36 |
-| P2P bytes per device per decode step                        |      ≈ 638 MB |      ≈ 1.44 GB |
+| P2P bytes per device per decode step                        |      ≈ 638 MB |      ≈ 0.96 GB |
 | `hipMemcpyPeerAsync` calls per device per layer, 4 × (EP−1) |             4 |             28 |
 | Global barriers per decode step, 2 per layer + 1            |            49 |             73 |
 
 Counting the whole phase, which direction dominates depends on `GETP_ROWSKIP`. With it on — the default, and active at EP 8, so this is the shipping configuration for 120B — inbound is the smaller side: about 26,600,000 B in against 31,137,792 B out per layer, because only the reduce-scatter is row-skipped and the all-gather still sends every row. With `GETP_ROWSKIP=0`, inbound is 61,931,520 B, a shade under twice outbound rather than exactly twice, because the outbound side also carries the two top-k arrays.
-outbound side also carries the two top-k arrays. With `GETP_AGSKIP` also on, that is 26,600,000 B in
-against about 13,300,000 B out per layer on 120B, from 61,931,520 against 31,137,792 before either.
+outbound side also carries the two top-k arrays. With `GETP_AGSKIP` and `GETP_EAGG_BF16` also on, it is
+about 13,300,000 B each way per layer on 120B, from 61,931,520 in against 31,137,792 out before any of them.
 
 These numbers are the argument for both the delta rotation and sending bf16 on the wire. Even after
-both row-skips, 1.44 GB of P2P traffic per device per token step is not something to leave
-half-duplex — and it was 3.35 GB before them.
+both row-skips and the bf16 return leg, 0.96 GB of P2P traffic per device per token step is not
+something to leave half-duplex — and it was 3.35 GB before them.
 
 Staging memory is the other cost. Every EP buffer is sized `EP × BATCH_SIZE × hidden_dim`, so on 120B:
 
@@ -435,7 +454,7 @@ Staging memory is the other cost. Every EP buffer is sized `EP × BATCH_SIZE × 
 | `peer_e_agg` | fp32 |      70.8 MB |
 | **Total**    |      | **≈ 319 MB** |
 
-`ext_e_agg2` is the second half of the layer-parity double buffer (`src/hip/forward.hip:5606`), so it is resident for the whole run and has to be counted.
+`ext_e_agg2` is the second half of the layer-parity double buffer (see `RunStateExt::ext_e_agg2`), so it is resident for the whole run and has to be counted.
 
 `peer_e_agg` is over-allocated: it gets EP slots and only ever uses EP−1, so about 8.8 MB of its 70.8 MB
 is never touched on 120B.

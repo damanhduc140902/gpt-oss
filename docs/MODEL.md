@@ -300,7 +300,7 @@ if (sampler->temperature == 0.0f) {
 }
 ```
 
-At temperature 0 the raw logits are used — no division, no softmax, no RNG draw. Since **0.0 is the default**, the default run is bit-reproducible for a fixed build, and both `-p 0.9` (top-p) and `-s` (seed, otherwise `time(NULL)`) are dead unless `-t` is raised. Above zero it is the llama2.c path unchanged: divide, softmax, then `sample_mult` or `sample_topp`, the latter cropping candidates below `(1 - topp) / (n - 1)` before a `qsort` so the nucleus filter does not sort 201,088 entries.
+At temperature 0 the raw logits are used — no division, no softmax, no RNG draw. Since **0.0 is the default**, the default run is bit-reproducible for a fixed build (on the 20B, all but a rare full-length run - see the README), and both `-p 0.9` (top-p) and `-s` (seed, otherwise `time(NULL)`) are dead unless `-t` is raised. Above zero it is the llama2.c path unchanged: divide, softmax, then `sample_mult` or `sample_topp`, the latter cropping candidates below `(1 - topp) / (n - 1)` before a `qsort` so the nucleus filter does not sort 201,088 entries.
 
 | Flag             | Default      | Note                                       |
 | ---------------- | ------------ | ------------------------------------------ |

@@ -141,15 +141,20 @@ python eval.py -m 20b -s /tmp/submission.txt
 
 Completions are written in request order, so output line _i_ is the answer to prompt _i_.
 
-The engine is reproducible: two runs of the same binary on the same input file produce identical
-output, and that is how changes are validated here -- the 20B against output hash 720709b86d36 and
-the 120B against efe1096ff64c, both with zero differing lines. Hashing the output, not METEOR or
+The engine is reproducible, bar the rare 20B case below: two runs of the same binary on the same
+input file produce identical output, and that is how changes are validated here -- the 20B against output hash 720709b86d36 and
+the 120B against 18a57667bd03, both with zero differing lines. (The 120B hashed to efe1096ff64c until
+the expert-output exchange moved to bf16; that one change was accepted on its METEOR and BERTScore,
+since it changes the numbers by design.) Hashing the output, not METEOR or
 BERTScore, is therefore the gate for any change that is supposed to move no numbers; the scores are
 the coarse backstop, too noisy to accept or reject a sub-percent change.
 
 It was not always so. Before the expert exchange became a pull, a receiver could read a peer's buffer
 while it was still being written, and two 8-GPU runs of the same binary agreed on only 50 % to
-95 % of output lines, run pair by run pair.
+95 % of output lines, run pair by run pair. The 20B still has a rare exception: of its last twelve
+full-length runs one differed in 7 of 12,288 lines, all of them requests served by one GPU, and the
+same binary then gave the usual hash three times running - a leftover ordering race, not a change
+in the numbers (see the main README).
 
 What the engine is still not is position-invariant: a completion depends on where its prompt sits in
 the batch. The same prompt at a different batch index takes a different numerical path through the
