@@ -261,6 +261,39 @@ void getp_rmsnorm_f32_bf16(float *o, __hip_bfloat16 *ob, float *x,
           o, ob, x, weight, dim);
 }
 
+// GETP_KV_HEADMAJOR (default 1): a layer's KV cache is [batch][kv_head][t][64] instead of
+// [t][batch][kv_dim], each (sequence, kv_head) region padded by GETP_KV_PAD elements. In the old
+// layout every key an attention workgroup reads is its own 128-byte piece, batch x kv_dim x 2 bytes
+// from the next one (1.5 MB on the 20B), and decode attention ran at 0.8 TB/s with the L1 waiting on
+// L2 88 % of the time. Head-major makes a 16-key tile one 2 KB block - but unpadded it was SLOWER on
+// full-context layers: each region is CAP x 128 bytes, so every region starts on the same memory
+// channel while the workgroups advance through t together. The pad staggers them. Op test (us, old
+// layout / head-major / head-major + 384 pad): 20B full T=1024 4051 / 4359 / 2651, T=512 2070 /
+// 1924 / 1358, 20B sliding 653 / 395 / 388, 120B full T=1024 2098 / 2919 / 1343 (pad 64 bad,
+// 128-256 good, 384 best, 512 worse). Only addresses change: bit-exact.
+// GETP_KV_OFF(t, b, col, B, KVD, CAP) is the
+// element offset of (ring slot t, batch row b, column col = kv_head * 64 + d) inside one layer, for B
+// batch rows, KVD = kv_dim columns and a ring of CAP slots; it is additive in t and (b, col), so a
+// slot pointer (t, 0, 0) plus the offset (0, b, col) addresses the element. head_dim is 64.
+// transformer.cpp (included before this file) sizes the cache with the same two macros.
+#ifndef GETP_KV_HEADMAJOR
+#define GETP_KV_HEADMAJOR 1
+#endif
+#ifndef GETP_KV_PAD
+#define GETP_KV_PAD 384
+#endif
+#if GETP_KV_HEADMAJOR
+#define GETP_KV_OFF(t, b, col, B, KVD, CAP)                                                    \
+  (((size_t)(b) * (size_t)((KVD) >> 6) + (size_t)((col) >> 6)) *                               \
+       ((size_t)(CAP) * 64 + GETP_KV_PAD) + (size_t)(t) * 64 + (size_t)((col) & 63))
+// Elements a layer occupies beyond CAP * B * KVD: its padding.
+#define GETP_KV_LAYER_PAD(B, KVD) ((size_t)(B) * (size_t)((KVD) >> 6) * GETP_KV_PAD)
+#else
+#define GETP_KV_OFF(t, b, col, B, KVD, CAP) \
+  ((size_t)(t) * (size_t)(B) * (size_t)(KVD) + (size_t)(b) * (size_t)(KVD) + (size_t)(col))
+#define GETP_KV_LAYER_PAD(B, KVD) ((size_t)0)
+#endif
+
 __global__ void kv_store_pair_fp32_to_bf16_kernel(
     const float *__restrict__ k, const float *__restrict__ v,
     __hip_bfloat16 *__restrict__ kdst, __hip_bfloat16 *__restrict__ vdst,
@@ -690,6 +723,25 @@ __device__ __forceinline__ bf16x4 mlp1_pack2(unsigned int lo, unsigned int hi) {
   return cvt.h;
 }
 
+// GETP_MLP1_AHEAD2 (default 1): mlp1's HBM loads go two k tiles ahead, branch-free, between the
+// MFMAs. The one-ahead loop issued tile t+1 at the top of step t and needed it at the end of the
+// same step, from basic blocks of its own (`if (r < tcnt && kk + 7 < H)`, zero fills), so all six
+// loads went out in one burst; removing the loads altogether made mlp1 10-13 % faster while serving
+// the weights from L2 saved only 1-6 %, i.e. the loads cost latency, not bandwidth. Now step t loads
+// tile t+2 into register set t&1 while it writes tile t+1 from set (t+1)&1 to LDS, and a row past
+// tcnt / a column past I / a tile past the end read a clamped valid address instead of branching: an
+// MFMA output row depends only on its own A row (a column only on its own B column), and the epilogue
+// never stores those. Op test (one rank, us, 120B typical / 120B hot / 20B): 1250 / 2296 / 1969 ->
+// 1199 / 2234 / 1889. Bit-exact. Needs H % (2 * BK) == 0; 0 restores the one-ahead loop.
+#ifndef GETP_MLP1_AHEAD2
+#define GETP_MLP1_AHEAD2 1
+#endif
+// MFMAs between two consecutive HBM loads of the two-ahead loop (6 loads over 64 MFMAs; 7..10 are
+// equal within noise, 4 is 1 % slower).
+#ifndef GETP_MLP1_LOAD_GAP
+#define GETP_MLP1_LOAD_GAP 10
+#endif
+template <int V> struct Mlp1Parity { static constexpr int value = V; };
 // GATHER: when enabled, A_in is no longer a pre-copied [pair][H] table but ext_t_bf16
 // [token][H] itself; the tile's row comes from tok_idx[pos]. See the note where `arow` is
 // computed. GATHER = false generates exactly the old code (tok_idx is optimised away).
@@ -903,6 +955,127 @@ mlp1_swiglu_bf16_bucketed_kernel_outbf16_tuned(
   }
   __syncthreads();
 
+#if GETP_MLP1_AHEAD2
+  // HBM loads two k tiles ahead (see GETP_MLP1_AHEAD2): step t loads tile t+2 into set t&1 and
+  // writes tile t+1 from set (t+1)&1 to LDS. Unrolled by two so each set has a fixed register name.
+  uint4 sX[2][nbLoadsX], sWG[2][nbLoadsW], sWU[2][nbLoadsW];
+  // Branch-free: clamped row, column and k tile; `kt` is the k offset of the tile.
+  auto load_set = [&](uint4 (&rX)[nbLoadsX], uint4 (&rG)[nbLoadsW], uint4 (&rU)[nbLoadsW], int kt) {
+    const int kc = min(kt, H - BK);
+    #pragma unroll
+    for (int i = 0; i < nbLoadsX; ++i) {
+      const int r = min(loadX_y8 + i * strideX8, tcnt - 1);
+      const int pos = GATHER ? arow[i] : (base + r);
+      rX[i] = *reinterpret_cast<const uint4*>(A_in + (size_t)pos * H + kc + 8 * loadX_x8);
+    }
+    #pragma unroll
+    for (int i = 0; i < nbLoadsW; ++i) {
+      const int col = min(colBase + loadW_y + i * strideW, I - 1);
+      rG[i] = *reinterpret_cast<const uint4*>(W1 + w1_e + (size_t)(2 * col + 0) * H + kc + 8 * loadW_x);
+      rU[i] = *reinterpret_cast<const uint4*>(W1 + w1_e + (size_t)(2 * col + 1) * H + kc + 8 * loadW_x);
+    }
+  };
+  load_set(sX[1], sWG[1], sWU[1], BK);
+  auto kstep = [&](auto S_, int bk) {
+    constexpr int S = decltype(S_)::value;
+    load_set(sX[S], sWG[S], sWU[S], bk + 2 * BK);
+    // MFMA ILP optimization: Pre-load all vectors to improve instruction-level parallelism
+    #pragma unroll
+    for (int k = 0; k < BK; k += 16) {
+      // basek = k + 4*yMF is always a multiple of 4 -> plane k0 = basek/4 = (k>>2) + yMF.
+      const int kslot = (k >> 2) + yMF;
+
+      // Pre-load all activation vectors
+      bf16x4 av_array[nIterM];
+      #pragma unroll
+      for (int im = 0; im < nIterM; ++im) {
+        const int row = yTile * WM + im * 16 + xMF;
+        av_array[im] = sxs[(size_t)kslot * SM + row];            // 1 x ds_read_b64
+      }
+
+      // Compute with better ILP
+      #pragma unroll
+      for (int im = 0; im < nIterM; ++im) {
+        const bf16x4 av = av_array[im];
+
+        #pragma unroll
+        for (int g = 0; g < BN_AGG; ++g) {
+          const int col_base = xTile * WN + xMF + g * BN;
+
+          // Pre-load all weight vectors for this aggregation group
+          bf16x4 gv_array[nIterN];
+          bf16x4 uv_array[nIterN];
+          #pragma unroll
+          for (int in = 0; in < nIterN; ++in) {
+            const int c = col_base + in * 16;
+            gv_array[in] = swgs[(size_t)kslot * SN + c];         // 1 x ds_read_b64
+            uv_array[in] = swus[(size_t)kslot * SN + c];         // 1 x ds_read_b64
+          }
+
+          // Execute MFMAs with all data in registers
+          #pragma unroll
+          for (int in = 0; in < nIterN; ++in) {
+            dg_acc[g][im][in] = __builtin_amdgcn_mfma_f32_16x16x16bf16_1k(av, gv_array[in], dg_acc[g][im][in], 0, 0, 0);
+            du_acc[g][im][in] = __builtin_amdgcn_mfma_f32_16x16x16bf16_1k(av, uv_array[in], du_acc[g][im][in], 0, 0, 0);
+          }
+        }
+      }
+    }
+
+    // Pinned schedule (mask 0x0100 = LDS read, 0x0008 = MFMA, 0x0020 = VMEM read): the LDS reads
+    // first, since the MFMAs wait on them, then one HBM load every GETP_MLP1_LOAD_GAP MFMAs. The
+    // loads are for two steps later, so nothing waits on them here. (Splitting the LDS reads - the
+    // second 16-deep half's reads spread over the first half's MFMAs - measured 1-3 % slower.)
+    __builtin_amdgcn_sched_group_barrier(0x0100, 20, 0);
+    #pragma unroll
+    for (int i = 0; i < nbLoadsX + 2 * nbLoadsW; ++i) {
+      __builtin_amdgcn_sched_group_barrier(0x0008, GETP_MLP1_LOAD_GAP, 0);
+      __builtin_amdgcn_sched_group_barrier(0x0020, 1, 0);
+    }
+    __builtin_amdgcn_sched_group_barrier(0x0008, 64 - (nbLoadsX + 2 * nbLoadsW) * GETP_MLP1_LOAD_GAP, 0);
+    __builtin_amdgcn_sched_barrier(0);
+    __syncthreads();
+    {
+      const uint4 (&regX)[nbLoadsX] = sX[1 - S];
+      const uint4 (&regWG)[nbLoadsW] = sWG[1 - S];
+      const uint4 (&regWU)[nbLoadsW] = sWU[1 - S];
+      #pragma unroll
+      for (int i = 0; i < nbLoadsX; ++i) {
+        int off = i * strideX8;
+        const int r = loadX_y8 + off;
+
+        bf16x4* dst = &sxs[(size_t)((LOAD_VEC * loadX_x8) / KP) * SM + r];
+
+        const uint4 v = regX[i];
+
+        dst[0]  = mlp1_pack2(v.x, v.y);
+        dst[SM] = mlp1_pack2(v.z, v.w);
+      }
+
+      #pragma unroll
+      for (int i = 0; i < nbLoadsW; ++i) {
+        int off = i * strideW;
+
+        bf16x4* dg = &swgs[(size_t)((8 * loadW_x) / KP) * SN + (loadW_y + off)];
+        bf16x4* du = &swus[(size_t)((8 * loadW_x) / KP) * SN + (loadW_y + off)];
+
+        const uint4 wg = regWG[i];
+        const uint4 wu = regWU[i];
+
+        dg[0]  = mlp1_pack2(wg.x, wg.y);
+        dg[SN] = mlp1_pack2(wg.z, wg.w);
+        du[0]  = mlp1_pack2(wu.x, wu.y);
+        du[SN] = mlp1_pack2(wu.z, wu.w);
+      }
+    }
+    __syncthreads();
+  };
+  #pragma unroll 1
+  for (int bk = 0; bk < H; bk += 2 * BK) {     // H % (2 * BK) == 0: the launcher checks
+    kstep(Mlp1Parity<0>{}, bk);
+    kstep(Mlp1Parity<1>{}, bk + BK);
+  }
+#else
   #pragma unroll 1
   for (int bk = 0; bk < H; bk += BK) {
     uint4 regX[nbLoadsX];
@@ -1034,6 +1207,7 @@ mlp1_swiglu_bf16_bucketed_kernel_outbf16_tuned(
 
     __syncthreads();
   }
+#endif
 
   const int xD = lane & 15;
   const int yD = 4 * (lane >> 4);
@@ -1184,6 +1358,20 @@ struct Mlp2LdsPlan {
                 "the W tile base must be 16-byte aligned");
   static_assert(bytes <= 64u * 1024u, "the mlp2 LDS tile exceeds 64 KB/CU");
 };
+
+// GETP_MLP2_AHEAD2 (default 1): mlp2's HBM loads two k tiles ahead, branch-free, between the MFMAs
+// - the same change as GETP_MLP1_AHEAD2 (clamped row tcnt-1, column H-1, last k tile; those outputs
+// are never stored). Op test (one rank, us, 120B typical / 120B hot / 20B): 662 / 1298 / 1158 ->
+// 625 / 1204 / 1056. Bit-exact. Needs the unsplit kernel (MATMUL_MLP2_MAX_SPLITS = 1) and
+// I % (2 * BK) == 0; 0 restores the one-ahead loop.
+#ifndef GETP_MLP2_AHEAD2
+#define GETP_MLP2_AHEAD2 1
+#endif
+// MFMAs between two consecutive HBM loads (5 loads in the 30 MFMAs after the LDS reads; 2-6 equal).
+#ifndef GETP_MLP2_LOAD_GAP
+#define GETP_MLP2_LOAD_GAP 4
+#endif
+template <int V> struct Mlp2Parity { static constexpr int value = V; };
 
 // Pack two dwords into one slot of 4 x bf16. A pure retype: both VGPRs are already in place,
 // so it emits no VALU instruction (unlike the old version's 4 half-word extracts).
@@ -1386,6 +1574,118 @@ mlp2_partial_bf16_bucketed_splitk_kernel_inbf16_tuned(
 
   __syncthreads();
 
+#if GETP_MLP2_AHEAD2
+  // Branch-free HBM loads two k tiles ahead (see GETP_MLP2_AHEAD2): step t loads tile t+2 into set
+  // t&1 and writes tile t+1 from set (t+1)&1 to LDS. Unrolled by two so each set has a fixed name.
+  uint4 sX[2][nbLoadsX], sW[2][nbLoadsW];
+  auto load_set = [&](uint4 (&rX)[nbLoadsX], uint4 (&rW)[nbLoadsW], int kt) {
+    const int kc = min(kt, kEnd - BK);
+    #pragma unroll
+    for (int i = 0; i < nbLoadsX; ++i) {
+      const int r = min(loadX_y8 + i * strideX8, tcnt - 1);
+      rX[i] = *reinterpret_cast<const uint4*>(gate_up_bf16 + (size_t)(base + r) * (size_t)I + kc + LOAD_VEC * loadX_x8);
+    }
+    #pragma unroll
+    for (int i = 0; i < nbLoadsW; ++i) {
+      const int col = min(colBase + loadW_y + i * strideW, H - 1);
+      rW[i] = *reinterpret_cast<const uint4*>(W2 + w2_e + (size_t)col * (size_t)I + kc + 8 * loadW_x);
+    }
+  };
+  load_set(sX[1], sW[1], kBeg + BK);
+  auto kstep = [&](auto S_, int bk) {
+    constexpr int S = decltype(S_)::value;
+    load_set(sX[S], sW[S], bk + 2 * BK);
+    // ---- Compute: read substep k+16's LDS fragments BEFORE substep k's MFMA chain ----
+    // See the note of the same name in mlp1: the ds_read latency -> s_waitcnt -> MFMA runs
+    // back to back for most of the kernel's time; two fragment buffers in registers let the
+    // next substep's ds_read issue ahead of the previous substep's MFMA. Bit-exact.
+    bf16x4 fa[2][nIterM];
+    bf16x4 fb[2][BN_AGG][nIterN];
+    auto load_frags = [&](int k, int buf) {
+      const int kslot = (k >> 2) + yMF;
+      #pragma unroll
+      for (int im = 0; im < nIterM; ++im)
+        fa[buf][im] = sxs[kslot * SM + yTile * WM + im * 16 + xMF];          // ds_read_b64
+      #pragma unroll
+      for (int g = 0; g < BN_AGG; ++g) {
+        #pragma unroll
+        for (int in = 0; in < nIterN; ++in)
+          fb[buf][g][in] = sws[kslot * SN + xTile * WN + xMF + g * BN + in * 16]; // ds_read_b64
+      }
+    };
+    load_frags(0, 0);
+    #pragma unroll
+    for (int k = 0; k < BK; k += 16) {
+      const int cur = (k / 16) & 1;
+      if (k + 16 < BK) load_frags(k + 16, cur ^ 1);
+      #pragma unroll
+      for (int im = 0; im < nIterM; ++im) {
+        #pragma unroll
+        for (int g = 0; g < BN_AGG; ++g) {
+          #pragma unroll
+          for (int in = 0; in < nIterN; ++in)
+            d_acc[g][im][in] = __builtin_amdgcn_mfma_f32_16x16x16bf16_1k(fa[cur][im], fb[cur][g][in], d_acc[g][im][in], 0, 0, 0);
+        }
+      }
+    }
+    // The one-ahead loop's pinned order (substep 0's reads, then one read of substep 1 per 3
+    // MFMAs), with the HBM loads spread over the trailing MFMAs.
+    __builtin_amdgcn_sched_group_barrier(0x0100, 6, 0);
+    #pragma unroll
+    for (int i = 0; i < 6; ++i) {
+      __builtin_amdgcn_sched_group_barrier(0x0008, 3, 0);
+      __builtin_amdgcn_sched_group_barrier(0x0100, 1, 0);
+    }
+    #pragma unroll
+    for (int i = 0; i < nbLoadsX + nbLoadsW; ++i) {
+      __builtin_amdgcn_sched_group_barrier(0x0008, GETP_MLP2_LOAD_GAP, 0);
+      __builtin_amdgcn_sched_group_barrier(0x0020, 1, 0);
+    }
+    __builtin_amdgcn_sched_group_barrier(0x0008, 30 - (nbLoadsX + nbLoadsW) * GETP_MLP2_LOAD_GAP, 0);
+    __builtin_amdgcn_sched_barrier(0);
+    __syncthreads();
+    {
+      const uint4 (&regX)[nbLoadsX] = sX[1 - S];
+      const uint4 (&regW)[nbLoadsW] = sW[1 - S];
+      // Store activation with padding
+      #pragma unroll
+      for (int i = 0; i < nbLoadsX; ++i) {
+        int off = i * strideX8;
+        const int r = loadX_y8 + off;
+        const int pos = base + r;
+
+        // 8 consecutive shorts along k of ONE row = 2 adjacent slots along the k0 plane axis.
+        bf16x4* dst = &sxs[((LOAD_VEC * loadX_x8) / KP) * SM + r];
+
+        const uint4 v = regX[i];
+
+        dst[0]  = mlp2_pack2(v.x, v.y);   // k+0 .. k+3   ds_write_b64
+        dst[SM] = mlp2_pack2(v.z, v.w);   // k+4 .. k+7   ds_write_b64
+      }
+
+      // Store weight with padding
+      #pragma unroll
+      for (int i = 0; i < nbLoadsW; ++i) {
+        int off = i * strideW;
+        const int col = colBase + loadW_y + off;
+
+        static_assert(LOAD_VEC == 2 * KP, "one uint4 from HBM must cover exactly 2 KPack slots");
+        bf16x4* dst = &sws[((8 * loadW_x) / KP) * SN + (loadW_y + off)];
+
+        const uint4 wb = regW[i];
+
+        dst[0]  = mlp2_pack2(wb.x, wb.y);   // k+0 .. k+3   ds_write_b64
+        dst[SN] = mlp2_pack2(wb.z, wb.w);   // k+4 .. k+7   ds_write_b64
+      }
+    }
+    __syncthreads();
+  };
+  #pragma unroll 1
+  for (int bk = kBeg; bk < kEnd; bk += 2 * BK) {   // (kEnd - kBeg) % (2 * BK) == 0: the launcher checks
+    kstep(Mlp2Parity<0>{}, bk);
+    kstep(Mlp2Parity<1>{}, bk + BK);
+  }
+#else
   #pragma unroll 1
   for (int bk = kBeg; bk < kEnd; bk += BK) {
     uint4 regX[nbLoadsX];
@@ -1517,6 +1817,7 @@ mlp2_partial_bf16_bucketed_splitk_kernel_inbf16_tuned(
 
     __syncthreads();
   }
+#endif
 
   // ---- Epilogue -------------------------------------------------------------
   // The old version loaded the bias and w_by_bucket INSIDE the store loop, after the per-row
@@ -1625,6 +1926,12 @@ static inline void launch_mlp1_swiglu_bf16_bucketed_outbf16(
   constexpr int BN_AGG = 2;
   constexpr int BNt = BN * BN_AGG;
   using LdsPlan = Mlp1LdsPlan<BM, BNt, BK, MATMUL_MLP1_LDS_PAD_SLOTS>;
+#if GETP_MLP1_AHEAD2
+  if (H % (2 * BK) != 0) {
+    fprintf(stderr, "mlp1: GETP_MLP1_AHEAD2 needs H %% (2 * BK) == 0 (H = %d)\n", H);
+    abort();
+  }
+#endif
   dim3 block(THREADS);
   dim3 grid((I + BNt - 1) / BNt, total_blocks);
   // ONE source of truth for the LDS size - the same plan the kernel body uses.
@@ -1679,6 +1986,13 @@ static inline void launch_mlp2_partial_bf16_bucketed_frombf16(
   const int max_splits_by_K = max(1, (I + BK - 1) / BK);
   splits = min(splits, max_splits_by_K);
   splits = min(splits, MATMUL_MLP2_MAX_SPLITS);
+#if GETP_MLP2_AHEAD2
+  // The two-ahead loop runs the whole k range in pairs of tiles: no split, I % (2 * BK) == 0.
+  if (splits != 1 || I % (2 * BK) != 0) {
+    fprintf(stderr, "mlp2: GETP_MLP2_AHEAD2 needs splits == 1 and I %% (2 * BK) == 0 (I = %d)\n", I);
+    abort();
+  }
+#endif
 
   if (splits > 1) {
     int total_pairs = 0;
@@ -2106,6 +2420,19 @@ __device__ __forceinline__ bf16x4 getp_qkv_pack2(unsigned int lo,
   return __builtin_bit_cast(bf16x4, p);
 }
 
+// The qkv GEMM's HBM loads can go two k tiles ahead, branch-free (the change GETP_MLP1_AHEAD2
+// describes; template argument AHEAD2). Op test: M = 768 (the 120B, 240 blocks, one round) 275 ->
+// 259 us, M = 1536 (the 20B, 480 blocks, 1.5 rounds) 455 -> 480 us, so the launcher takes it for
+// M <= GETP_QKV_AHEAD2_MAXM only. Bit-exact either way.
+#ifndef GETP_QKV_AHEAD2_MAXM
+#define GETP_QKV_AHEAD2_MAXM 1024
+#endif
+// MFMAs between two consecutive HBM loads of the two-ahead loop.
+#ifndef GETP_QKV_LOAD_GAP
+#define GETP_QKV_LOAD_GAP 4
+#endif
+template <int V> struct QkvParity { static constexpr int value = V; };
+template <bool AHEAD2>
 __global__ void __launch_bounds__(256)
 new_matmul_qkv_fused_kernel(
   float *__restrict__ q_out, float *__restrict__ k_out,
@@ -2117,9 +2444,11 @@ new_matmul_qkv_fused_kernel(
   // hundred bytes - it sits in L1 after the first touch).
   // rope_cos == nullptr => fully off, the epilogue runs exactly the old path.
   , const float *rope_cos, const float *rope_sin, int head_dim
-  // Only read under GETP_ROPE_FUSED_KV: this step's KV cache slot.
+  // Only read under GETP_ROPE_FUSED_KV: this step's KV cache slot (the layer base plus
+  // GETP_KV_OFF(slot, 0, 0, ...)), and the layer's ring capacity.
   , __hip_bfloat16 *__restrict__ k_slot_bf16
   , __hip_bfloat16 *__restrict__ v_slot_bf16
+  , int kv_cap
   // 1/sqrt(head_dim); only read under GETP_Q_BF16. See qbf16.
   , float q_scale
 #endif
@@ -2252,6 +2581,87 @@ new_matmul_qkv_fused_kernel(
   }
   __syncthreads();
 
+  if constexpr (AHEAD2) {
+  // Branch-free HBM loads two k tiles ahead: step t loads tile t+2 into set t&1 and writes tile
+  // t+1 from set (t+1)&1 to LDS. Unrolled by two so each set has a fixed register name.
+  uint4 sX[2][nbLoadsX], sW[2][nbLoadsW];
+  auto load_set = [&](uint4 (&rX)[nbLoadsX], uint4 (&rW)[nbLoadsW], int kt) {
+    const int kc = min(kt, K - BK);
+    #pragma unroll
+    for (int i = 0; i < nbLoadsX; ++i) {
+      const int index_y = min(BM * (int)blockIdx.y + loadXIdx_y + i * strideX, M - 1);
+      rX[i] = *reinterpret_cast<const uint4 *>(&x[index_y * K + kc + 8 * loadXIdx_x]);
+    }
+    #pragma unroll
+    for (int i = 0; i < nbLoadsW; ++i) {
+      const int index_y = min(BN * (int)blockIdx.x + loadWIdx_y + i * strideW, N - 1);
+      rW[i] = *reinterpret_cast<const uint4 *>(&w[index_y * K + kc + 8 * loadWIdx_x]);
+    }
+  };
+  load_set(sX[1], sW[1], BK);
+  auto kstep = [&](auto S_, int bkIdx) {
+    constexpr int S = decltype(S_)::value;
+    load_set(sX[S], sW[S], bkIdx + 2 * BK);
+    // Computing
+    #pragma unroll
+    for (int k = 0; k < BK; k += MFMA_K) {
+      #pragma unroll
+      for (int iterWaveM = 0; iterWaveM < nIterWaveM; ++iterWaveM) {
+        #pragma unroll
+        for (int iterWaveN = 0; iterWaveN < nIterWaveN; ++iterWaveN) {
+          // basek = k + 4*(lane>>4) is always a multiple of 4, so a row's 4 k elements fit
+          // inside ONE slot -> 1 x ds_read_b64 instead of 4 x
+          // ds_read_u16. Ak/Bk are kept so the MFMA lane mapping stays visible.
+          x_local = xss[((k + Ak) / KP) * SX +
+                        (yInBlockTile * WM + MFMA_M * iterWaveM + Ai)];
+          w_local = wss[((k + Bk) / KP) * SW +
+                        (xInBlockTile * WN + MFMA_N * iterWaveN + Bj)];
+
+          CDfloat y_local = acc_local[iterWaveM * nIterWaveN + iterWaveN];
+          y_local  = __builtin_amdgcn_mfma_f32_16x16x16bf16_1k(x_local, w_local, y_local, 0, 0, 0);
+          acc_local[iterWaveM * nIterWaveN + iterWaveN] = y_local;
+        }
+      }
+    }
+    // LDS reads first (the MFMAs wait on them), then one HBM load every GETP_QKV_LOAD_GAP MFMAs.
+    constexpr int NMF = (BK / MFMA_K) * nIterWaveM * nIterWaveN;
+    constexpr int NLD = nbLoadsX + nbLoadsW;
+    static_assert(NLD * GETP_QKV_LOAD_GAP <= NMF, "GETP_QKV_LOAD_GAP too large for this tile");
+    __builtin_amdgcn_sched_group_barrier(0x0100, (BK / MFMA_K) * (nIterWaveM + nIterWaveN), 0);
+    #pragma unroll
+    for (int i = 0; i < NLD; ++i) {
+      __builtin_amdgcn_sched_group_barrier(0x0008, GETP_QKV_LOAD_GAP, 0);
+      __builtin_amdgcn_sched_group_barrier(0x0020, 1, 0);
+    }
+    __builtin_amdgcn_sched_group_barrier(0x0008, NMF - NLD * GETP_QKV_LOAD_GAP, 0);
+    __builtin_amdgcn_sched_barrier(0);
+    __syncthreads();
+    {
+      const uint4 (&regX)[nbLoadsX] = sX[1 - S];
+      const uint4 (&regW)[nbLoadsW] = sW[1 - S];
+      #pragma unroll
+      for (int i = 0; i < nbLoadsX; ++i) {
+        int offset = i * strideX;
+        bf16x4 *dst = &xss[((8 * loadXIdx_x) / KP) * SX + (loadXIdx_y + offset)];
+        dst[0]  = getp_qkv_pack2(regX[i].x, regX[i].y);
+        dst[SX] = getp_qkv_pack2(regX[i].z, regX[i].w);
+      }
+      #pragma unroll
+      for (int i = 0; i < nbLoadsW; ++i) {
+        int offset = i * strideW;
+        bf16x4 *dst = &wss[((8 * loadWIdx_x) / KP) * SW + (loadWIdx_y + offset)];
+        dst[0]  = getp_qkv_pack2(regW[i].x, regW[i].y);
+        dst[SW] = getp_qkv_pack2(regW[i].z, regW[i].w);
+      }
+    }
+    __syncthreads();
+  };
+  #pragma unroll 1
+  for (int bkIdx = 0; bkIdx < K; bkIdx += 2 * BK) {   // K % (2 * BK) == 0: the launcher checks
+    kstep(QkvParity<0>{}, bkIdx);
+    kstep(QkvParity<1>{}, bkIdx + BK);
+  }
+  } else {
   #pragma unroll 1
   for (int bkIdx = 0; bkIdx < K; bkIdx += BK) {
     // Prefetch
@@ -2315,6 +2725,7 @@ new_matmul_qkv_fused_kernel(
       }
     }
     __syncthreads();
+  }
   }
 
 #if GETP_ROPE_FUSED
@@ -2388,11 +2799,9 @@ new_matmul_qkv_fused_kernel(
 #if GETP_ROPE_FUSED_KV
               // kv_store_pair_fp32_to_bf16 has been removed: writing bf16 directly here uses
               // EXACTLY the old rounding helper, so the values match bit for bit.
-              unsigned short *dst =
-                  reinterpret_cast<unsigned short *>(k_slot_bf16) +
-                  (size_t)global_y * k_len;
-              dst[gx1 - q_len] = f32_to_bf16bits(o1);
-              dst[gx2 - q_len] = f32_to_bf16bits(o2);
+              unsigned short *dst = reinterpret_cast<unsigned short *>(k_slot_bf16);
+              dst[GETP_KV_OFF(0, global_y, gx1 - q_len, M, k_len, kv_cap)] = f32_to_bf16bits(o1);
+              dst[GETP_KV_OFF(0, global_y, gx2 - q_len, M, k_len, kv_cap)] = f32_to_bf16bits(o2);
 #else
               float *dst = k_out + (size_t)global_y * k_len;
               dst[gx1 - q_len] = o1;
@@ -2424,7 +2833,7 @@ new_matmul_qkv_fused_kernel(
           if (global_y < M) {
             if (b) result += __bfloat162float(b[global_x]);
             reinterpret_cast<unsigned short *>(v_slot_bf16)
-                [(size_t)global_y * v_len + (global_x - q_len - k_len)] =
+                [GETP_KV_OFF(0, global_y, global_x - q_len - k_len, M, v_len, kv_cap)] =
                     f32_to_bf16bits(result);
           }
         }
@@ -2472,6 +2881,7 @@ new_matmul_qkv_fused_kernel(
   // than leaving a warning floating around.
   (void)k_slot_bf16;
   (void)v_slot_bf16;
+  (void)kv_cap;
 #endif
 }
 
@@ -2486,9 +2896,12 @@ static inline void getp_matmul_qkv_fused_bf16(
     // No default value: if any call site has not been updated, that must be a COMPILE ERROR
     // rather than a silent fall-through to the old path.
     , const float *rope_cos, const float *rope_sin,
-    __hip_bfloat16 *k_slot, __hip_bfloat16 *v_slot
+    __hip_bfloat16 *k_slot, __hip_bfloat16 *v_slot, int kv_cap
 #endif
     ) {
+#if GETP_KV_HEADMAJOR && !GETP_ROPE_FUSED_KV
+#error "GETP_KV_HEADMAJOR needs GETP_ROPE_FUSED_KV: the unfused KV store writes the old layout"
+#endif
 
   const int q_len = head_dim * n_attn_heads;
   const int k_len = head_dim * n_kv_heads;
@@ -2497,6 +2910,9 @@ static inline void getp_matmul_qkv_fused_bf16(
   const int M = batch_size;
   const int N = q_len + k_len + v_len;
   const int K = n;
+  // Two-ahead loads for small batches only (see GETP_QKV_AHEAD2_MAXM); they need an even number of
+  // k tiles.
+  const bool ahead2 = M <= GETP_QKV_AHEAD2_MAXM && K % (2 * GetpQkvTile::BK) == 0;
 
   // ONE source of truth for the block geometry: taken from the constants the kernel body uses.
   // The old code here had 'const int BK = 16;' while the kernel body used BK = 32 -
@@ -2541,12 +2957,22 @@ static inline void getp_matmul_qkv_fused_bf16(
     std::abort();
   }
 #endif
-  new_matmul_qkv_fused_kernel<<<grid, block, 0, stream>>>(
+  if (ahead2)
+    new_matmul_qkv_fused_kernel<true><<<grid, block, 0, stream>>>(
       q, k, v, x_bf16, w_qkv_bf16, b_qkv_bf16, n, q_len, k_len, v_len,
       batch_size, rope_ok ? rope_cos : nullptr, rope_sin, head_dim,
-      k_slot, v_slot, 1.0f / sqrtf((float)head_dim));
+      k_slot, v_slot, kv_cap, 1.0f / sqrtf((float)head_dim));
+  else
+    new_matmul_qkv_fused_kernel<false><<<grid, block, 0, stream>>>(
+      q, k, v, x_bf16, w_qkv_bf16, b_qkv_bf16, n, q_len, k_len, v_len,
+      batch_size, rope_ok ? rope_cos : nullptr, rope_sin, head_dim,
+      k_slot, v_slot, kv_cap, 1.0f / sqrtf((float)head_dim));
 #else
-  new_matmul_qkv_fused_kernel<<<grid, block, 0, stream>>>(
+  if (ahead2)
+    new_matmul_qkv_fused_kernel<true><<<grid, block, 0, stream>>>(
+      q, k, v, x_bf16, w_qkv_bf16, b_qkv_bf16, n, q_len, k_len, v_len, batch_size);
+  else
+    new_matmul_qkv_fused_kernel<false><<<grid, block, 0, stream>>>(
       q, k, v, x_bf16, w_qkv_bf16, b_qkv_bf16, n, q_len, k_len, v_len, batch_size);
 #endif
 
@@ -3364,6 +3790,12 @@ void getp_vecadd(float *x, float *y, int size, int batch_size,
 #define FLASH_P_HILO 0
 #endif
 
+// Two KV tiles in flight per wave instead of one; see the loop. Bit-exact. On the time-major KV layout
+// this gained nothing; on the padded head-major one (GETP_KV_HEADMAJOR) it is 2-4 % (a full 20B layer at
+// 1024 keys, 2651 -> 2605 us), at 140 registers - three waves per SIMD instead of four.
+#ifndef GETP_ATTN_PREFETCH2
+#define GETP_ATTN_PREFETCH2 1
+#endif
 template <int HPW, bool APPLY_MASK>
 __global__ void __launch_bounds__(64 * (8 / HPW))
 flash_attn_decode_mfma16_kernel(
@@ -3476,8 +3908,8 @@ flash_attn_decode_mfma16_kernel(
     const int offset  = i * strideKV;
     const int index_y = t_start + ly + offset;
     if (index_y < t_end) {
-      const size_t off = (size_t)(index_y % cache_tcap) * batch_size * kv_dim +
-                         (size_t)b * kv_dim + (size_t)kv_h * head_dim + 8 * lx;
+      const size_t off = GETP_KV_OFF(index_y % cache_tcap, b, kv_h * head_dim + 8 * lx,
+                                     batch_size, kv_dim, cache_tcap);
       put16(&ks[ly + offset][lx * 8], *reinterpret_cast<const uint4 *>(key_cache + off));
       put16(&vs[ly + offset][lx * 8], *reinterpret_cast<const uint4 *>(value_cache + off));
     } else {
@@ -3496,6 +3928,214 @@ flash_attn_decode_mfma16_kernel(
   float m_run = -INFINITY;
   float l_run = 0.f;
 
+#if GETP_ATTN_PREFETCH2
+  // Two tiles in flight: while tile bt is computed from LDS, tile bt+TILE waits in one register set
+  // (loaded a trip earlier) and tile bt+2*TILE is loading into the other. The loop is unrolled by
+  // hand, twice the old body with the sets swapped, so every array index stays a compile-time
+  // constant and the sets stay in registers. The compute section is the old one, verbatim.
+  uint4 rK0[nbLoadsKV], rV0[nbLoadsKV], rK1[nbLoadsKV], rV1[nbLoadsKV];
+  if (t_start + TILE < t_end) {
+    #pragma unroll
+    for (int i = 0; i < nbLoadsKV; ++i) {
+      const int index_y = t_start + TILE + ly + i * strideKV;
+      if (index_y < t_end) {
+        const size_t off = GETP_KV_OFF(index_y % cache_tcap, b, kv_h * head_dim + 8 * lx,
+                                       batch_size, kv_dim, cache_tcap);
+        rK0[i] = *reinterpret_cast<const uint4 *>(key_cache + off);
+        rV0[i] = *reinterpret_cast<const uint4 *>(value_cache + off);
+      } else {
+        rK0[i] = rV0[i] = make_uint4(0, 0, 0, 0);
+      }
+    }
+  }
+  for (int bt0 = t_start; bt0 < t_end; bt0 += 2 * TILE) {
+    {
+      const int bt = bt0;   // tile bt in LDS, tile bt + TILE (if any) in set 0
+      if (bt + 2 * TILE < t_end) {
+        #pragma unroll
+        for (int i = 0; i < nbLoadsKV; ++i) {
+          const int index_y = bt + 2 * TILE + ly + i * strideKV;
+          if (index_y < t_end) {
+            const size_t off = GETP_KV_OFF(index_y % cache_tcap, b, kv_h * head_dim + 8 * lx,
+                                           batch_size, kv_dim, cache_tcap);
+            rK1[i] = *reinterpret_cast<const uint4 *>(key_cache + off);
+            rV1[i] = *reinterpret_cast<const uint4 *>(value_cache + off);
+          } else {
+            rK1[i] = rV1[i] = make_uint4(0, 0, 0, 0);
+          }
+        }
+      }
+
+    // ---- S^T = K . Q^T : A[key][dim] read with one b64 instruction per chunk
+    f32x4 st;
+    #pragma unroll
+    for (int i = 0; i < 4; ++i) st[i] = 0.f;
+    #pragma unroll
+    for (int c = 0; c < NCHUNK; ++c) {
+      bf16x4 kA;
+      *reinterpret_cast<uint2 *>(&kA) =
+          *reinterpret_cast<const uint2 *>(&ks[ln][c * TILE + 4 * g]);
+      st = __builtin_amdgcn_mfma_f32_16x16x16bf16_1k(kA, qB[c], st, 0, 0, 0);
+    }
+
+    // ---- the lower mask. Out-of-range ks rows are zero-filled and so score 0, and
+    // exp(0 - m) > 0 would corrupt the sum -> they have to be forced to -INFINITY.
+    const int kbase = bt + 4 * g;
+    #pragma unroll
+    for (int m = 0; m < 4; ++m)
+      if (kbase + m >= t_end) st[m] = -INFINITY;
+
+    // ---- the tile max, shared by all 4 g groups of the same head. Merging BEFORE computing
+    // m_new is mandatory: one g group may hold no valid key at all (m_tile = -INF) and would
+    // produce NaN if it computed its own. After the merge, every tile
+    // is guaranteed to hold at least one valid key, so m_tile is finite.
+    float m_tile = fmaxf(fmaxf(st[0], st[1]), fmaxf(st[2], st[3]));
+    m_tile = fmaxf(m_tile, __shfl_xor(m_tile, 16));
+    m_tile = fmaxf(m_tile, __shfl_xor(m_tile, 32));
+
+    const float m_new = fmaxf(m_run, m_tile);
+    const float alpha = __expf(m_run - m_new);
+
+    // ---- P^T = exp(S^T - m_new), rounded to bf16 straight away to serve as the B operand.
+    bf16x4 pB;
+#if FLASH_P_HILO
+    bf16x4 pLo;
+#endif
+    float lsum = 0.f;
+    #pragma unroll
+    for (int m = 0; m < 4; ++m) {
+      const float e = __expf(st[m] - m_new);   // = 0 khi st[m] = -INF
+      lsum += e;
+      pB[m] = f32_to_bf16bits(e);
+#if FLASH_P_HILO
+      pLo[m] = f32_to_bf16bits(e - __bfloat162float(bf16bits_to_bf16(pB[m])));
+#endif
+    }
+
+    // l is kept per g group; since all 4 groups share m_new, adding them up once in the
+    // epilogue is enough - merging per tile would be redundant.
+    l_run = l_run * alpha + lsum;
+    m_run = m_new;
+
+    // ---- O^T += V^T . P^T
+    #pragma unroll
+    for (int c = 0; c < NCHUNK; ++c) {
+      bf16x4 vA;
+      #pragma unroll
+      for (int kk = 0; kk < 4; ++kk) vA[kk] = vs[4 * g + kk][c * TILE + ln];
+      #pragma unroll
+      for (int i = 0; i < 4; ++i) acc_o[c][i] *= alpha;
+      acc_o[c] = __builtin_amdgcn_mfma_f32_16x16x16bf16_1k(vA, pB, acc_o[c], 0, 0, 0);
+#if FLASH_P_HILO
+      acc_o[c] = __builtin_amdgcn_mfma_f32_16x16x16bf16_1k(vA, pLo, acc_o[c], 0, 0, 0);
+#endif
+    }
+
+    __syncthreads();
+    if (bt + TILE < t_end) {
+      #pragma unroll
+      for (int i = 0; i < nbLoadsKV; ++i) {
+        put16(&ks[ly + i * strideKV][lx * 8], rK0[i]);
+        put16(&vs[ly + i * strideKV][lx * 8], rV0[i]);
+      }
+    }
+    __syncthreads();
+    }
+    if (bt0 + TILE >= t_end) break;
+    {
+      const int bt = bt0 + TILE;   // tile bt in LDS, tile bt + TILE (if any) in set 1
+      if (bt + 2 * TILE < t_end) {
+        #pragma unroll
+        for (int i = 0; i < nbLoadsKV; ++i) {
+          const int index_y = bt + 2 * TILE + ly + i * strideKV;
+          if (index_y < t_end) {
+            const size_t off = GETP_KV_OFF(index_y % cache_tcap, b, kv_h * head_dim + 8 * lx,
+                                           batch_size, kv_dim, cache_tcap);
+            rK0[i] = *reinterpret_cast<const uint4 *>(key_cache + off);
+            rV0[i] = *reinterpret_cast<const uint4 *>(value_cache + off);
+          } else {
+            rK0[i] = rV0[i] = make_uint4(0, 0, 0, 0);
+          }
+        }
+      }
+
+    // ---- S^T = K . Q^T : A[key][dim] read with one b64 instruction per chunk
+    f32x4 st;
+    #pragma unroll
+    for (int i = 0; i < 4; ++i) st[i] = 0.f;
+    #pragma unroll
+    for (int c = 0; c < NCHUNK; ++c) {
+      bf16x4 kA;
+      *reinterpret_cast<uint2 *>(&kA) =
+          *reinterpret_cast<const uint2 *>(&ks[ln][c * TILE + 4 * g]);
+      st = __builtin_amdgcn_mfma_f32_16x16x16bf16_1k(kA, qB[c], st, 0, 0, 0);
+    }
+
+    // ---- the lower mask. Out-of-range ks rows are zero-filled and so score 0, and
+    // exp(0 - m) > 0 would corrupt the sum -> they have to be forced to -INFINITY.
+    const int kbase = bt + 4 * g;
+    #pragma unroll
+    for (int m = 0; m < 4; ++m)
+      if (kbase + m >= t_end) st[m] = -INFINITY;
+
+    // ---- the tile max, shared by all 4 g groups of the same head. Merging BEFORE computing
+    // m_new is mandatory: one g group may hold no valid key at all (m_tile = -INF) and would
+    // produce NaN if it computed its own. After the merge, every tile
+    // is guaranteed to hold at least one valid key, so m_tile is finite.
+    float m_tile = fmaxf(fmaxf(st[0], st[1]), fmaxf(st[2], st[3]));
+    m_tile = fmaxf(m_tile, __shfl_xor(m_tile, 16));
+    m_tile = fmaxf(m_tile, __shfl_xor(m_tile, 32));
+
+    const float m_new = fmaxf(m_run, m_tile);
+    const float alpha = __expf(m_run - m_new);
+
+    // ---- P^T = exp(S^T - m_new), rounded to bf16 straight away to serve as the B operand.
+    bf16x4 pB;
+#if FLASH_P_HILO
+    bf16x4 pLo;
+#endif
+    float lsum = 0.f;
+    #pragma unroll
+    for (int m = 0; m < 4; ++m) {
+      const float e = __expf(st[m] - m_new);   // = 0 khi st[m] = -INF
+      lsum += e;
+      pB[m] = f32_to_bf16bits(e);
+#if FLASH_P_HILO
+      pLo[m] = f32_to_bf16bits(e - __bfloat162float(bf16bits_to_bf16(pB[m])));
+#endif
+    }
+
+    // l is kept per g group; since all 4 groups share m_new, adding them up once in the
+    // epilogue is enough - merging per tile would be redundant.
+    l_run = l_run * alpha + lsum;
+    m_run = m_new;
+
+    // ---- O^T += V^T . P^T
+    #pragma unroll
+    for (int c = 0; c < NCHUNK; ++c) {
+      bf16x4 vA;
+      #pragma unroll
+      for (int kk = 0; kk < 4; ++kk) vA[kk] = vs[4 * g + kk][c * TILE + ln];
+      #pragma unroll
+      for (int i = 0; i < 4; ++i) acc_o[c][i] *= alpha;
+      acc_o[c] = __builtin_amdgcn_mfma_f32_16x16x16bf16_1k(vA, pB, acc_o[c], 0, 0, 0);
+#if FLASH_P_HILO
+      acc_o[c] = __builtin_amdgcn_mfma_f32_16x16x16bf16_1k(vA, pLo, acc_o[c], 0, 0, 0);
+#endif
+    }
+
+    __syncthreads();
+    if (bt + TILE < t_end) {
+      #pragma unroll
+      for (int i = 0; i < nbLoadsKV; ++i) {
+        put16(&ks[ly + i * strideKV][lx * 8], rK1[i]);
+        put16(&vs[ly + i * strideKV][lx * 8], rV1[i]);
+      }
+    }
+    __syncthreads();
+    }
+  }
+#else
   for (int bt = t_start; bt < t_end; bt += TILE) {
     uint4 regK[nbLoadsKV];
     uint4 regV[nbLoadsKV];
@@ -3505,8 +4145,8 @@ flash_attn_decode_mfma16_kernel(
       for (int i = 0; i < nbLoadsKV; ++i) {
         const int index_y = bt + TILE + ly + i * strideKV;
         if (index_y < t_end) {
-          const size_t off = (size_t)(index_y % cache_tcap) * batch_size * kv_dim +
-                             (size_t)b * kv_dim + (size_t)kv_h * head_dim + 8 * lx;
+          const size_t off = GETP_KV_OFF(index_y % cache_tcap, b, kv_h * head_dim + 8 * lx,
+                                         batch_size, kv_dim, cache_tcap);
           regK[i] = *reinterpret_cast<const uint4 *>(key_cache + off);
           regV[i] = *reinterpret_cast<const uint4 *>(value_cache + off);
         } else {
@@ -3590,6 +4230,7 @@ flash_attn_decode_mfma16_kernel(
     }
     __syncthreads();
   }
+#endif
 
   // ---- merge l across the 4 g groups (once only)
   // Barrier before reusing the ks/vs LDS region as `ot`: every wave must have finished reading
@@ -4143,6 +4784,9 @@ flash_attn_decode_odd_layer_bf16_matrix_core_kernel(
 #ifndef FLASH_MFMA16_ODD
 #define FLASH_MFMA16_ODD  FLASH_MFMA16
 #endif
+#if GETP_KV_HEADMAJOR && !(FLASH_MFMA16_EVEN && FLASH_MFMA16_ODD)
+#error "GETP_KV_HEADMAJOR is only wired into the mfma16 attention kernel; the older kernels read the old layout"
+#endif
 #if FLASH_MFMA16_EVEN || FLASH_MFMA16_ODD
 static_assert(FLASH_DECODE_TILE_T == 16,
               "the mfma 16x16x16 kernel needs a tile step of 16");
@@ -4441,6 +5085,26 @@ constexpr int attn_o_lds_pad_slots(int BM_, int BN_, int NKC) {
 // both VGPRs are already in place (the result of global_load_dwordx4), so it emits NO
 // VALU instruction - unlike the old version's 4 half-word extracts (& 0xFFFF / >> 16).
 // __builtin_bit_cast rather than union punning: same codegen, standard spelling.
+// The attn_o GEMM's HBM loads can go two k tiles ahead, branch-free (the change GETP_MLP1_AHEAD2
+// describes; template argument AHEAD2), chosen per tile shape. Op test: the wide tile (BN 128, the
+// 20B, M = 1536) 503 -> 446 us, the narrow one (BN 64, the 120B, M = 768) 284 -> 302 us, so the
+// narrow tile keeps the one-ahead loop. Bit-exact either way. GETP_ATTN_O_MINW_WIDE promises the
+// register allocator that many waves per SIMD for the wide tile (1 = no promise; 3, which would keep
+// three blocks per CU, measured 489 us).
+#ifndef GETP_ATTN_O_AHEAD2_WIDE
+#define GETP_ATTN_O_AHEAD2_WIDE 1
+#endif
+#ifndef GETP_ATTN_O_AHEAD2_NARROW
+#define GETP_ATTN_O_AHEAD2_NARROW 0
+#endif
+#ifndef GETP_ATTN_O_MINW_WIDE
+#define GETP_ATTN_O_MINW_WIDE 1
+#endif
+// MFMAs between two consecutive HBM loads of the two-ahead loop.
+#ifndef GETP_ATTN_O_LOAD_GAP
+#define GETP_ATTN_O_LOAD_GAP 4
+#endif
+template <int V> struct AttnOParity { static constexpr int value = V; };
 __device__ __forceinline__ bf16x4 attn_o_pack2(unsigned int lo, unsigned int hi) {
   struct Pair { unsigned int a, b; };
   static_assert(sizeof(Pair) == sizeof(bf16x4), "pack2: size mismatch");
@@ -4453,9 +5117,12 @@ template<
   int WM, int WN,
   int WARPS_PER_BLOCK,
   bool ACC = false,
-  int THREADS = 64 * WARPS_PER_BLOCK
+  int THREADS = 64 * WARPS_PER_BLOCK,
+  // AHEAD2: HBM loads two k tiles ahead (see the k loop). MINW: the minimum waves per SIMD promised
+  // to the register allocator (1 = no promise). The launcher picks both per tile shape.
+  bool AHEAD2 = false, int MINW = 1
 >
-__global__ void __launch_bounds__(THREADS)
+__global__ void __launch_bounds__(THREADS, MINW)
 matmul_attn_o_bf16_kernel_tuned(
     float *xout, const __hip_bfloat16 *__restrict__ x,
     const __hip_bfloat16 *__restrict__ w,
@@ -4597,6 +5264,97 @@ matmul_attn_o_bf16_kernel_tuned(
   }
   __syncthreads();
 
+  if constexpr (AHEAD2) {
+  // Branch-free HBM loads two k tiles ahead: step t loads tile t+2 into set t&1 and writes tile
+  // t+1 from set (t+1)&1 to LDS. Unrolled by two so each set has a fixed register name.
+  uint4 sX[2][nbLoadsX8], sW[2][nbLoadsW];
+  auto load_set = [&](uint4 (&rX)[nbLoadsX8], uint4 (&rW)[nbLoadsW], int kt) {
+    const int kc = min(kt, K - BK);
+    #pragma unroll
+    for (int i = 0; i < nbLoadsX8; ++i) {
+      const int rg = min(BM * (int)blockIdx.y + loadX_y8 + i * strideX8, M - 1);
+      rX[i] = *reinterpret_cast<const uint4*>(x + (size_t)rg * K + kc + X_LOAD_VEC * loadX_x8);
+    }
+    #pragma unroll
+    for (int i = 0; i < nbLoadsW; ++i) {
+      const int cy = min(BN * (int)blockIdx.x + loadWIdx_y + i * strideW, N - 1);
+      rW[i] = *reinterpret_cast<const uint4*>(&w[(size_t)cy * K + kc + 8 * loadWIdx_x]);
+    }
+  };
+  load_set(sX[1], sW[1], BK);
+  auto kstep = [&](auto S_, int bkIdx) {
+    constexpr int S = decltype(S_)::value;
+    load_set(sX[S], sW[S], bkIdx + 2 * BK);
+    // MFMA compute loop - fully unrolled for maximum ILP
+    #pragma unroll
+    for (int k = 0; k < BK; k += MFMA_K) {
+      // base_k = k + Ak is a multiple of 4 (k a multiple of 16, Ak = 4*(lane>>4)), so all 4
+      // k shorts fit INSIDE one slot -> slot index = base_k >> 2. The index stays 32-bit:
+      // LDS addresses are 32-bit, so no (size_t) goes into the hot loop.
+      const int ak0 = (k + Ak) >> 2;
+      const int bk0 = (k + Bk) >> 2;
+
+      #pragma unroll
+      for (int im = 0; im < nIterWaveM; ++im) {
+        const int row = yInBlockTile * WM + MFMA_M * im + Ai;
+        // ONE ds_read_b64 (was: 4 ds_read_u16 with stride BM+GETP_LDS_PAD).
+        const Afloat av = xsT[ak0][row];
+
+        #pragma unroll
+        for (int in = 0; in < nIterWaveN; ++in) {
+          const int col = xInBlockTile * WN + MFMA_N * in + Bj;
+
+          // ONE ds_read_b64 (was: 4 ds_read_u16 with stride BN+GETP_LDS_PAD).
+          const Bfloat bv = wsT[bk0][col];
+
+          const int idx = im * nIterWaveN + in;
+          acc_local[idx] = __builtin_amdgcn_mfma_f32_16x16x16bf16_1k(av, bv, acc_local[idx], 0, 0, 0);
+        }
+      }
+    }
+    // LDS reads first (the MFMAs wait on them), then one HBM load every GETP_ATTN_O_LOAD_GAP MFMAs.
+    constexpr int NMF = (BK / MFMA_K) * nIterWaveM * nIterWaveN;
+    constexpr int NLD = nbLoadsX8 + nbLoadsW;
+    static_assert(NLD * GETP_ATTN_O_LOAD_GAP <= NMF, "GETP_ATTN_O_LOAD_GAP too large for this tile");
+    __builtin_amdgcn_sched_group_barrier(0x0100, (BK / MFMA_K) * (nIterWaveM + nIterWaveN), 0);
+    #pragma unroll
+    for (int i = 0; i < NLD; ++i) {
+      __builtin_amdgcn_sched_group_barrier(0x0008, GETP_ATTN_O_LOAD_GAP, 0);
+      __builtin_amdgcn_sched_group_barrier(0x0020, 1, 0);
+    }
+    __builtin_amdgcn_sched_group_barrier(0x0008, NMF - NLD * GETP_ATTN_O_LOAD_GAP, 0);
+    __builtin_amdgcn_sched_barrier(0);
+    __syncthreads();
+    {
+      const uint4 (&regX8)[nbLoadsX8] = sX[1 - S];
+      const uint4 (&regW)[nbLoadsW] = sW[1 - S];
+      #pragma unroll
+      for (int i = 0; i < nbLoadsX8; ++i) {
+        const int off = i * strideX8;
+        const int row_tile = loadX_y8 + off;
+        if (row_tile >= BM) break;
+
+        const uint4 v = regX8[i];
+        xsT[loadX_k0 + 0][row_tile] = attn_o_pack2(v.x, v.y);
+        xsT[loadX_k0 + 1][row_tile] = attn_o_pack2(v.z, v.w);
+      }
+
+      #pragma unroll
+      for (int i = 0; i < nbLoadsW; ++i) {
+        const int off = i * strideW;
+        const uint4 w_val = regW[i];
+        wsT[loadW_k0 + 0][loadWIdx_y + off] = attn_o_pack2(w_val.x, w_val.y);
+        wsT[loadW_k0 + 1][loadWIdx_y + off] = attn_o_pack2(w_val.z, w_val.w);
+      }
+    }
+    __syncthreads();
+  };
+  #pragma unroll 1
+  for (int bkIdx = 0; bkIdx < K; bkIdx += 2 * BK) {   // K % (2 * BK) == 0: the launcher checks
+    kstep(AttnOParity<0>{}, bkIdx);
+    kstep(AttnOParity<1>{}, bkIdx + BK);
+  }
+  } else {
   #pragma unroll 1
   for (int bkIdx = 0; bkIdx < K; bkIdx += BK) {
     uint4 regX8[nbLoadsX8];
@@ -4687,6 +5445,7 @@ matmul_attn_o_bf16_kernel_tuned(
     }
     __syncthreads();
   }
+  }
 
   // AGGRESSIVE output: fully unrolled with optimized address calculation
   #pragma unroll
@@ -4761,6 +5520,13 @@ static inline void getp_matmul_attn_o_bf16_acc(
   static_assert(WARPSW == WARPSN, "both tiles must keep the same block size");
   // Resident workgroup slots for the WIDE kernel, asked of the runtime once per thread (one
   // thread per device) rather than hard-wired, so the rule survives a tile or GPU change.
+  // The two-ahead loop (GETP_ATTN_O_AHEAD2_*) needs an even number of k tiles.
+  if ((GETP_ATTN_O_AHEAD2_WIDE || GETP_ATTN_O_AHEAD2_NARROW) && K % (2 * BK) != 0) {
+    fprintf(stderr, "attn_o: GETP_ATTN_O_AHEAD2_* needs K %% (2 * BK) == 0 (K = %d)\n", K);
+    abort();
+  }
+  // The tile rule stays tied to the one-ahead kernel's occupancy (3 blocks per CU): the two-ahead
+  // wide kernel fits only 2, which would move the 120B (M = 768) to the wide tile - slower there.
   static thread_local int slots = 0;
   if (slots == 0) {
     int dev = 0, per_cu = 0;
@@ -4776,11 +5542,13 @@ static inline void getp_matmul_attn_o_bf16_acc(
   const int wide = ((N + BNW - 1) / BNW) * rows;
   if (2 * wide < slots) {
     // Less than half the machine: twice as many, half-width workgroups keep more CUs busy.
-    matmul_attn_o_bf16_kernel_tuned<BM, BNN, BK, WM, WNN, WARPSN, true>
+    matmul_attn_o_bf16_kernel_tuned<BM, BNN, BK, WM, WNN, WARPSN, true, 64 * WARPSN,
+                                    GETP_ATTN_O_AHEAD2_NARROW != 0>
         <<<dim3((N + BNN - 1) / BNN, rows), dim3(64 * WARPSN), 0, stream>>>(
             x_resid, x_bf16, w, b, M, N, K);
   } else {
-    matmul_attn_o_bf16_kernel_tuned<BM, BNW, BK, WM, WNW, WARPSW, true>
+    matmul_attn_o_bf16_kernel_tuned<BM, BNW, BK, WM, WNW, WARPSW, true, 64 * WARPSW,
+                                    GETP_ATTN_O_AHEAD2_WIDE != 0, GETP_ATTN_O_MINW_WIDE>
         <<<dim3((N + BNW - 1) / BNW, rows), dim3(64 * WARPSW), 0, stream>>>(
             x_resid, x_bf16, w, b, M, N, K);
   }
@@ -4921,7 +5689,7 @@ __global__ void extract_argmax_pairs(const unsigned long long* pairs, int* out, 
 #define MATMUL_LOGITS_LDS_KPAD 4
 #endif
 
-// The argmax epilogue reduces in registers before touching LDS (see the head of logitsx.py).
+// The argmax epilogue reduces in registers before touching LDS (see GETP_LOGITS_EPI).
 // 0 = the old path, bit-identical. Enable with -DGETP_LOGITS_EPI=1.
 #ifndef GETP_LOGITS_EPI
 #define GETP_LOGITS_EPI 1   // on by default (measured end to end: -0,35 ms/step); set 0 to A/B
@@ -5896,18 +6664,19 @@ int *getp_forward_120b(Transformer * /*transformer*/,
                 : (size_t)even_layers * even_stride +
                       (size_t)idx_half * odd_stride;
     const int tslot = pos % cache_tcap;
-    const size_t base_off = layer_toff * (size_t)BATCH_SIZE * (size_t)kv_dim;
+    // Layers are laid out even ones first, then odd ones (layer_toff); each also carries its padding.
+    const size_t base_off = layer_toff * (size_t)BATCH_SIZE * (size_t)kv_dim +
+                            (size_t)(is_even ? idx_half : even_layers + idx_half) *
+                                GETP_KV_LAYER_PAD(BATCH_SIZE, kv_dim);
 
     __hip_bfloat16 *key_cache =
         reinterpret_cast<__hip_bfloat16 *>(dev_s->key_cache);
     __hip_bfloat16 *value_cache =
         reinterpret_cast<__hip_bfloat16 *>(dev_s->value_cache);
     __hip_bfloat16 *k_slot =
-        key_cache + base_off +
-        (size_t)tslot * (size_t)BATCH_SIZE * (size_t)kv_dim;
+        key_cache + base_off + GETP_KV_OFF(tslot, 0, 0, BATCH_SIZE, kv_dim, cache_tcap);
     __hip_bfloat16 *v_slot =
-        value_cache + base_off +
-        (size_t)tslot * (size_t)BATCH_SIZE * (size_t)kv_dim;
+        value_cache + base_off + GETP_KV_OFF(tslot, 0, 0, BATCH_SIZE, kv_dim, cache_tcap);
 
     float *k_step = dev_s->tb2;
     float *v_step = dev_s->tb2 + (size_t)BATCH_SIZE * (size_t)kv_dim;
@@ -5929,7 +6698,7 @@ int *getp_forward_120b(Transformer * /*transformer*/,
                                dev_w_qkv, dev_b_qkv, hidden_dim, head_dim,
                                p->n_attn_heads, p->n_kv_heads, BATCH_SIZE,
                                compute_stream, dev_cos_vals, dev_sin_vals,
-                               k_slot, v_slot);
+                               k_slot, v_slot, cache_tcap);
 #if !GETP_ROPE_FUSED_KV
     kv_store_pair_fp32_to_bf16(k_slot, v_slot, k_step, v_step,
                                BATCH_SIZE * kv_dim, compute_stream);
@@ -6465,18 +7234,19 @@ int *getp_forward_20b(Transformer * /*transformer*/,
                 : (size_t)even_layers * even_stride +
                       (size_t)idx_half * odd_stride;
     const int tslot = pos % cache_tcap;
-    const size_t base_off = layer_toff * (size_t)BATCH_SIZE * (size_t)kv_dim;
+    // Layers are laid out even ones first, then odd ones (layer_toff); each also carries its padding.
+    const size_t base_off = layer_toff * (size_t)BATCH_SIZE * (size_t)kv_dim +
+                            (size_t)(is_even ? idx_half : even_layers + idx_half) *
+                                GETP_KV_LAYER_PAD(BATCH_SIZE, kv_dim);
 
     __hip_bfloat16 *key_cache =
         reinterpret_cast<__hip_bfloat16 *>(dev_s->key_cache);
     __hip_bfloat16 *value_cache =
         reinterpret_cast<__hip_bfloat16 *>(dev_s->value_cache);
     __hip_bfloat16 *k_slot =
-        key_cache + base_off +
-        (size_t)tslot * (size_t)BATCH_SIZE * (size_t)kv_dim;
+        key_cache + base_off + GETP_KV_OFF(tslot, 0, 0, BATCH_SIZE, kv_dim, cache_tcap);
     __hip_bfloat16 *v_slot =
-        value_cache + base_off +
-        (size_t)tslot * (size_t)BATCH_SIZE * (size_t)kv_dim;
+        value_cache + base_off + GETP_KV_OFF(tslot, 0, 0, BATCH_SIZE, kv_dim, cache_tcap);
 
     // float *k_step = dev_s->qkv;
     // float *v_step = dev_s->qkv + (size_t)BATCH_SIZE * (size_t)kv_dim;
@@ -6502,7 +7272,7 @@ int *getp_forward_20b(Transformer * /*transformer*/,
                                dev_w_qkv, dev_b_qkv, hidden_dim, head_dim,
                                p->n_attn_heads, p->n_kv_heads, batch_size,
                                nullptr, dev_cos_vals, dev_sin_vals,
-                               k_slot, v_slot);
+                               k_slot, v_slot, cache_tcap);
 #if !GETP_ROPE_FUSED_KV
     kv_store_pair_fp32_to_bf16(k_slot, v_slot, k_step, v_step,
                                batch_size * kv_dim, nullptr);

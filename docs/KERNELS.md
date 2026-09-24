@@ -281,11 +281,30 @@ Operand precision is handled three ways. The router takes fp32 activations and c
 
 ### Double buffering, and the register pipeline underneath it
 
-All seven kernels run the same software pipeline. The global loads for tile _k+1_ are issued into
-`uint4`/`float4` registers at the top of the loop body; the matrix-core instructions for tile _k_ run
-out of LDS while those loads are in flight; then a barrier, the register-to-LDS store, and a second
-barrier. Two `__syncthreads()` per K step, in every one of them. This is what actually overlaps HBM
-latency with compute, and it costs only the prefetch registers listed above.
+All seven kernels run the same software pipeline. The global loads are issued into `uint4`/`float4`
+registers; the matrix-core instructions for tile _k_ run out of LDS while those loads are in flight;
+then a barrier, the register-to-LDS store, and a second barrier. Two `__syncthreads()` per K step, in
+every one of them. This is what actually overlaps HBM latency with compute, and it costs only the
+prefetch registers listed above.
+
+How far ahead the loads go differs. In the original loop, still the `#else` arm everywhere, step _k_
+loads tile _k+1_ at its top, under `if (row < M && kk + 7 < K)` guards, and stores it at its end - one
+step to land, and the guards put every load in a basic block of its own, so the scheduler issues them
+in one burst ahead of the LDS reads. Removing the loads altogether (a timing-only ablation) made the
+expert GEMMs 10-13 % faster, while serving their weights from L2 saved only 1-6 %: what the loads cost
+is latency. The two-ahead loop (`GETP_MLP1_AHEAD2`, `GETP_MLP2_AHEAD2`, and the `AHEAD2` template
+argument of attention-out and QKV) keeps two register sets: step _k_ loads tile _k+2_ into set _k & 1_
+while it stores tile _k+1_ from set _(k+1) & 1_, and the K loop is unrolled by two so each set keeps a
+fixed register name. The loads are unconditional - a row past the tile's valid count, a column past N
+and a tile past the end read a clamped, valid address instead, which is safe because an MFMA output
+row depends only on its own A row and a column only on its own B column, and the epilogue never
+stores those - so the loop body is one basic block and `sched_group_barrier` can place one load every
+few MFMAs after the LDS reads. The arithmetic and its order do not change: bit-exact. It is used where
+the single-GPU harness measured it faster - MLP1 (1250 to 1199 µs on a 120B rank, 1969 to 1889 µs on a
+20B rank), MLP2 (662 to 625, 1158 to 1057), attention-out's wide tile (the 20B, 503 to 446) and QKV at
+M = 768 (the 120B, 275 to 258) - and not for attention-out's narrow tile or QKV at M = 1536, where the
+second register set costs more occupancy than it saves. The logits GEMM, already at 71 % of matrix
+peak, measured 1 % slower with it and keeps the original loop.
 
 LDS double buffering proper — two staging buffers alternating on `(bk / BK) & 1` — exists only in the
 two router kernels, which is why their LDS budget is `2 * BK * (BM + BNt) * 2 B = 20480 B` while the
@@ -545,9 +564,13 @@ list.
 
 ### Cache layout and tiling
 
-The KV cache is one bf16 allocation per device, time-major inside each layer: the element address runs
-`layer_offset + (t % cache_tcap)`, then batch, then KV head, then head dim. Time capacity differs by
-layer class.
+The KV cache is one bf16 allocation per device, head-major inside each layer (`GETP_KV_HEADMAJOR`,
+default 1): after the layer offset the element address runs batch, then KV head, then the ring slot
+`t % cache_tcap`, then head dim - each (request, KV head) owns one contiguous region of
+`cache_tcap × 64` elements plus a pad of `GETP_KV_PAD` = 384. `GETP_KV_OFF(t, b, col, B, KVD, CAP)`
+computes the offset, and it is additive in _t_ and _(b, col)_, so the qkv epilogue's slot pointer
+`GETP_KV_OFF(slot, 0, 0, ...)` plus the per-element offset `GETP_KV_OFF(0, b, col, ...)` addresses
+the same element the attention kernel reads. Time capacity differs by layer class.
 
 | Layer class    | Slots (`cache_tcap`)           | Why                                            |
 | -------------- | ------------------------------ | ---------------------------------------------- |
@@ -555,15 +578,29 @@ layer class.
 | Odd (full)     | 1024, equal to `seq_len / 2`   | a ring sized to the memory budget              |
 
 For 20b that is 12 × 128 + 12 × 1024 = 13 824 time slots per device across 24 layers, at 1.5 MiB per
-slot for K and the same for V (1536 requests × 512 elements × 2 B). Note the consequence for the full
+slot for K and the same for V (1536 requests × 512 elements × 2 B), plus the pads: 24 layers × 1536 ×
+8 regions × 384 elements × 2 B = 226 MB for K and the same for V (170 MB each on the 120B), which
+`transformer.cpp` adds to the allocation with the same two macros. Note the consequence for the full
 layers: they hold half the advertised `seq_len` of 2048, so history beyond 1024 positions is dropped
 there too.
 
-Putting time outermost makes the per-step write one contiguous `BATCH_SIZE * kv_dim` block — 1.5 MiB. With `GETP_ROPE_FUSED_KV` (default 1) the qkv epilogue writes that block itself, two bf16 per lane, and `kv_store_pair_fp32_to_bf16` is no longer launched: its wide 8-byte-per-lane `uint2` store was traded away to remove the 12.6 MB per layer of fp32 k/v round-trip traffic that path required.
-perfectly coalesced by `kv_store_pair_fp32_to_bf16`. The cost is on the read side: consecutive timesteps
-for one (request, KV head) are 1.5 MiB apart, so each 16-key tile touches 16 separate 128-byte rows. The
-trade is deliberate. Writes happen once per step for every request in the batch, while reads are
-amortised over the eight query heads of the group.
+With `GETP_ROPE_FUSED_KV` (default 1) the qkv epilogue writes the new token's K and V into this layout
+itself, two bf16 per lane, and `kv_store_pair_fp32_to_bf16` is no longer launched; that kernel and the
+two older attention kernels still assume the time-major layout, so selecting any of them with
+`GETP_KV_HEADMAJOR` on is a compile error.
+
+The layout used to be time-major - `layer_offset + (t % cache_tcap)`, then batch, then KV head, then
+head dim - which made the per-step write one contiguous 1.5 MiB block, at the price of the read side:
+consecutive timesteps of one (request, KV head) were 1.5 MiB apart, so every 16-key tile was 16
+separate 128-byte reads, and on a trace the attention kernel ran at 0.8 TB/s with the L1 waiting on
+L2 88 % of the time. Head-major makes that tile one 2 KB block, and yet on its own it was _slower_ on
+full-context layers (a single-GPU harness, µs: 4051 → 4359 on a 20B layer at 1024 keys, 2098 → 2919 on
+the 120B's) - and 15 % slower end to end - because each region is `cache_tcap × 128` bytes, a
+power-of-two multiple, so every region starts on the same memory channel while the workgroups advance
+through time in step. The pad staggers the regions: the same kernel reads at 1.2 TB/s, 4051 → 2651 µs
+on the full 20B layer, 653 → 388 µs on a sliding one, 2098 → 1343 µs on the full 120B layer. Pads of
+64 elements were still bad, 128-256 good, 384 the best measured, 512 worse. Only addresses change, so
+the output is bit-exact; the qkv epilogue's scattered write costs about 20 µs per layer on the 20B.
 
 Sequence tiling is `TILE = 16`. LDS is one padded region, `kvo[2 * TILE * (HEAD_DIM + FLASH_LDS_PAD)]`,
 reinterpreted as `ks` and `vs`: 16 rows of 68 `unsigned short` for K plus the same for V, 4352 bytes per
@@ -574,12 +611,15 @@ aligned, so the loader (`put16`) writes two `b64` stores where one `b128` would 
 `nbLoadsKV = TILE * (HEAD_DIM/8) / BLOCK_SIZE = 2` at the default 64-thread block, each thread issues
 two 16-byte K loads and two V loads per tile.
 
-Double buffering here is register-staged, not LDS-staged: the next tile is prefetched into `regK` and
-`regV` before the compute loop and written into the single LDS buffer after it, bracketed by two
-`__syncthreads()`. Register state per lane is 16 floats of output accumulator (`acc_o[NCHUNK]`, four
-head-dim chunks), the two scalars `m_run` and `l_run`, four `bf16x4` Q registers, and 16 VGPRs of K/V
-prefetch — which is what lets a 64-thread block with 4352 B of LDS reach high occupancy, and occupancy
-is what hides the KV read latency.
+Double buffering here is register-staged, not LDS-staged, and two tiles deep
+(`GETP_ATTN_PREFETCH2`, default 1): while tile _t_ is computed out of the single LDS buffer, tile
+_t+1_ waits in one register set, loaded a tile earlier, and tile _t+2_ is loading into the other; the
+loop runs two tiles per trip so both sets keep fixed register names, and the per-tile arithmetic and
+both barriers are unchanged. On the time-major layout this bought nothing; on the padded head-major
+one it is 2-4 % (2651 → 2605 µs on the full 20B layer). Register state per lane is 16 floats of output
+accumulator (`acc_o[NCHUNK]`, four head-dim chunks), the two scalars `m_run` and `l_run`, four
+`bf16x4` Q registers, and 32 VGPRs of K/V prefetch - 140 registers, three waves per SIMD, which with
+4352 B of LDS per 64-thread block is what hides the KV read latency.
 
 Finished requests cost almost nothing. `if (!mask_on[b]) return;` retires the whole block after a single
 global read of the per-request active flag, before any Q, K, V or sink traffic. The flag array is
@@ -814,6 +854,8 @@ outright rather than degrading to a CPU path.
 | All GEMM, attention and MoE kernels                                                                                                                                                                        | [`src/hip/forward.hip`](../src/hip/forward.hip)                                                            |
 | Tile macros: `MATMUL_*`, `NUM_CTA_*`, `GETP_BN_AGG` (no `MATMUL_QKV_*` exists)                                                                                                                             | [`src/hip/forward.hip`](../src/hip/forward.hip), defined next to each kernel                               |
 | Attention switches: `FLASH_MFMA16` (and the per-parity `FLASH_MFMA16_EVEN` / `_ODD`), `FLASH_HEADS_PER_WAVE`, `FLASH_LDS_PAD`, `FLASH_P_HILO`; `FLASH_DECODE_TILE_T` now sizes only the retired kernels    | [`src/hip/forward.hip`](../src/hip/forward.hip)                                                            |
+| Load pipeline depth: `GETP_MLP1_AHEAD2`, `GETP_MLP2_AHEAD2` and their `*_LOAD_GAP`, `GETP_ATTN_O_AHEAD2_WIDE` / `_NARROW`, `GETP_QKV_AHEAD2_MAXM`; attention's `GETP_ATTN_PREFETCH2`                    | [`src/hip/forward.hip`](../src/hip/forward.hip)                                                            |
+| KV cache layout: `GETP_KV_HEADMAJOR`, `GETP_KV_PAD`, `GETP_KV_OFF`                                                                                                                                              | [`src/hip/forward.hip`](../src/hip/forward.hip), [`src/getp/transformer.cpp`](../src/getp/transformer.cpp) |
 | LDS padding, one macro per staging layout: `MATMUL_MLP1_LDS_PAD_SLOTS`, `MATMUL_MLP2_LDS_PAD_SLOTS`, `GETP_QKV_LDS_PAD_SLOTS`, `MATMUL_ATTN_O_LDS_PAD_SLOTS` (cells) and `MATMUL_LOGITS_LDS_KPAD` (halves) | [`src/hip/forward.hip`](../src/hip/forward.hip)                                                            |
 | Batch size, expert parallelism, per-device request slicing                                                                                                                                                 | [`src/getp/run.cpp`](../src/getp/run.cpp)                                                                  |
 | KV cache sizing and per-layer ring capacities                                                                                                                                                              | [`src/getp/transformer.cpp`](../src/getp/transformer.cpp)                                                  |

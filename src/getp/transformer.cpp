@@ -1,6 +1,15 @@
 #pragma once
 #include "transformer.hpp"
 
+// KV cache layout (see forward.hip, GETP_KV_OFF): this file is included first, so the defaults live
+// here too; the two definitions must match.
+#ifndef GETP_KV_HEADMAJOR
+#define GETP_KV_HEADMAJOR 1
+#endif
+#ifndef GETP_KV_PAD
+#define GETP_KV_PAD 384
+#endif
+
 #include <cassert>
 #include <hip/hip_runtime.h>
 
@@ -231,9 +240,15 @@ void init_device_run_state(RunState *s, Config *p) {
   if (odd_tcap < 1) odd_tcap = 1;
   const size_t total_t = (size_t)even_layers * (size_t)even_tcap +
                          (size_t)(p->n_layers - even_layers) * (size_t)odd_tcap;
+  // Head-major KV (GETP_KV_HEADMAJOR, see forward.hip): every (sequence, kv_head) region of every
+  // layer is padded by GETP_KV_PAD elements.
+  const size_t kv_elems = (size_t)BATCH_SIZE * total_t * (size_t)kv_dim +
+                          (GETP_KV_HEADMAJOR ? (size_t)p->n_layers * BATCH_SIZE * (size_t)(kv_dim / 64) *
+                                                   GETP_KV_PAD
+                                             : 0);
 
-  HIP_CHECK(hipMalloc(&s->key_cache, (size_t)BATCH_SIZE * total_t * (size_t)kv_dim * sizeof(__hip_bfloat16)));
-  HIP_CHECK(hipMalloc(&s->value_cache, (size_t)BATCH_SIZE * total_t * (size_t)kv_dim * sizeof(__hip_bfloat16)));
+  HIP_CHECK(hipMalloc(&s->key_cache, kv_elems * sizeof(__hip_bfloat16)));
+  HIP_CHECK(hipMalloc(&s->value_cache, kv_elems * sizeof(__hip_bfloat16)));
 
   s->qkv = nullptr;
   s->att = nullptr;

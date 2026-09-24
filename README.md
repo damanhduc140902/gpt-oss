@@ -23,7 +23,7 @@ hipBLAS, no RCCL, no MPI. Every kernel, every collective and the tokenizer are w
 this repository. The only dependency is the HIP runtime itself.
 
 It began from [llama2.c](https://github.com/karpathy/llama2.c) and grew into a complete inference system.
-On a single node of 8 AMD MI250 GPUs it serves **69,309 tokens per second on the 20B model and 30,302 on
+On a single node of 8 AMD MI250 GPUs it serves **75,369 tokens per second on the 20B model and 32,297 on
 the 120B model**, while keeping the generated text faithful to a CPU reference.
 
 Two things are measured, and both have to hold:
@@ -224,8 +224,8 @@ Measured on one node of 8× AMD MI250 in batch (`getp`) mode.
 
 | Model          | Requests | Warm-up (s) | Inference (s) | Throughput (TPS) | METEOR | BERTScore |
 | -------------- | -------: | ----------: | ------------: | ---------------: | -----: | --------: |
-| `gpt-oss-20b`  |    12288 |          23 |           176 |        **69309** |  0.535 |     0.978 |
-| `gpt-oss-120b` |     6144 |          36 |           201 |        **30302** |  0.554 |     0.981 |
+| `gpt-oss-20b`  |    12288 |          29 |           157 |        **75369** |  0.535 |     0.978 |
+| `gpt-oss-120b` |     6144 |          62 |           188 |        **32297** |  0.554 |     0.981 |
 
 Where those numbers came from, one optimisation at a time on the 20B model:
 
@@ -247,7 +247,9 @@ Where those numbers came from, one optimisation at a time on the 20B model:
 | RoPE folded into the qkv epilogue; router block sized to the expert count; argmax reduced in registers |      65651 |  +1.8% |
 | LM head rastered in groups of two row blocks so the weight tile lands in L2 |      66096 |  +0.7% |
 | LM head activations converted to bf16 once, which widens the grouping to six |      68424 |  +3.5% |
-| q written pre-scaled as bf16, since attention rounded it to bf16 anyway |  **69309** |  +1.3% |
+| q written pre-scaled as bf16, since attention rounded it to bf16 anyway |      69309 |  +1.3% |
+| Expert GEMMs load HBM two k tiles ahead, without branches, between the MFMAs |      70734 |  +1.9% |
+| KV cache head-major with padded regions; attention-out loads two k tiles ahead; two KV tiles in flight |  **75369** |  +6.5% |
 
 The 120B model reached 20,426 tok/s on that same work without a single change written for it: it runs
 the same kernels with the same defaults. Past that point it needed its own work, because its bottleneck
@@ -264,13 +266,19 @@ is not the same one:
 | The attention-out tile chosen at run time from how full the GPU is      |      24902 |  +0.6% |
 | The expert-output exchange sent as bf16 instead of fp32 †               |      26033 |  +4.5% |
 | Experts moved between GPUs every 100 steps to even out the load ‡       |      28670 | +10.2% |
-| The peer pulls spread over four copy streams                            |  **30349** |  +6.2% |
+| The peer pulls spread over four copy streams                            |      30349 |  +6.2% |
+| Expert GEMMs load HBM two k tiles ahead, without branches, between the MFMAs |      30224 |  +1.7% |
+| KV cache head-major with padded regions; qkv loads two k tiles ahead; two KV tiles in flight |  **32297** |  +5.1% |
 
 Each percentage is a paired measurement: the two builds run alternately in one session, twice each,
-against the same input - except the last two rows, which rest on one to three runs each (the
-four-stream figure was repeated at 29,750 and 30,300 in a later session). Absolute throughput moves about 1 % between sessions, so the rows are not
-strictly comparable across the table - the number that stands behind the summary above is the
-verification run of the shipped build, which measured 30,302 tok/s in both of its two runs with no flags set - their inference phases took 200.627 s each, to the millisecond.
+against the same input - except the four-stream and expert-move rows, which rest on one to three runs
+each (the four-stream figure was repeated at 29,750 and 30,300 in a later session), and the last row of
+each table, whose change is the ratio of two paired sessions: against the previous shipped build it
+measured +8.5 % on the 20B (75,369 against 69,435) and +6.9 % on the 120B (32,297 and 32,572 against
+30,335), of which the row above it is +1.9 % and +1.7 %. Absolute throughput moves about 1 % between
+sessions, so the rows are not strictly comparable across the table - the numbers that stand behind the
+summary above are the verification runs of the shipped build: the median of five full-length 20B runs
+(75,331 to 75,628 tok/s, inference 156.9-157.0 s) and the lower of two 120B runs (32,297 and 32,572).
 
 Every row is bit-exact except the two marked, which change the 120B's numbers by design and were
 therefore accepted on METEOR and BERTScore (thresholds 0.3 and 0.9) rather than on a hash. Both stay
@@ -335,6 +343,29 @@ dense fp32 blocks and a host barrier at both sync points. What is measured is th
 seven-stream version from the fastest into a collapse (14,202 tok/s) while four streams barely notice
 (29,786). The shipped build uses four.
 
+The last two rows of both tables came from measuring kernels one at a time instead of end to end:
+each kernel has a single-GPU harness that runs it on the model's real shapes, times it and hashes its
+output, so a change is judged in two minutes on one GPU and only then confirmed on all eight.
+Two findings carried them. First, the GEMMs spent their load latency in the open: every one of them
+issued k tile _t+1_ at the top of step _t_ and needed it at the end of the same step, from branchy
+basic blocks the scheduler could not interleave. Removing the loads altogether made the expert GEMMs
+10-13 % faster while serving their weights from L2 saved only 1-6 %, so the cost was latency, not
+bandwidth. Loading two tiles ahead, from clamped addresses instead of branches, took the expert GEMMs
+of a 120B rank from 1912 to 1824 µs per layer and a 20B rank from 3127 to 2946 µs, bit-exact; the same
+loop is used where it wins elsewhere - attention-out's wide tile (the 20B, 503 to 446 µs) and qkv at
+the 120B's batch (275 to 258 µs) - and not where it loses.
+
+Second, decode attention read its KV cache at 0.8 TB/s, half of HBM, with the L1 waiting on L2 88 %
+of the time. The cache was time-major, so each key a workgroup reads was its own 128-byte piece, 1.5
+MB from the next. A head-major layout had been tried and was 15 % slower end to end, which had been read
+as "the layout is not the limit" - but the harness showed it only lost on full-context layers, and why:
+every (sequence, KV head) region is a power-of-two number of bytes long, so every region starts on the
+same memory channel, and the workgroups walk through time together. Padding each region by 768 bytes
+staggers them. The same kernel then runs at 1.2 TB/s: 4051 to 2651 µs on a full 20B layer at 1024
+keys, 653 to 388 µs on a sliding one, 2098 to 1343 µs on a full 120B layer - bit-exact, because only
+addresses change. Keeping two KV tiles in flight per wave, which gained nothing on the old layout, adds
+another 2-4 % on the new one.
+
 Warm-up is dominated by reading the checkpoint off disk, so it depends on whether the file is still in
 the page cache; it is not part of what the optimisation work changed.
 
@@ -348,7 +379,7 @@ optimisations in it, so they are not the ones those scores were computed from �
 scored without a GPU: `./run.sh eval 20b` reports METEOR 0.533 and BERTScore 0.978 on them, a hair
 under the table's METEOR and the same BERTScore.
 
-Repeating a run still moves throughput - by about 1 % between sessions, less within one: the two runs behind the 120B figure came in at 30,302 both times - but it very rarely moves the completions.
+Repeating a run still moves throughput - by about 1 % between sessions, less within one: the five runs behind the 20B figure spread over 0.4 %, the two behind the 120B figure over 0.9 % - but it very rarely moves the completions.
 That was not always true: before the expert exchange was made pull-based, a receiver could read a peer's
 buffer while it was still being written, so two runs of the _same binary_ at 8 GPUs agreed on only about
 50 % to 95 % of output lines, run pair by run pair. With the pull in place the 120B reproduces its hash from run to run, and every optimisation listed above
@@ -361,10 +392,14 @@ METEOR when the claim is that a change moved no numbers, and it is what makes a 
 
 The 20B is not quite there. Of its last twelve full-length runs on the reference input, eleven hashed
 identically; the twelfth differed in 7 of its 12,288 lines, all of them requests served by the same
-GPU, and that same binary then gave the usual hash three times in a row. A change that altered the
-numbers would do so every time, so this is a rare ordering race still left somewhere on the 20B's
-two-device exchange path, and it has not been found yet. The 16-step gate behind 720709b86d36 has never missed;
-a single full-length 20B run that disagrees is rerun before it is read as evidence.
+GPU, and that same binary then gave the usual hash three times in a row. The current build shows the
+same thing: of five full-length runs, four hash exactly like the build before it (and so does the
+reference input, `8b019f121ede`, which is why the table's METEOR and BERTScore are unchanged); the
+first run after the gate differed in 96 lines - every 32nd request of two GPUs, from its first token.
+A change that altered the numbers would do so every time, so this is a rare ordering race still left
+somewhere on the 20B's two-device exchange path, and it has not been found yet. The 16-step gate
+behind 720709b86d36 has never missed; a single full-length 20B run that disagrees is rerun before it
+is read as evidence.
 
 ---
 
