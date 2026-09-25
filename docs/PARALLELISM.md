@@ -233,8 +233,10 @@ the ones this rank can serve, keeping `eg >= expert_start && eg < expert_end` an
 finished reaches this filter with every id set to −1 by the router (see the routing section of
 [KERNELS.md](KERNELS.md)), so it survives on no rank and costs the expert GEMMs nothing.
 
-The loop above is what the 20B runs. At EP > 2 the 120B no longer issues copies at all: see
-[Direct pulls](#direct-pulls-at-ep--2) below.
+The loop above is the copy path, and neither model runs it by default any more: the 120B's
+exchanges are the [direct pulls](#direct-pulls-at-ep--2) below, and the 20B's pairs read each other's
+slices with kernels ([the 20B's pairs](#the-20bs-pairs-kernel-reads-not-copies)). It is still there
+behind `GETP_XPULL=0` and `GETP_K2PULL=0`.
 
 ## Phase two: the reduce-scatter
 
@@ -332,9 +334,38 @@ parity buffer before the reads are done. And the host barrier at sync point 1 st
 threads within one layer of each other, so an event slot (128 per device, by layer) is recorded again
 only long after every wait on its previous record was issued.
 
+## The 20B's pairs: kernel reads, not copies
+
+`GETP_K2PULL` (default 1, EP = 2). The pair enables peer access once and exchanges without a copy
+engine:
+
+- **Sync point 1:** the compute stream waits for the partner's event itself, and `k2pull_copy_kernel`
+  copies the partner's slice of `ext_t_bf16` and of the two top-k tables from the partner's memory
+  into ours: remote reads, local writes that go through our L2 like any kernel's.
+- **Sync point 2:** the rank records its event after emitting the partner's slice of the expert
+  output, takes the host barrier, gathers its own rows, then waits for the partner's event and
+  `k2pull_add_kernel` adds the partner's fp32 partial sums, read in place from its `ext_e_agg`, into
+  `dev_x` - `x[i] += y[i]`, the addition `getp_vecadd` did. The 17.7 MB copy into `peer_e_agg` and the
+  separate add pass are gone.
+
+This is a correctness fix. With `hipMemcpyPeerAsync` into our buffers, one 20B run in three under host
+CPU load (about one in twelve on an idle host) diverged on one GPU from some step on. Comparing every
+exchange with its source right after it landed (a probe, not in the tree) caught it at sync point 2:
+the copy had completed and the compute stream had waited for it, yet the add kernel read a contiguous
+third of `peer_e_agg` - 512 rows - that differed from the partner's `ext_e_agg`. A copy engine writes
+HBM behind the GPU's L2, and lines of `peer_e_agg` left in L2 by the previous layer's add were read
+instead of the new data; the layer's other traffic usually evicts them, which is why it was rare and
+why host timing changed how often it happened. The two remedies that looked right and were not: a
+value handshake in host-coherent memory with a system-scope fence (still one wrong run in four),
+and dropping the unused event records before sync point 1. Draining the stream at sync point 1
+seemed to help (7 of 7 runs right) but costs ~4 % and leaves the stale lines where they are.
+With the kernel reads: output bit-identical to the copy path (`81e82a2c077f`), 81,024 against
+81,024 tok/s, and six runs under 88 busy host loops all identical.
+
 ## Ordering: the delta rotation
 
-The copy loops of the MoE block (the 20B's, and the 120B's with `GETP_XPULL=0`) walk the same rotation.
+The copy loops of the MoE block (behind `GETP_K2PULL=0` on the 20B and `GETP_XPULL=0` on the 120B)
+walk the same rotation.
 Two of them copy — the phase-one pull, whose single body carries `ext_t_bf16` and both top-k arrays, and
 the `ext_e_agg` fetch. The others issue no transfer at all: they reuse the walk to pair each
 `hipStreamWaitEvent` with the work that follows it — the waits on `events_pull`, and the waits that gate
@@ -352,7 +383,7 @@ for (int delta = 1; delta < N_DEVICES; ++delta) {
 
 ![all gather](assets/all-gather.png)
 
-On the 20B the copies of one phase are all issued on the per-device `memory_stream`, created with
+On the 20B's copy path the copies of one phase are all issued on the per-device `memory_stream`, created with
 `hipStreamNonBlocking` in [`src/getp/transformer.cpp`](../src/getp/transformer.cpp), so they execute in
 issue order. The 120B's copy path (`GETP_XPULL=0`) spreads them over four copy streams, peer _j_ on
 stream _j_ mod 4 (`GETP_COPY_STREAMS`), so that pulls from different peers overlap; the rotation still
@@ -529,7 +560,7 @@ Over a full decode step:
 | ----------------------------------------------------------- | ------------: | -------------: |
 | Layers                                                      |            24 |             36 |
 | P2P bytes per device per decode step                        |      ≈ 638 MB |      ≈ 0.96 GB |
-| `hipMemcpyPeerAsync` calls per device per layer             |             4 |   0 (`GETP_XPULL`) |
+| `hipMemcpyPeerAsync` calls per device per layer             | 0 (`GETP_K2PULL`) | 0 (`GETP_XPULL`) |
 | Global barriers per decode step, 2 per layer + 1            |            49 |             73 |
 
 On the 120B, with neither row-skip, inbound is 61,931,520 B per layer, a shade under twice the
@@ -626,13 +657,13 @@ Only `memory` and `compute` are used by the EP path.
 
 A few things in this area are worth knowing before changing it.
 
-**Peer access is enabled only for the direct pulls.** `enable_p2p_allpairs` in
+**Peer access is enabled by the exchange kernels.** `enable_p2p_allpairs` in
 [`src/getp/collectives.cpp`](../src/getp/collectives.cpp) is `static` and has no caller anywhere in the
-tree, and `cgCreate` does not invoke it. The one `hipDeviceEnablePeerAccess` is `GETP_XPULL`'s, on the
-120B's first step, to the other GPUs of the group; it aborts the run if access is refused, because the
-pull kernels dereference peer pointers. The 20B never enables it, so whether its P2P copies take a
-direct device-to-device link or a staged fallback is left entirely to HIP. There is no probe, no fallback path and no
-comment on the matter, so nothing in this repository settles it.
+tree, and `cgCreate` does not invoke it. Peer access comes from `GETP_XPULL` (the 120B, to the other
+seven GPUs of the group) and `GETP_K2PULL` (each 20B pair), on the first step; both abort the run if
+access is refused, because their kernels dereference peer pointers. On the copy paths behind
+`GETP_XPULL=0` / `GETP_K2PULL=0`, whether a P2P copy takes a direct link or a staged fallback is left
+to HIP.
 
 **The engine is one translation unit.** This is not a stylistic detail; several things on this
 page only make sense once you know it. [`src/run.cpp`](../src/run.cpp) `#include`s _source_ files, not

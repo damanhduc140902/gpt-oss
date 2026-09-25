@@ -491,6 +491,13 @@ peer's slice on its own `memory_stream`, records `events_pull[j]`, and `compute_
 before `getp_map_global_to_local_batch`. With that, the hash trace shows no divergence at any stage
 and two full runs agree on 100.00 % of lines. The price is the lost overlap: 63 342 against 62 841 tok/s on 20B over two interleaved pairs, 0.8 %.
 
+The pull did not close it completely on the 20B: about one run in twelve still diverged on an idle
+host, one in three with the host CPU busy. The cause was the copy engine itself: it writes HBM behind
+the GPU's L2, and a kernel reading the copied buffer can get lines the previous layer left in L2
+(caught at the expert-output exchange by comparing every exchange with its source). The pairs now
+read each other's slices with kernels over peer access (`GETP_K2PULL`), as the 120B's direct pulls
+always did; see [PARALLELISM.md](PARALLELISM.md).
+
 `ext_e_agg`, the buffer the aggregate is pulled from, is additionally two buffers used alternately by
 layer parity (`ext_e_agg2` in `RunStateExt`). Nothing forbids a peer's next-layer
 `moe_gather_pairs_acc` from rewriting the slice a copy is still pulling, so the second buffer closes
@@ -518,22 +525,19 @@ Each `DeviceTransformer` creates four non-blocking streams
 | Stream           | Carries                                       |
 | ---------------- | --------------------------------------------- |
 | `compute_stream` | every kernel, plus the final argmax read-back |
-| `memory_stream`  | all `hipMemcpyPeerAsync` traffic; at EP > 2 shared with three more copy streams, peer _j_ on stream _j_ mod 4 (`GETP_COPY_STREAMS`) |
+| `memory_stream`  | the expert moves' weight copies; the exchange copies only on the copy paths (`GETP_K2PULL=0`, `GETP_XPULL=0`), where at EP > 2 three more copy streams join it, peer _j_ on stream _j_ mod 4 (`GETP_COPY_STREAMS`) |
 
 Overlap is real but narrow, and it is event-driven rather than stream-priority driven. Two places
 in the layer body actually hide work:
 
 1. **Hidden-state and top-k exchange.** These used to be pushed behind the router GEMM — the one
-   substantial overlap in the layer — and are now pulled after the barrier on `memory_stream`, with
-   `compute_stream` waiting on `events_pull[j]` before the bucket build (the loop following the first
-   `sync_workers` in `getp_forward_120b`, [`forward.hip`](../src/hip/forward.hip)). The copy still
-   overlaps nothing else, but it is short: 8.8 MB of bf16 plus two 24 KB top-k arrays per peer. The
-   overlap was given up for determinism; see the barrier section above for why.
-2. **Expert-aggregate reduction interleaved with its copies.** Each peer copy records its own
-   `events_e_agg[j]`, and the matching `getp_vecadd` waits only on that one event (the two peer
-   loops following `moe_gather_pairs_acc` in `getp_forward_120b`,
-   [`forward.hip`](../src/hip/forward.hip)), so reduction of peer _j_ overlaps the arrival
-   of peer _j+1_.
+   substantial overlap in the layer — and are now read after the barrier: by `k2pull_copy_kernel` on
+   the 20B and by `xpull_ag_kernel` on the 120B, both on `compute_stream` right before the bucket
+   build. The transfer overlaps nothing else, but it is short: 8.8 MB of bf16 plus two 24 KB top-k
+   arrays per peer on the 20B. The overlap was given up for determinism; see the barrier section above.
+2. **The expert aggregate.** The 20B gathers its own rows after emitting the partner's slice, while
+   the partner is still finishing its own, and only then waits and adds the partner's partial sums
+   in place (`k2pull_add_kernel`); the 120B adds all seven peers' in one `xpull_rs_kernel`.
 
 A third overlap used to sit between those two: a 35.4 MB `hipMemsetAsync` of `ext_e_agg` hidden
 behind both MLPs. It is gone, because `moe_gather_pairs_kernel` now writes `e_agg` instead of

@@ -7236,6 +7236,46 @@ inline void sync_workers(hipStream_t stream, Barrier &sync_point) {
 #define GETP_COPY_STREAMS 4
 #endif
 
+// GETP_K2PULL (default 1): at EXPERT_PARALLELISM = 2 the partner's data is read by kernels over
+// peer access; no copy engine writes into memory our kernels then read. Bit-exact.
+// The 20B's pairs used to exchange with hipMemcpyPeerAsync into our buffers, and one run in three
+// under host CPU load (one in ~12 on an idle host) diverged on one GPU from some step on. Comparing
+// every exchange with its source right after it landed caught it: after the sync-point-2 copy had
+// completed and the compute stream had waited for it, a kernel read a contiguous third of
+// peer_e_agg (512 rows) that did not match the partner's e_agg. The copy engine writes HBM behind
+// our L2, and lines the previous layer's add left there are read instead of the new data; the
+// layer's other traffic usually evicts them, so it is rare. The 120B's exchanges were already
+// kernels reading the peers' memory (GETP_XPULL) and never showed it. Under the same load the
+// kernel reads measured 6 of 6 runs identical, at the same speed.
+#ifndef GETP_K2PULL
+#define GETP_K2PULL 1
+#endif
+#if GETP_K2PULL
+// EP = 2: the partner's slice copied by a kernel reading its memory (see the note above).
+__global__ __launch_bounds__(256) void k2pull_copy_kernel(uint4 *__restrict__ dst,
+                                                          const uint4 *__restrict__ src, size_t n16) {
+  for (size_t i = (size_t)blockIdx.x * blockDim.x + threadIdx.x; i < n16;
+       i += (size_t)gridDim.x * blockDim.x)
+    dst[i] = src[i];
+}
+// x[i] += y[i] with y the partner's fp32 partial sums read in place: copy + vecadd in one pass.
+__global__ __launch_bounds__(256) void k2pull_add_kernel(float4 *__restrict__ x,
+                                                         const float4 *__restrict__ y, size_t n4) {
+  const size_t i = (size_t)blockIdx.x * blockDim.x + threadIdx.x;
+  if (i >= n4) return;
+  float4 a = x[i];
+  const float4 b = y[i];
+  a.x += b.x; a.y += b.y; a.z += b.z; a.w += b.w;
+  x[i] = a;
+}
+static inline void k2pull_copy(void *dst, const void *src, size_t bytes, hipStream_t st) {
+  const size_t n16 = bytes / 16;
+  const unsigned grid = (unsigned)std::min<size_t>((n16 + 255) / 256, 832);
+  k2pull_copy_kernel<<<grid, 256, 0, st>>>(reinterpret_cast<uint4 *>(dst),
+                                           reinterpret_cast<const uint4 *>(src), n16);
+}
+#endif
+
 int *getp_forward_120b(Transformer * /*transformer*/,
                        DeviceTransformer **dev_transformers, GPUWorker *workers,
                        Barrier &sync_point, int thread_idx_offset, int token[],
@@ -7261,6 +7301,25 @@ int *getp_forward_120b(Transformer * /*transformer*/,
   float *dev_x = dev_s->x;
 
   HIP_CHECK(hipSetDevice(device_index));
+#if GETP_K2PULL
+  // EP = 2: the partner's buffers are read by kernels (K2PULL), so the pair needs peer access.
+  const bool k2 = (EXPERT_PARALLELISM == 2);
+  if (k2) {
+    static thread_local bool k2_peer = false;
+    if (!k2_peer) {
+      const int pd = workers[(device_index - base_device_index + 1) % 2].device_index;
+      const hipError_t e = hipDeviceEnablePeerAccess(pd, 0);
+      if (e != hipSuccess && e != hipErrorPeerAccessAlreadyEnabled) {
+        fprintf(stderr, "k2pull: no peer access %d -> %d\n", device_index, pd);
+        abort();
+      }
+      (void)hipGetLastError();
+      k2_peer = true;
+    }
+  }
+#else
+  const bool k2 = false;
+#endif
 
   // These 5 events used to be created EVERY STEP and never destroyed. Now they are created once
   // per thread (one thread per GPUWorker, one device per thread).
@@ -7743,7 +7802,7 @@ int *getp_forward_120b(Transformer * /*transformer*/,
 #endif
     {
 #if GETP_DEVSYNC
-    sync_workers_dev(compute_stream, memory_stream, sync_point, device_index,
+    sync_workers_dev(compute_stream, k2 ? compute_stream : memory_stream, sync_point, device_index,
                      EXPERT_PARALLELISM, base_device_index, 2 * (int)l + 0);
 #else
     sync_workers(compute_stream, sync_point);
@@ -7755,7 +7814,23 @@ int *getp_forward_120b(Transformer * /*transformer*/,
 #else
     const bool xp = false;
 #endif
-    for (int delta = 1, j = 0; delta < EXPERT_PARALLELISM && !xp; ++delta) {
+#if GETP_K2PULL
+    if (k2) {
+      // The partner's slice of ext_t_bf16 and of the top-k tables, read from its memory by kernels
+      // on our compute stream (which has just waited for the partner's event). A copy engine would
+      // write HBM behind our L2, and the scatter could then read lines left there by the last layer.
+      const int pd = workers[(own_slice + 1) % 2].device_index;
+      const size_t ps = (size_t)(pd - base_device_index);
+      RunStateExt *pe = ext_get(pd);
+      const size_t nk = (size_t)BATCH_SIZE * p->experts_per_token;
+      k2pull_copy(ext->ext_t_bf16 + ps * BATCH_SIZE * hidden_dim,
+                  pe->ext_t_bf16 + ps * BATCH_SIZE * hidden_dim,
+                  sizeof(__hip_bfloat16) * (size_t)BATCH_SIZE * hidden_dim, compute_stream);
+      k2pull_copy(ext->ext_topk_i + ps * nk, pe->ext_topk_i + ps * nk, sizeof(int) * nk, compute_stream);
+      k2pull_copy(ext->ext_topk_v + ps * nk, pe->ext_topk_v + ps * nk, sizeof(float) * nk, compute_stream);
+    }
+#endif
+    for (int delta = 1, j = 0; delta < EXPERT_PARALLELISM && !xp && !k2; ++delta) {
       int i = (device_index + delta) % EXPERT_PARALLELISM;
       GPUWorker *peer_worker = &workers[i];
       int peer_device_index = peer_worker->device_index;
@@ -7794,7 +7869,7 @@ int *getp_forward_120b(Transformer * /*transformer*/,
       HIP_CHECK(hipEventRecord(events_pull[j], GETP_CS(j)));
       ++j;
     }
-    for (int delta = 1, j = 0; delta < EXPERT_PARALLELISM && !xp; ++delta) {
+    for (int delta = 1, j = 0; delta < EXPERT_PARALLELISM && !xp && !k2; ++delta) {
       int i = (device_index + delta) % EXPERT_PARALLELISM;
       if (workers[i].device_index == device_index) continue;
       HIP_CHECK(hipStreamWaitEvent(compute_stream, events_pull[j], 0));
@@ -8006,6 +8081,26 @@ int *getp_forward_120b(Transformer * /*transformer*/,
       sync_point.wait();
     } else
 #endif
+#if GETP_K2PULL && GETP_DEVSYNC && GETP_GP_OWN_LAST
+    if (k2 && gp_own_last) {
+      // Record, barrier, our own rows while the partner finishes its slice for us, then wait for
+      // its event and add its partial sums straight from its e_agg (no copy, no peer_e_agg).
+      const int pd = workers[(own_slice + 1) % 2].device_index;
+      const int ks = (2 * (int)l + 1) % GETP_SYNC_SLOTS;
+      HIP_CHECK(hipEventRecord(g_ev_sync[device_index][ks], compute_stream));
+      sync_point.wait();
+      moe_gather_pairs_acc(eagg_out, dev_x, own_slice * BATCH_SIZE,
+                           own_slice * BATCH_SIZE + BATCH_SIZE, ext->z_partial, ext->pair_pos,
+                           hidden_dim, p->experts_per_token, EXPERT_PARALLELISM * BATCH_SIZE,
+                           compute_stream, gp_rank, own_slice * BATCH_SIZE, BATCH_SIZE, gp_bf16);
+      HIP_CHECK(hipStreamWaitEvent(compute_stream, g_ev_sync[pd][ks], 0));
+      RunStateExt *pe = ext_get(pd);
+      const float *src = ((l & 1) ? pe->ext_e_agg2 : pe->ext_e_agg) + (size_t)own_slice * BATCH_SIZE * hidden_dim;
+      const size_t n4 = (size_t)BATCH_SIZE * hidden_dim / 4;
+      k2pull_add_kernel<<<(unsigned)((n4 + 255) / 256), 256, 0, compute_stream>>>(
+          reinterpret_cast<float4 *>(dev_x), reinterpret_cast<const float4 *>(src), n4);
+    } else
+#endif
     {
 #if GETP_DEVSYNC
     sync_workers_dev(compute_stream, memory_stream, sync_point, device_index,
@@ -8064,7 +8159,7 @@ int *getp_forward_120b(Transformer * /*transformer*/,
     }
 #endif
 
-    for (int delta = 1, j = 0; delta < EXPERT_PARALLELISM && !xp; ++delta) {
+    for (int delta = 1, j = 0; delta < EXPERT_PARALLELISM && !xp && !k2; ++delta) {
       int i = (device_index + delta) % EXPERT_PARALLELISM;
       GPUWorker *peer_worker = &workers[i];
       int peer_device_index = peer_worker->device_index;
@@ -8116,7 +8211,7 @@ int *getp_forward_120b(Transformer * /*transformer*/,
         ++j;
       }
     }
-    for (int delta = 1, j = 0; delta < EXPERT_PARALLELISM && !xp; ++delta) {
+    for (int delta = 1, j = 0; delta < EXPERT_PARALLELISM && !xp && !k2; ++delta) {
       int i = (device_index + delta) % EXPERT_PARALLELISM;
       GPUWorker *peer_worker = &workers[i];
       int peer_device_index = peer_worker->device_index;

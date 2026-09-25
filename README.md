@@ -422,14 +422,18 @@ the 20B's benchmark input today; the 20B's 16-step gate is now `edddca087af7`). 
 instrument than METEOR when the claim is that a change moved no numbers, and it is what makes a 0.6%
 win safe to accept.
 
-The 20B is not quite there. Of its last twelve full-length runs on the reference input, eleven hashed
-identically; the twelfth differed in 7 of its 12,288 lines, all of them requests served by the same
-GPU, and that same binary then gave the usual hash three times in a row. The current build shows the
-same thing at d4fde70: of five full-length runs, four hashed exactly like the build before it and the
-first run after the gate differed in 96 lines - every 32nd request of two GPUs, from its first token.
-The shipped build's five verification runs all hashed alike (`81e82a2c077f` on the benchmark input). A change that altered the numbers would do so every time, so this is a rare ordering race still left
-somewhere on the 20B's two-device exchange path, and it has not been found yet. The 16-step gate has
-never missed; a single full-length 20B run that disagrees is rerun before it is read as evidence.
+The 20B took longer. Its full-length runs used to disagree now and then - about one run in twelve
+on an idle host, a few hundred lines of one GPU or one pair from some step on - and one run in three
+while the host CPU was busy (an evaluation running alongside, or 88 busy loops). Swapping the event
+handshake between the two GPUs of a pair for a value in memory did not help, and neither did peer
+access or dropping unused event records. What found it was a probe that compared every exchange with
+its source right after it landed: after the copy engine had delivered the partner's expert output
+and the compute stream had waited for it, the add kernel read a contiguous third of it (512 rows)
+that did not match the partner's buffer. A copy engine writes HBM behind the GPU's L2, and lines the
+previous layer left in L2 were read instead of the new data. The 120B, whose exchanges are kernels
+reading the peers' memory, never showed it. The 20B's pairs now exchange the same way
+(`GETP_K2PULL`, see [PARALLELISM.md](docs/PARALLELISM.md)): same output (`81e82a2c077f`), same
+speed, and six runs under the same CPU load all identical.
 
 ---
 
