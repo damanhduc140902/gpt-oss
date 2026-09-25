@@ -23,7 +23,7 @@ hipBLAS, no RCCL, no MPI. Every kernel, every collective and the tokenizer are w
 this repository. The only dependency is the HIP runtime itself.
 
 It began from [llama2.c](https://github.com/karpathy/llama2.c) and grew into a complete inference system.
-On a single node of 8 AMD MI250 GPUs it serves **75,369 tokens per second on the 20B model and 32,297 on
+On a single node of 8 AMD MI250 GPUs it serves **81,100 tokens per second on the 20B model and 36,978 on
 the 120B model**, while keeping the generated text faithful to a CPU reference.
 
 Two things are measured, and both have to hold:
@@ -224,8 +224,8 @@ Measured on one node of 8× AMD MI250 in batch (`getp`) mode.
 
 | Model          | Requests | Warm-up (s) | Inference (s) | Throughput (TPS) | METEOR | BERTScore |
 | -------------- | -------: | ----------: | ------------: | ---------------: | -----: | --------: |
-| `gpt-oss-20b`  |    12288 |          29 |           157 |        **75369** |  0.535 |     0.978 |
-| `gpt-oss-120b` |     6144 |          62 |           188 |        **32297** |  0.554 |     0.981 |
+| `gpt-oss-20b`  |    12288 |          29 |           145 |        **81100** |  0.513 |     0.976 |
+| `gpt-oss-120b` |     6144 |          40 |           164 |        **36978** |  0.550 |     0.980 |
 
 Where those numbers came from, one optimisation at a time on the 20B model:
 
@@ -249,7 +249,11 @@ Where those numbers came from, one optimisation at a time on the 20B model:
 | LM head activations converted to bf16 once, which widens the grouping to six |      68424 |  +3.5% |
 | q written pre-scaled as bf16, since attention rounded it to bf16 anyway |      69309 |  +1.3% |
 | Expert GEMMs load HBM two k tiles ahead, without branches, between the MFMAs |      70734 |  +1.9% |
-| KV cache head-major with padded regions; attention-out loads two k tiles ahead; two KV tiles in flight |  **75369** |  +6.5% |
+| KV cache head-major with padded regions; attention-out loads two k tiles ahead; two KV tiles in flight |      75369 |  +6.5% |
+| RMSNorm one wave per row; router GEMM fused; expert-output gather at 16 bytes a thread, the pair's slice first |      77145 |  +2.4% |
+| The value half of the KV cache stored as int8 § |      78502 |  +2.3% |
+| Experts moved between the two GPUs of each pair too ¶ |      78955 |  +0.6% |
+| Finished requests routed to no expert |  **81100** |  +2.8% |
 
 The 120B model reached 20,426 tok/s on that same work without a single change written for it: it runs
 the same kernels with the same defaults. Past that point it needed its own work, because its bottleneck
@@ -268,22 +272,30 @@ is not the same one:
 | Experts moved between GPUs every 100 steps to even out the load ‡       |      28670 | +10.2% |
 | The peer pulls spread over four copy streams                            |      30349 |  +6.2% |
 | Expert GEMMs load HBM two k tiles ahead, without branches, between the MFMAs |      30224 |  +1.7% |
-| KV cache head-major with padded regions; qkv loads two k tiles ahead; two KV tiles in flight |  **32297** |  +5.1% |
+| KV cache head-major with padded regions; qkv loads two k tiles ahead; two KV tiles in flight |      32297 |  +5.1% |
+| RMSNorm one wave per row; router GEMM fused; expert-output gather and row adds at 16 bytes a thread |      34526 |  +6.5% |
+| Both expert exchanges as one kernel each, reading the peers' memory directly |      36111 |  +4.2% |
+| The value half of the KV cache stored as int8 § |      36564 |  +1.6% |
+| Finished requests routed to no expert |  **36978** |  +1.1% |
 
-Each percentage is a paired measurement: the two builds run alternately in one session, twice each,
-against the same input - except the four-stream and expert-move rows, which rest on one to three runs
-each (the four-stream figure was repeated at 29,750 and 30,300 in a later session), and the last row of
-each table, whose change is the ratio of two paired sessions: against the previous shipped build it
-measured +8.5 % on the 20B (75,369 against 69,435) and +6.9 % on the 120B (32,297 and 32,572 against
-30,335), of which the row above it is +1.9 % and +1.7 %. Absolute throughput moves about 1 % between
-sessions, so the rows are not strictly comparable across the table - the numbers that stand behind the
-summary above are the verification runs of the shipped build: the median of five full-length 20B runs
-(75,331 to 75,628 tok/s, inference 156.9-157.0 s) and the lower of two 120B runs (32,297 and 32,572).
+Each percentage is a paired measurement: the two builds run alternately in one session, against the
+same input, mostly twice each - except the four-stream and expert-move rows, which rest on one to three
+runs each (the four-stream figure was repeated at 29,750 and 30,300 in a later session), and the
+head-major KV row, whose change is the ratio of two paired sessions. Absolute throughput moves about
+1 % between sessions, so the rows are not strictly comparable across the table. The last five rows of
+each table were measured on top of each other in one sitting and then verified together against the
+previous shipped build: 81,100 against 75,209 tok/s on the 20B (+7.8 %) and 36,978 against 32,532 on the 120B
+(+13.7 %). The numbers that stand behind the summary above are those verification runs: the median of
+five full-length 20B runs (81,022 to 81,308 tok/s, inference 144.7-145.2 s) and the lower of two 120B runs (36,978 and
+37,118).
 
-Every row is bit-exact except the two marked, which change the 120B's numbers by design and were
-therefore accepted on METEOR and BERTScore (thresholds 0.3 and 0.9) rather than on a hash. Both stay
-reproducible from run to run, and both are gated on `EXPERT_PARALLELISM > 2`, so the 20B never takes
-them and still hashes to `720709b86d36`.
+Every row is bit-exact except the marked ones, which change the numbers by design and were therefore
+accepted on METEOR and BERTScore (thresholds 0.3 and 0.9) rather than on a hash. The two 120B rows
+marked † and ‡ are gated on `EXPERT_PARALLELISM > 2`; the 20B took no inexact change until the int8 V
+cache, and hashed to `720709b86d36` (the 16-step gate) up to the row before it. The last row is exact
+for a fixed expert placement (the bf16 20B build without expert moves keeps its full-length hash,
+`4bfba1c91770`), but the expert moves are planned from pair counts that no longer include finished
+requests, so with them on it changes the output like the moves themselves do.
 
 † The expert partial sums cross the interconnect as bf16: `efe1096ff64c` became `18a57667bd03`,
 METEOR 0.5608 to 0.5603, BERTScore 0.9814 to 0.9805.
@@ -292,6 +304,14 @@ METEOR 0.5608 to 0.5603, BERTScore 0.9814 to 0.9805.
 the partial sums are grouped - and rounded to bf16 - differently: `18a57667bd03` became
 `eaf474501c3c`, METEOR 0.5603 to 0.5545, BERTScore 0.9805 to 0.9811. The same run always makes the
 same moves, so the output is still reproducible, including on a host loaded by other work.
+
+§ One int8 code per element and one fp32 scale per 64-element head vector, dequantized to fp16 inside
+attention (see [KERNELS.md](docs/KERNELS.md)). Quick METEOR-only screens: the 20B's 0.534 became 0.519,
+the 120B's 0.5545 became 0.548. Keys stay bf16: with K in int8 as well the 20B fell to METEOR 0.342.
+
+¶ The same moves as ‡, now inside each 20B pair: METEOR 0.519 to 0.512 (with § in place).
+
+The shipped build scores METEOR 0.5135 and BERTScore 0.9763 on the 20B, 0.5496 and 0.9798 on the 120B.
 
 At expert parallelism 8 the 120B spent 63% of every step with the GPUs idle, nearly all of it waiting
 on the expert exchange. The output half was seven dense 8.85 MB blocks per layer, one per peer,
@@ -366,12 +386,23 @@ keys, 653 to 388 µs on a sliding one, 2098 to 1343 µs on a full 120B layer - b
 addresses change. Keeping two KV tiles in flight per wave, which gained nothing on the old layout, adds
 another 2-4 % on the new one.
 
+The newest rows come from what was left once the big kernels were close to their limits: the expert
+GEMMs run 73-85 % matrix-core-busy and the LM head 89 %, so the remaining time was in the small
+kernels around them, in the exchange, and in work nobody needed. The norms, the router and the
+expert-output gather were rewritten to keep every addition in its old order, so they are exact
+(+2.4 % and +6.5 %). On the 120B both expert exchanges became one kernel each that reads the peers'
+memory directly, which removed some 35 peer copies and a stream drain per layer (+4.2 %, exact).
+Requests that have finished were still routed through the expert GEMMs, 5.9 % of the 20B's row-steps
+on the benchmark input; they now go to no expert (+2.8 % and +1.1 %). Two changes trade exactness for
+speed: the value half of the KV cache in int8, which takes a full 20B attention layer at 1024 keys
+from 2605 to 1952 µs, and expert moves inside the 20B's pairs.
+
 Warm-up is dominated by reading the checkpoint off disk, so it depends on whether the file is still in
 the page cache; it is not part of what the optimisation work changed.
 
 Throughput is aggregate across all eight GPUs, not single-stream latency. The quality gates are METEOR
-0.3 and BERTScore 0.9; both models clear them several times over, so the speed was not bought with
-degraded output.
+0.3 and BERTScore 0.9, and both models clear them by a wide margin. The inexact rows cost the 20B
+0.022 of METEOR and the 120B 0.004, measured against the reference completions.
 
 Every figure in that table comes from one run each. The completions committed in
 [`tests/submission/`](tests/submission/) are from the starting point of that table, before any of the
@@ -383,23 +414,22 @@ Repeating a run still moves throughput - by about 1 % between sessions, less wit
 That was not always true: before the expert exchange was made pull-based, a receiver could read a peer's
 buffer while it was still being written, so two runs of the _same binary_ at 8 GPUs agreed on only about
 50 % to 95 % of output lines, run pair by run pair. With the pull in place the 120B reproduces its hash from run to run, and every optimisation listed above
-but two was checked by hashing the output rather than by scoring it - the 20B against 720709b86d36 and
-the 120B against the hash of the build before it, both with zero differing lines. The exceptions are the
-bf16 return leg and the expert moves, which change the 120B's numbers by design; they were judged on
-METEOR and BERTScore instead, and the output still hashes identically from one run to the next
-(`eaf474501c3c` today, on an idle host and on one loaded by an evaluation running alongside). A hash is a far sharper instrument than
-METEOR when the claim is that a change moved no numbers, and it is what makes a 0.6% win safe to accept.
+except the marked ones was checked by hashing the output rather than by scoring it - the 20B against
+720709b86d36 and the 120B against the hash of the build before it, both with zero differing lines. The
+marked ones change the numbers by design; they were judged on METEOR and BERTScore instead, and the
+output still hashes identically from one run to the next (`5ab5041b86f2` on the 120B and `81e82a2c077f` on
+the 20B's benchmark input today; the 20B's 16-step gate is now `edddca087af7`). A hash is a far sharper
+instrument than METEOR when the claim is that a change moved no numbers, and it is what makes a 0.6%
+win safe to accept.
 
 The 20B is not quite there. Of its last twelve full-length runs on the reference input, eleven hashed
 identically; the twelfth differed in 7 of its 12,288 lines, all of them requests served by the same
 GPU, and that same binary then gave the usual hash three times in a row. The current build shows the
-same thing: of five full-length runs, four hash exactly like the build before it (and so does the
-reference input, `8b019f121ede`, which is why the table's METEOR and BERTScore are unchanged); the
+same thing at d4fde70: of five full-length runs, four hashed exactly like the build before it and the
 first run after the gate differed in 96 lines - every 32nd request of two GPUs, from its first token.
-A change that altered the numbers would do so every time, so this is a rare ordering race still left
-somewhere on the 20B's two-device exchange path, and it has not been found yet. The 16-step gate
-behind 720709b86d36 has never missed; a single full-length 20B run that disagrees is rerun before it
-is read as evidence.
+The shipped build's five verification runs all hashed alike (`81e82a2c077f` on the benchmark input). A change that altered the numbers would do so every time, so this is a rare ordering race still left
+somewhere on the 20B's two-device exchange path, and it has not been found yet. The 16-step gate has
+never missed; a single full-length 20B run that disagrees is rerun before it is read as evidence.
 
 ---
 

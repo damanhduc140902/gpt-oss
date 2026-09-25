@@ -217,9 +217,9 @@ The upload is split into two allocations along the parallelism boundary:
 | Experts (`dev_experts`)         | 17.80 GiB                 | 26.71 GiB                 |
 | KV cache time slots (`total_t`) | 13,824 (12×128 + 12×1024) | 20,736 (18×128 + 18×1024) |
 | `BATCH_SIZE`                    | 1536                      | 768                       |
-| KV cache, K + V in bf16         | 40.5 GiB                  | 30.4 GiB                  |
+| KV cache, K + V, bf16-sized     | 40.5 GiB                  | 30.4 GiB                  |
 
-`total_t` is where the alternating window pays off: windowed layers get 128 slots, full layers get `seq_len / 2 = 1024`, and the cache is addressed as a ring with `pos % cache_tcap`. A uniform 2048 slots per layer would have cost the 20B model roughly 3.5× the cache it actually uses.
+The KV buffers are bf16-sized for both tensors, although V holds int8 codes and their scales by default (see [KERNELS.md](KERNELS.md)); the row leaves out the region pads, 0.84 GiB on the 20B and 0.63 GiB on the 120B. `total_t` is where the alternating window pays off: windowed layers get 128 slots, full layers get `seq_len / 2 = 1024`, and the cache is addressed as a ring with `pos % cache_tcap`. A uniform 2048 slots per layer would have cost the 20B model roughly 3.5× the cache it actually uses.
 
 The two configurations land at close to the same total because `BATCH_SIZE` is the free variable: it is tuned per model to fill whatever HBM the weights leave, which is why 20B runs 1536 sequences and 120B runs 768. EP=2 for the 20B model is chosen for the same reason — the model fits on one device, but halving the expert footprint buys batch size, and batch size is throughput.
 

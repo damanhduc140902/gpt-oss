@@ -260,24 +260,23 @@ than the arithmetic does.
 - **MLP1** clamps both branches, applies SwiGLU and writes bf16 directly, so the intermediate never
   exists in fp32 and MLP2 reads it at half the width with no conversion pass in between.
 - **MLP2** applies the routing weight, which makes the final MoE gather a plain sum.
-- **QKV** fans out to three destinations and does the rotation and the rounding on the way: q is rotated, scaled by `1/sqrt(head_dim)` and written as bf16; K is rotated and written as bf16 straight into this step's KV cache slot; V is written as bf16 into its own slot unrotated. That retires both `getp_apply_rotary_emb` launches and `kv_store_pair_fp32_to_bf16` from the live path. The fp32 fan-out shown above is the `GETP_ROPE_FUSED 0` fallback arm.
+- **QKV** fans out to three destinations and does the rotation and the rounding on the way: q is rotated, scaled by `1/sqrt(head_dim)` and written as bf16; K is rotated and written as bf16 straight into this step's KV cache slot; V is written into its own slot unrotated, by default as int8 codes plus one fp32 scale per (row, KV head) (`GETP_KV8_V`, see [Cache layout and tiling](#cache-layout-and-tiling)). That retires both `getp_apply_rotary_emb` launches and `kv_store_pair_fp32_to_bf16` from the live path. The fp32 fan-out shown above is the `GETP_ROPE_FUSED 0` fallback arm.
 - **Attention out** adds into the fp32 residual instead of writing a tensor of its own.
   `matmul_attn_o_bf16_kernel_tuned` takes an `ACC` template flag, and the live launcher is
   `getp_matmul_attn_o_bf16_acc`, which instantiates it with `ACC = true`. That removes a 17.7 MB write
   and a 17.7 MB read per layer. The non-accumulating `getp_matmul_attn_o_bf16` is still defined and no
   longer called.
-- **The MoE gather** does the same on the way out. `moe_gather_pairs_kernel` adds its own-device slice
-- **The MoE gather** does the same on the way out. `moe_gather_pairs_kernel` adds its own-device slice
-  straight into the residual and _overwrites_ the peer slices rather than accumulating into them, which
-  is why the 35 MB per-layer memset of `ext_e_agg` is gone. At `EXPERT_PARALLELISM > 2` — the 120B
-  configuration; `GETP_ROWSKIP` self-disables below it, so 20B keeps the plain overwrite — the kernel
-  goes further and skips any row whose token routes no expert to this device. Such a row is all zeros,
-  so it is not written at all, and the surviving rows are compacted to the head of their slice. Nothing
-  reads the cells that were skipped: the peer copies, and scatter-adds, only the first `cnt` rows, which
-  on 120B is 43 % of them.
-  every cell is written exactly once — which is why the 35 MB per-layer memset of `ext_e_agg` is gone.
+- **The MoE gather** does the same on the way out. `moe_gather_pairs_kernel` (in its live form
+  `moe_gather_pairs_v4_kernel`, four columns per thread) adds its own-device slice straight into the
+  residual and _overwrites_ the peer slices rather than accumulating into them, so every cell is written
+  exactly once, which is why the 35 MB per-layer memset of `ext_e_agg` is gone. At
+  `EXPERT_PARALLELISM > 2` — the 120B configuration; `GETP_ROWSKIP` self-disables below it, so 20B keeps
+  the plain overwrite — the kernel goes further and skips any row whose token routes no expert to this
+  device. Such a row is all zeros, so it is not written at all, and the surviving rows are compacted to
+  the head of their slice. Nothing reads the cells that were skipped: the peer reads only the first
+  `cnt` rows, which on 120B is 43 % of them.
 
-Operand precision is handled three ways. The router takes fp32 activations and converts to bf16 during the global-to-LDS store, so the conversion rides along with a load that has to happen anyway. The logits kernel used to do the same; with `GETP_LOGITS_XBF16` (default 1) a separate `logits_x_to_bf16_kernel` converts the whole activation matrix once per step and the GEMM stages that bf16 copy through `xb` instead — half the bytes per staging load, which is what moved the group swizzle's optimum from G = 2 to G = 6. The fp32 convert-on-store path for logits survives as the `#else` arm. QKV and attention-out want bf16 already in memory, and their producers write it directly: `getp_rmsnorm_bf16` emits bf16 into `pre_qkv_bf16`, and the attention kernel rounds in the lane and writes `attn_o_bf16` itself. The separate `tensor_fp32_to_bf16` pass over each of those tensors is gone from the live path; the remaining calls to it sit in the dispatcher's retired `#else` arms and in the never-called `getp_forward_20b`.
+Operand precision is handled three ways. The router reads the bf16 copy of its activations that the pre-MoE RMSNorm writes for the expert exchange anyway (`GETP_ROUTER_FUSED`, see [Routing](#routing)); its fallback takes fp32 activations and converts to bf16 during the global-to-LDS store, so the conversion rides along with a load that has to happen anyway. The logits kernel used to do the same; with `GETP_LOGITS_XBF16` (default 1) a separate `logits_x_to_bf16_kernel` converts the whole activation matrix once per step and the GEMM stages that bf16 copy through `xb` instead — half the bytes per staging load, which is what moved the group swizzle's optimum from G = 2 to G = 6. The fp32 convert-on-store path for logits survives as the `#else` arm. QKV and attention-out want bf16 already in memory, and their producers write it directly: `getp_rmsnorm_bf16` emits bf16 into `pre_qkv_bf16`, and the attention kernel rounds in the lane and writes `attn_o_bf16` itself. The separate `tensor_fp32_to_bf16` pass over each of those tensors is gone from the live path; the remaining calls to it sit in the dispatcher's retired `#else` arms and in the never-called `getp_forward_20b`.
 
 ### Double buffering, and the register pipeline underneath it
 
@@ -510,10 +509,13 @@ wave now runs 8 matrix-core instructions, 2 cross-lane operations and 5 `__expf`
 instructions, roughly 128 cross-lane operations and roughly 80 `__expf` in the retired design. The
 softmax is no longer the bottleneck because there is barely any of it left per key.
 
-Numerically the path is: Q scaled and rounded to bf16 in the qkv epilogue rather than here — `GETP_Q_BF16` (default on) has the epilogue write `f32_to_bf16bits(q_scale * o1)`, and the attention kernel loads those bf16 bit patterns directly; `q_scale` is 2^-3, so scaling before the rounding leaves the mantissa untouched and the result bit-identical to rounding first — K and V stored bf16 in the cache,
-cache, scores accumulated in fp32 inside the matrix core, `P` rounded to bf16 before the PV product,
-output accumulated in fp32, then rounded to bf16 in the lane and written straight to `attn_o_bf16`. The
-one new rounding is the one on `P`; `FLASH_P_HILO` (default 0) exists to split `P` into a high and a
+Numerically the path is: Q scaled and rounded to bf16 in the qkv epilogue rather than here — `GETP_Q_BF16` (default on) has the epilogue write `f32_to_bf16bits(q_scale * o1)`, and the attention kernel loads those bf16 bit patterns directly; `q_scale` is 2^-3, so scaling before the rounding leaves the mantissa untouched and the result bit-identical to rounding first — K stored bf16 in the
+cache, scores accumulated in fp32 inside the matrix core, output accumulated in fp32, then rounded to
+bf16 in the lane and written straight to `attn_o_bf16`. V is stored as int8 by default and dequantized
+to fp16 while its LDS tile is staged, so the PV product runs as `mfma_f32_16x16x16f16`, with `P`
+scaled by 2^15 and rounded to fp16, which keeps it a normal fp16 number down to e ≈ 2e-9 (the 2^15
+comes out in the final scale). With `GETP_KV8_V = 0` V stays bf16 and `P` is rounded to bf16 before a
+`_bf16_1k` product; `FLASH_P_HILO` (default 0, bf16 V only) exists to split that `P` into a high and a
 residual bf16 and pay one extra MFMA per chunk — four per tile — should that rounding ever prove to be
 the cause of a numerical difference.
 
@@ -564,10 +566,11 @@ list.
 
 ### Cache layout and tiling
 
-The KV cache is one bf16 allocation per device, head-major inside each layer (`GETP_KV_HEADMAJOR`,
-default 1): after the layer offset the element address runs batch, then KV head, then the ring slot
-`t % cache_tcap`, then head dim - each (request, KV head) owns one contiguous region of
-`cache_tcap × 64` elements plus a pad of `GETP_KV_PAD` = 384. `GETP_KV_OFF(t, b, col, B, KVD, CAP)`
+The KV cache is one bf16-sized allocation per device for K and one for V, head-major inside each layer
+(`GETP_KV_HEADMAJOR`, default 1): after the layer offset the element address runs batch, then KV head,
+then the ring slot `t % cache_tcap`, then head dim - each (request, KV head) owns one contiguous region
+of `cache_tcap × 64` elements plus a pad of `GETP_KV_PAD` elements (768 by default, 384 when both
+tensors are bf16; see below). `GETP_KV_OFF(t, b, col, B, KVD, CAP)`
 computes the offset, and it is additive in _t_ and _(b, col)_, so the qkv epilogue's slot pointer
 `GETP_KV_OFF(slot, 0, 0, ...)` plus the per-element offset `GETP_KV_OFF(0, b, col, ...)` addresses
 the same element the attention kernel reads. Time capacity differs by layer class.
@@ -579,8 +582,8 @@ the same element the attention kernel reads. Time capacity differs by layer clas
 
 For 20b that is 12 × 128 + 12 × 1024 = 13 824 time slots per device across 24 layers, at 1.5 MiB per
 slot for K and the same for V (1536 requests × 512 elements × 2 B), plus the pads: 24 layers × 1536 ×
-8 regions × 384 elements × 2 B = 226 MB for K and the same for V (170 MB each on the 120B), which
-`transformer.cpp` adds to the allocation with the same two macros. Note the consequence for the full
+8 regions × 768 elements × 2 B = 453 MB for K and the same for V (340 MB each on the 120B), which
+`transformer.cpp` adds to the allocation with the same macros. Note the consequence for the full
 layers: they hold half the advertised `seq_len` of 2048, so history beyond 1024 positions is dropped
 there too.
 
@@ -602,14 +605,43 @@ on the full 20B layer, 653 → 388 µs on a sliding one, 2098 → 1343 µs on th
 64 elements were still bad, 128-256 good, 384 the best measured, 512 worse. Only addresses change, so
 the output is bit-exact; the qkv epilogue's scattered write costs about 20 µs per layer on the 20B.
 
+**V in int8** (`GETP_KV8_V`, default 1; `GETP_KV8_K` does the same for K and defaults to 0). Decode
+attention is bound by the bytes of the cache it reads, and a 64-element head vector costs 128 bytes in
+bf16 against 68 as int8 codes plus one fp32 scale. There is no new allocation: code _e_ sits at byte _e_
+of the bf16-sized buffer - the same `GETP_KV_OFF` offsets, counted in bytes - and the scale of the
+vector that starts at element _e_ is float _e_/64 of the buffer's upper half (`getp_kv8_scales`), so a
+16-key tile has 16 consecutive scales. The rest of the upper half is unused; the saving is bandwidth,
+not memory. The qkv epilogue quantizes: a row's 64 dims sit on the 16 lanes of a lane group times 4
+values, so the absolute maximum takes four `__shfl_xor`, and the stored code is
+`round(x × 127 / amax) + 128`. Because the pad is counted in elements, the int8 tensor needs twice the
+element count for the same byte stagger, hence the default of 768 whenever a tensor is int8 (K, still
+bf16, then gets 1536 bytes); for this mix pads of 384 to 768 are within 5 % of each other and 768 is at or
+near the best on every shape measured, while 1024 is
+worse. Single-GPU harness, full 20B layer at 1024 keys: 2605 → 1952 µs; sliding: 377 → 293 µs; full
+120B layer: 1321 → 987 µs.
+
+This is the one change on this page that is not bit-exact, and K is left out for that reason. gpt-oss
+keys carry a large component shared across positions and very unequal channels - the largest dim's rms
+up to 23× the median - so one scale per vector quantizes the small channels coarsely, and the error in a
+score is multiplied through the softmax. On the 20B, METEOR against the reference completions (bf16
+0.534) is 0.519 with V in int8 and 0.342 with K too, although K would have taken the full layer on to
+1452 µs. Synthetic uniform keys hide this entirely: they gave 0.5 % output error with both tensors in
+int8.
+
 Sequence tiling is `TILE = 16`. LDS is one padded region, `kvo[2 * TILE * (HEAD_DIM + FLASH_LDS_PAD)]`,
 reinterpreted as `ks` and `vs`: 16 rows of 68 `unsigned short` for K plus the same for V, 4352 bytes per
-block at the default `FLASH_LDS_PAD = 4`. Both are kept as raw bf16 _bit patterns_, because both are now
-matrix-core operands. The pad of 4 makes a row 136 bytes = 34 banks, so the 16 lanes of a `ds_read_b64`
+block at the default `FLASH_LDS_PAD = 4`. Both are kept as raw 16-bit _bit patterns_ - bf16 for K,
+fp16 for the int8 V after dequantization - because both are now matrix-core operands. The pad of 4 makes a row 136 bytes = 34 banks, so the 16 lanes of a `ds_read_b64`
 phase cover the 32 banks exactly once with no conflict; the cost is that a row is then only 8-byte
 aligned, so the loader (`put16`) writes two `b64` stores where one `b128` would otherwise do. With
 `nbLoadsKV = TILE * (HEAD_DIM/8) / BLOCK_SIZE = 2` at the default 64-thread block, each thread issues
-two 16-byte K loads and two V loads per tile.
+two 16-byte loads per tile for a bf16 tensor. For an int8 tensor it issues one - key `lane >> 2`, dims
+`16 × (lane & 3)` - plus that key's scale, and dequantizes while staging the tile: `v_perm_b32` against
+`0x64646464` turns two codes into the fp16 pair `1024 + code` exactly, `v_pk_add_f16` subtracts 1152
+(exact) and `v_pk_mul_f16` applies the scale, about 1.5 VALU instructions per element. The obvious
+cheaper variant - stage `1152 + q` and subtract `1152 × sum(P)` after the product - looks exact and is
+not: the matrix core flushes fp16 denormals, so small `P` vanish from the product but not from the
+correction, and with sharp attention the output error reached 290 %.
 
 Double buffering here is register-staged, not LDS-staged, and two tiles deep
 (`GETP_ATTN_PREFETCH2`, default 1): while tile _t_ is computed out of the single LDS buffer, tile
@@ -618,12 +650,13 @@ loop runs two tiles per trip so both sets keep fixed register names, and the per
 both barriers are unchanged. On the time-major layout this bought nothing; on the padded head-major
 one it is 2-4 % (2651 → 2605 µs on the full 20B layer). Register state per lane is 16 floats of output
 accumulator (`acc_o[NCHUNK]`, four head-dim chunks), the two scalars `m_run` and `l_run`, four
-`bf16x4` Q registers, and 32 VGPRs of K/V prefetch - 140 registers, three waves per SIMD, which with
-4352 B of LDS per 64-thread block is what hides the KV read latency.
+`bf16x4` Q registers, and 32 VGPRs of K/V prefetch - 140 registers in the all-bf16 build, three waves
+per SIMD, which with 4352 B of LDS per 64-thread block is what hides the KV read latency.
 
 Finished requests cost almost nothing. `if (!mask_on[b]) return;` retires the whole block after a single
 global read of the per-request active flag, before any Q, K, V or sink traffic. The flag array is
-uploaded each step and cleared when a request emits an end token.
+uploaded each step and cleared when a request emits an end token. The router uses the same flag to send
+a finished request to no expert (see [Routing](#routing)).
 
 Two limits on generality. The kernel is hard-wired to `head_dim = 64` and `kv_mul = 8`, so the shipped
 `gpt-oss-7m` test configuration (head_dim 32, 2 query heads, 1 KV head) would trip the assert. And the
@@ -641,10 +674,17 @@ run **one** launch of each expert GEMM across all experts at the same time.
 ### Routing
 
 Each MoE block starts from the post-attention RMSNorm activation, shape `[B, 2880]`, and scores it
-against the router weight with `getp_matmul_router_bf16`. That is an ordinary
-$\text{C}=\text{A}\times\text{B}^{\top}$ with $\text{N}$ = expert count and $\text{K}$ = 2880, using the
-32 × 32 × 32 tile and `GETP_BN_AGG = 4` described above, with the router bias folded into the epilogue
-of the split-K reduction.
+against the router weight: an ordinary $\text{C}=\text{A}\times\text{B}^{\top}$ with $\text{N}$ = expert
+count and $\text{K}$ = 2880. `getp_matmul_router_fused` (`GETP_ROUTER_FUSED`, default 1) does it in one
+kernel reading the bf16 copy of the activations, `ext_t_bf16`, which the RMSNorm writes for the expert
+exchange anyway: one workgroup per 32-row tile of 16 or 32 experts, one wave for each of the eight
+split-K chunks of 360, the partials summed through LDS from zero in split order and the bias added
+last. That is exactly the arithmetic of the split-K path it replaces - `getp_matmul_router_bf16`, the
+32 × 32 × 32 tile with `GETP_BN_AGG = 4` described above, which rounded the fp32 activations to the
+same bf16 bits in the kernel, wrote eight partials and summed them in a second kernel with the bias in
+its epilogue - so it is bit-exact. Since nothing else reads the fp32 copy, the pre-MoE RMSNorm now
+writes bf16 only. Norm and router together went from 134 to 58 µs per layer on the 20B and from 83 to
+57 µs on the 120B.
 
 Top-k selection is `router_topk_softmax_batch_kernel`: one block per token, scores cached in LDS, and
 K sequential selection passes, each a block-wide argmax followed by poisoning the winner with
@@ -676,6 +716,16 @@ selection and only over the K selected values, matching the reference. On the 12
 downstream knowing; selection itself, ties included, still runs on the expert ids. `GETP_ROUTER_TOPK_MAXK` (4) sizes
 the fixed-length scratch arrays and the shared-memory request; it is a compile-time ceiling on
 `experts_per_token`, and all shipped configurations use exactly 4.
+
+A request that has already finished (its flag in `mask_on` is 0) gets expert id −1 and weight 0 in all
+four slots (`GETP_DEAD_ROWS`, default 1). Every reader of the top-k table already treats an id outside
+its expert range as "not mine", so such a row reaches no expert GEMM, is sent to no peer, and gets 0
+added to its residual. The batch runs until its longest request ends, and attention was already
+skipping the finished ones, but the MoE was not: on the 8-GPU benchmark input 5.9 % of the 20B's
+row-steps and 3 % of the 120B's belong to finished requests. Measured paired: +2.75 % on the 20B,
++1.1 % on the 120B. For a fixed expert placement it is bit-exact (the 20B without `GETP_EPLB` keeps
+its hash); with `GETP_EPLB` on, the placement is planned from pair counts that no longer include the
+finished rows, so the moves change and with them the output (see [PARALLELISM.md](PARALLELISM.md)).
 
 The block is sized `min(1024, max(64, 2^ceil(log2(n_experts))))` under `GETP_SMALL_TOPK` (default on):
 64 threads for 20b's 32 experts and 128 for 120b's 128, against the fixed 1024 of the `#else` arm.
@@ -807,6 +857,36 @@ choices to local experts.
 Expected live occupancy is roughly 6144 pairs for 20b (16 of 32 experts local) and 3072 for 120b (16 of
 128), so most of that is insurance against a routing skew that would otherwise overrun the buckets.
 
+## The small kernels
+
+Everything that is not a GEMM or attention is memory-bound and short, and at 1536 rows these kernels
+added up to about 8 % of the 20B's kernel time. Three of them were running at 0.4-0.8 TB/s for reasons
+that had nothing to do with the bytes; all three rewrites keep every addition in its old order, so they
+are bit-exact.
+
+- **RMSNorm, one wave per row** (`GETP_RMSNORM_WAVE`). `rmsnorm_kernel_out` gave each 2880-wide row a
+  1024-thread block, whose sum of squares went through ten LDS levels behind ten barriers. The wave
+  version keeps the same 1024 partial sums and the same pairwise tree over them: lane _l_ holds partials
+  `4l + 256m + c` as float4 loads, levels 512 and 256 pair registers within the lane, 128 down to 4 are
+  `__shfl_down`, 2 and 1 are in the lane again. The row stays in registers for the output pass, and the
+  weight vector is prefetched when there are at most 1024 rows. One detail matters for bit-exactness:
+  the partials are accumulated with an explicit `__builtin_fmaf(t, t, acc)`, because the unrolled
+  `acc += t * t` lets the backend fuse the first square instead of the new one. A 20B layer's two
+  norms went from 112 to 72 µs in the single-GPU harness.
+- **Gather, scatter-add and vecadd at 16 bytes per thread** (`GETP_SMALL_VEC`). The MoE gather summed a
+  token's expert rows one float per thread, and the 120B's row scatter-add added a pulled bf16 row one
+  element per thread; four consecutive columns per thread (a float4 of fp32, 8 bytes of bf16) do the
+  same additions: gather 128 → 110 µs per layer on the 20B and 162 → 70 µs on the 120B, where most rows
+  are empty.
+- **The 20B's gather in two launches** (`GETP_GP_OWN_LAST`). The peer can only start pulling its
+  17.7 MB slice of the expert output once that slice is written, and it used to wait for the whole
+  gather, own rows included - rows it never reads. Now the gather writes the peer's slice, takes the
+  device-side sync point, and only then adds the rank's own rows into its residual, while the peer's
+  pull is already running.
+
+Together with the fused router GEMM (see [Routing](#routing)) these were +2.4 % end to end on the 20B
+and +6.5 % on the 120B, with both hashes unchanged.
+
 ## Building these kernels
 
 Every figure on this page — tiles, LDS budgets, occupancy, and the throughput numbers quoted in
@@ -855,7 +935,8 @@ outright rather than degrading to a CPU path.
 | Tile macros: `MATMUL_*`, `NUM_CTA_*`, `GETP_BN_AGG` (no `MATMUL_QKV_*` exists)                                                                                                                             | [`src/hip/forward.hip`](../src/hip/forward.hip), defined next to each kernel                               |
 | Attention switches: `FLASH_MFMA16` (and the per-parity `FLASH_MFMA16_EVEN` / `_ODD`), `FLASH_HEADS_PER_WAVE`, `FLASH_LDS_PAD`, `FLASH_P_HILO`; `FLASH_DECODE_TILE_T` now sizes only the retired kernels    | [`src/hip/forward.hip`](../src/hip/forward.hip)                                                            |
 | Load pipeline depth: `GETP_MLP1_AHEAD2`, `GETP_MLP2_AHEAD2` and their `*_LOAD_GAP`, `GETP_ATTN_O_AHEAD2_WIDE` / `_NARROW`, `GETP_QKV_AHEAD2_MAXM`; attention's `GETP_ATTN_PREFETCH2`                    | [`src/hip/forward.hip`](../src/hip/forward.hip)                                                            |
-| KV cache layout: `GETP_KV_HEADMAJOR`, `GETP_KV_PAD`, `GETP_KV_OFF`                                                                                                                                              | [`src/hip/forward.hip`](../src/hip/forward.hip), [`src/getp/transformer.cpp`](../src/getp/transformer.cpp) |
+| KV cache layout and format: `GETP_KV_HEADMAJOR`, `GETP_KV_PAD`, `GETP_KV_OFF`, `GETP_KV8_K`, `GETP_KV8_V`, `getp_kv8_scales`                                                                                    | [`src/hip/forward.hip`](../src/hip/forward.hip), [`src/getp/transformer.cpp`](../src/getp/transformer.cpp) |
+| Router and small kernels: `GETP_ROUTER_FUSED`, `GETP_DEAD_ROWS`, `GETP_RMSNORM_WAVE`, `GETP_SMALL_VEC`, `GETP_GP_OWN_LAST`                                                                                       | [`src/hip/forward.hip`](../src/hip/forward.hip)                                                            |
 | LDS padding, one macro per staging layout: `MATMUL_MLP1_LDS_PAD_SLOTS`, `MATMUL_MLP2_LDS_PAD_SLOTS`, `GETP_QKV_LDS_PAD_SLOTS`, `MATMUL_ATTN_O_LDS_PAD_SLOTS` (cells) and `MATMUL_LOGITS_LDS_KPAD` (halves) | [`src/hip/forward.hip`](../src/hip/forward.hip)                                                            |
 | Batch size, expert parallelism, per-device request slicing                                                                                                                                                 | [`src/getp/run.cpp`](../src/getp/run.cpp)                                                                  |
 | KV cache sizing and per-layer ring capacities                                                                                                                                                              | [`src/getp/transformer.cpp`](../src/getp/transformer.cpp)                                                  |

@@ -2,12 +2,25 @@
 #include "transformer.hpp"
 
 // KV cache layout (see forward.hip, GETP_KV_OFF): this file is included first, so the defaults live
-// here too; the two definitions must match.
+// here too; the definitions must match.
 #ifndef GETP_KV_HEADMAJOR
 #define GETP_KV_HEADMAJOR 1
 #endif
+// GETP_KV8_K / GETP_KV8_V: that half of the KV cache is stored as int8 (see forward.hip).
+#ifndef GETP_KV8_K
+#define GETP_KV8_K 0
+#endif
+#ifndef GETP_KV8_V
+#define GETP_KV8_V 1
+#endif
+// The pad is counted in elements, so an int8 tensor needs twice the element count for the same
+// byte stagger between regions.
 #ifndef GETP_KV_PAD
+#if GETP_KV8_K || GETP_KV8_V
+#define GETP_KV_PAD 768
+#else
 #define GETP_KV_PAD 384
+#endif
 #endif
 
 #include <cassert>

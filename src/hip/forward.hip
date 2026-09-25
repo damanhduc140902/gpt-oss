@@ -95,6 +95,13 @@
 #define GETP_EVAGG 1
 #endif
 
+// At EXPERT_PARALLELISM = 2, moe_gather_pairs writes the peer's slice first, then the device-side
+// sync point, then our own rows into the residual - so the peer's pull overlaps our own rows.
+// Bit-exact. Set 0 for one launch before the sync point.
+#ifndef GETP_GP_OWN_LAST
+#define GETP_GP_OWN_LAST 1
+#endif
+
 // The all-gather sends only the rows each peer actually needs, mirroring GETP_ROWSKIP, which
 // trimmed the reduce-scatter leg alone. The old code sent all BATCH_SIZE rows to every peer,
 // 31,0 MB per layer, while each rank pair uses only 326/768 = 42,4 % of them - nothing reads
@@ -120,6 +127,12 @@
 
 #ifndef GETP_ROWSKIP
 #define GETP_ROWSKIP 1   // on by default; turns itself off when EP <= 2. Set 0 to A/B
+#endif
+
+// The expert-output gather and the row scatter-add move 16 bytes per thread instead of 2-4: the
+// same additions in the same order on every element, so bit-exact. Set 0 for the scalar kernels.
+#ifndef GETP_SMALL_VEC
+#define GETP_SMALL_VEC 1
 #endif
 
 #ifndef GETP_SMALL_TOPK
@@ -231,8 +244,114 @@ __global__ void rmsnorm_kernel_out(float *o, __hip_bfloat16 *ob,
   }
 }
 
+
+// RMSNorm with one wave per row, for size == 2880 (any other size keeps the block kernel).
+// rmsnorm_kernel_out gives each row a 1024-thread block whose sum of squares goes through ten LDS
+// levels, each behind a barrier: 65 / 57 us per call on the 20B, 0.4 TB/s. The wave keeps the same
+// 1024 partials, p[j] = x[j]^2 + x[j+1024]^2 (+ x[j+2048]^2) accumulated in that order, and the same
+// pairwise tree over them, p[j] += p[j+s] for s = 512 ... 1: lane l holds p[4l + 256m + c], levels 512
+// and 256 pair registers of the lane, 128 ... 4 are shuffles, 2 and 1 are in the lane again. So the
+// same bits; the row stays in registers for the output pass.
+#ifndef GETP_RMSNORM_WAVE
+#define GETP_RMSNORM_WAVE 1
+#endif
+// Weights prefetched before the reduction (WPF) below this many rows: with few waves per SIMD the
+// weight load's latency is exposed (120B, 768 rows: 48.3 -> 41.1 us for both norms), with more it
+// only costs registers (20B, 1536 rows: 72.4 -> 74.5 us).
+#ifndef GETP_RMSNORM_WPF_ROWS
+#define GETP_RMSNORM_WPF_ROWS 1024
+#endif
+#if GETP_RMSNORM_WAVE
+// x is not __restrict__: the final norm runs in place (o == x). Each row is read whole before it
+// is written, by one wave, so that is safe.
+template <bool WRITE_F32, bool WRITE_BF16, bool WPF>
+__global__ __launch_bounds__(256) void rmsnorm_wave_kernel(float *o, __hip_bfloat16 *ob,
+                                                          const float *x,
+                                                          const float *__restrict__ weight,
+                                                          int rows, int size) {
+  constexpr int SIZE = 2880, NK = (SIZE + 255) / 256;   // 12 float4 slots per lane, the last partial
+  const int lane = threadIdx.x & 63;
+  const int r = blockIdx.x * 4 + (threadIdx.x >> 6);
+  if (r >= rows) return;
+  const size_t row = (size_t)r * SIZE;
+  const float4 *xr = reinterpret_cast<const float4 *>(x + row);
+  // slot k = m + 4q holds elements 4*lane + 256*k + (0..3), i.e. partial j = 4*lane + 256*m + c, term q
+  float4 v[NK];
+  #pragma unroll
+  for (int k = 0; k < NK; ++k)
+    if (4 * lane + 256 * k < SIZE) v[k] = xr[lane + 64 * k];
+  const float4 *wr = reinterpret_cast<const float4 *>(weight);
+  float4 gw[NK];
+  if constexpr (WPF) {
+    #pragma unroll
+    for (int k = 0; k < NK; ++k)
+      if (4 * lane + 256 * k < SIZE) gw[k] = wr[lane + 64 * k];
+  }
+  float p[4][4];   // p[m][c]
+  #pragma unroll
+  for (int m = 0; m < 4; ++m) {
+    float a0 = 0.f, a1 = 0.f, a2 = 0.f, a3 = 0.f;
+    #pragma unroll
+    for (int q = 0; q < 3; ++q) {
+      const int k = m + 4 * q;
+      if (k < NK && 4 * lane + 256 * k < SIZE) {
+        // Explicit fma, as the block kernel's rolled loop compiles (v_fmac acc, t, t). Written as
+        // acc += t * t and unrolled, the backend fuses the FIRST square instead of the new one.
+        const float4 t = v[k];
+        a0 = __builtin_fmaf(t.x, t.x, a0); a1 = __builtin_fmaf(t.y, t.y, a1);
+        a2 = __builtin_fmaf(t.z, t.z, a2); a3 = __builtin_fmaf(t.w, t.w, a3);
+      }
+    }
+    p[m][0] = a0; p[m][1] = a1; p[m][2] = a2; p[m][3] = a3;
+  }
+  float w[4];
+  #pragma unroll
+  for (int c = 0; c < 4; ++c) {
+    const float l512a = p[0][c] + p[2][c], l512b = p[1][c] + p[3][c];   // level 512
+    w[c] = l512a + l512b;                                               // level 256
+  }
+  #pragma unroll
+  for (int d = 32; d >= 1; d >>= 1)                                     // levels 128 ... 4
+    #pragma unroll
+    for (int c = 0; c < 4; ++c) w[c] += __shfl_down(w[c], d, 64);
+  float ss = (w[0] + w[2]) + (w[1] + w[3]);                             // levels 2, 1
+  ss = __shfl(ss, 0, 64);
+  ss /= size;   // the runtime divisor, as in the block kernel
+  ss += 1e-5f;
+  ss = 1.0f / sqrtf(ss);
+  #pragma unroll
+  for (int k = 0; k < NK; ++k) {
+    if (4 * lane + 256 * k < SIZE) {
+      const float4 t = v[k], g = WPF ? gw[k] : wr[lane + 64 * k];
+      float4 y;
+      y.x = g.x * (ss * t.x); y.y = g.y * (ss * t.y); y.z = g.z * (ss * t.z); y.w = g.w * (ss * t.w);
+      if constexpr (WRITE_F32) reinterpret_cast<float4 *>(o + row)[lane + 64 * k] = y;
+      if constexpr (WRITE_BF16) {
+        uint2 u;
+        u.x = (unsigned)f32_to_bf16bits(y.x) | ((unsigned)f32_to_bf16bits(y.y) << 16);
+        u.y = (unsigned)f32_to_bf16bits(y.z) | ((unsigned)f32_to_bf16bits(y.w) << 16);
+        reinterpret_cast<uint2 *>(reinterpret_cast<unsigned short *>(ob) + row)[lane + 64 * k] = u;
+      }
+    }
+  }
+}
+#define GETP_RMSNORM_LAUNCH(WF, WB, o, ob, x, w, rows, dim, st)                                   \
+  if ((dim) == 2880) {                                                                          \
+    if ((rows) <= GETP_RMSNORM_WPF_ROWS)                                                        \
+      rmsnorm_wave_kernel<WF, WB, true><<<(unsigned)(((rows) + 3) / 4), 256, 0, (st)>>>(         \
+          o, ob, x, w, rows, dim);                                                              \
+    else                                                                                        \
+      rmsnorm_wave_kernel<WF, WB, false><<<(unsigned)(((rows) + 3) / 4), 256, 0, (st)>>>(        \
+          o, ob, x, w, rows, dim);                                                              \
+    return;                                                                                     \
+  }
+#else
+#define GETP_RMSNORM_LAUNCH(WF, WB, o, ob, x, w, rows, dim, st)
+#endif
+
 void getp_rmsnorm(float *o, float *x, float *weight, int batch_size, int dim,
                   hipStream_t stream) {
+  GETP_RMSNORM_LAUNCH(true, false, o, nullptr, x, weight, batch_size, dim, stream)
   dim3 blockDim(1024);
   dim3 gridDim(1, batch_size);
   rmsnorm_kernel_out<true, false>
@@ -243,6 +362,7 @@ void getp_rmsnorm(float *o, float *x, float *weight, int batch_size, int dim,
 // bf16 only: for the case where nothing reads the fp32 form any more (the pre-qkv path).
 void getp_rmsnorm_bf16(__hip_bfloat16 *ob, float *x, float *weight,
                        int batch_size, int dim, hipStream_t stream) {
+  GETP_RMSNORM_LAUNCH(false, true, nullptr, ob, x, weight, batch_size, dim, stream)
   dim3 blockDim(1024);
   dim3 gridDim(1, batch_size);
   rmsnorm_kernel_out<false, true>
@@ -254,6 +374,7 @@ void getp_rmsnorm_bf16(__hip_bfloat16 *ob, float *x, float *weight,
 void getp_rmsnorm_f32_bf16(float *o, __hip_bfloat16 *ob, float *x,
                            float *weight, int batch_size, int dim,
                            hipStream_t stream) {
+  GETP_RMSNORM_LAUNCH(true, true, o, ob, x, weight, batch_size, dim, stream)
   dim3 blockDim(1024);
   dim3 gridDim(1, batch_size);
   rmsnorm_kernel_out<true, true>
@@ -275,12 +396,25 @@ void getp_rmsnorm_f32_bf16(float *o, __hip_bfloat16 *ob, float *x,
 // element offset of (ring slot t, batch row b, column col = kv_head * 64 + d) inside one layer, for B
 // batch rows, KVD = kv_dim columns and a ring of CAP slots; it is additive in t and (b, col), so a
 // slot pointer (t, 0, 0) plus the offset (0, b, col) addresses the element. head_dim is 64.
-// transformer.cpp (included before this file) sizes the cache with the same two macros.
+// transformer.cpp (included before this file) sizes the cache with the same macros.
 #ifndef GETP_KV_HEADMAJOR
 #define GETP_KV_HEADMAJOR 1
 #endif
+// GETP_KV8_K / GETP_KV8_V: that half of the KV cache is stored as int8 (see the note below).
+#ifndef GETP_KV8_K
+#define GETP_KV8_K 0
+#endif
+#ifndef GETP_KV8_V
+#define GETP_KV8_V 1
+#endif
+// The pad is counted in elements, so an int8 tensor needs twice the element count for the same
+// byte stagger between regions.
 #ifndef GETP_KV_PAD
+#if GETP_KV8_K || GETP_KV8_V
+#define GETP_KV_PAD 768
+#else
 #define GETP_KV_PAD 384
+#endif
 #endif
 #if GETP_KV_HEADMAJOR
 #define GETP_KV_OFF(t, b, col, B, KVD, CAP)                                                    \
@@ -293,6 +427,48 @@ void getp_rmsnorm_f32_bf16(float *o, __hip_bfloat16 *ob, float *x,
   ((size_t)(t) * (size_t)(B) * (size_t)(KVD) + (size_t)(b) * (size_t)(KVD) + (size_t)(col))
 #define GETP_KV_LAYER_PAD(B, KVD) ((size_t)0)
 #endif
+
+// int8 KV cache (GETP_KV8_K, GETP_KV8_V; only V by default). NOT bit-exact; 0 keeps bf16.
+// Decode attention reads the whole cache every step and is bound by those bytes: a 64-dim head
+// vector costs 128 bytes in bf16, 68 as int8 codes plus one fp32 scale per (position, sequence,
+// kv_head) vector.
+// Layout, no new allocation: code e sits at byte e of the bf16-sized allocation (the same
+// GETP_KV_OFF offsets, counted in bytes) and the scale of the vector starting at element e is float
+// e/64 of the allocation's upper half (getp_kv8_scales), so a 16-key tile has 16 consecutive scales.
+// Writer: the qkv epilogue. A row's 64 dims sit on the 16 lanes of a lane group x 4 values, so amax
+// takes four xor-shuffles; the code is round(x * 127 / amax) + 128.
+// Reader: one 16-byte load per lane per tile, dequantized while the LDS tile is staged: v_perm_b32
+// against 0x64646464 makes the fp16 value 1024 + code exactly, v_pk_add_f16 subtracts 1152 (exact)
+// and v_pk_mul_f16 applies the scale (one fp16 rounding). That tensor's MFMA then runs in fp16 on
+// real values; for V the other operand is P = e * 2^15 in fp16 (normal down to e ~ 2e-9), undone in
+// the final normalisation. Keeping the 1152 offset inside the MFMA and subtracting 1152 * sum(P)
+// afterwards looks exact but is not: the MFMA flushes fp16 denormals, so small P vanish from the
+// product but not from the correction (output error 290 % once the scores are peaky).
+// Why only V: gpt-oss keys carry a large component shared across positions and very unequal
+// channels (the largest dim's rms up to 23x the median), so per-vector int8 costs K far more than V.
+// 20B METEOR, bf16 0.534: V int8 0.519, K and V int8 0.342.
+#define GETP_KV8_ANY (GETP_KV8_K || GETP_KV8_V)
+#if GETP_KV8_ANY && (!GETP_KV_HEADMAJOR)
+#error "GETP_KV8_* needs GETP_KV_HEADMAJOR (one scale per contiguous 64-element vector)"
+#endif
+// Element `off` of a cache allocation: a byte offset for an int8 tensor, an element one for bf16.
+#define GETP_KV_PTR8(cache, off) \
+  reinterpret_cast<__hip_bfloat16 *>(reinterpret_cast<signed char *>(cache) + (size_t)(off))
+#define GETP_KV_PTR16(cache, off) (reinterpret_cast<__hip_bfloat16 *>(cache) + (size_t)(off))
+#if GETP_KV8_K
+#define GETP_KV_PTR_K GETP_KV_PTR8
+#else
+#define GETP_KV_PTR_K GETP_KV_PTR16
+#endif
+#if GETP_KV8_V
+#define GETP_KV_PTR_V GETP_KV_PTR8
+#else
+#define GETP_KV_PTR_V GETP_KV_PTR16
+#endif
+// The scale of the vector whose first element is at offset `off` (a multiple of 64).
+#define GETP_KV_SIDX(off) ((size_t)(off) >> 6)
+// The stored code of q in [-127, 127]: q + 128 (the reader stages it as fp16 1024 + code).
+#define GETP_KV8_CODE(q) ((signed char)((q) + 128))
 
 __global__ void kv_store_pair_fp32_to_bf16_kernel(
     const float *__restrict__ k, const float *__restrict__ v,
@@ -628,6 +804,16 @@ moe_scatter_acts_to_expert_frombf16_kernel<<<grid, block, 0, stream>>>(
 #define MATMUL_MLP2_MAX_SPLITS 1
 #endif
 
+
+// The router GEMM as one kernel over the bf16 copy of its input; see getp_matmul_router_fused.
+// Bit-exact. Set 0 for the split-K kernels on the fp32 input.
+#ifndef GETP_ROUTER_FUSED
+#define GETP_ROUTER_FUSED 1
+#endif
+// The fused router's loads run this many 16-k steps ahead of its MFMAs.
+#ifndef GETP_ROUTER_G
+#define GETP_ROUTER_G 8
+#endif
 
 #ifndef MATMUL_ROUTER_BLOCK_ROWS
 #define MATMUL_ROUTER_BLOCK_ROWS 32
@@ -2204,10 +2390,36 @@ __global__ __launch_bounds__(256) void getp_rowskip_scatter_add_bf16_kernel(
   if (c >= H) return;
   x[(size_t)idx[blockIdx.y] * H + c] += __bfloat162float(src[(size_t)blockIdx.y * H + c]);
 }
+#if GETP_SMALL_VEC
+// Eight elements per thread (H % 8 == 0; the launcher checks): the same fp32 addition per element.
+__global__ __launch_bounds__(128) void getp_rowskip_scatter_add_bf16_v8_kernel(
+    float *__restrict__ x, const __hip_bfloat16 *__restrict__ src,
+    const int *__restrict__ idx, const int *__restrict__ cnt, int H) {
+  if ((int)blockIdx.y >= *cnt) return;
+  const int c8 = blockIdx.x * blockDim.x + threadIdx.x;
+  if (c8 >= (H >> 3)) return;
+  const uint4 v = reinterpret_cast<const uint4 *>(src + (size_t)blockIdx.y * H)[c8];
+  float4 *xr = reinterpret_cast<float4 *>(x + (size_t)idx[blockIdx.y] * H) + 2 * c8;
+  float4 a = xr[0], b = xr[1];
+  a.x += bf16bits_to_f32((unsigned short)v.x); a.y += bf16bits_to_f32((unsigned short)(v.x >> 16));
+  a.z += bf16bits_to_f32((unsigned short)v.y); a.w += bf16bits_to_f32((unsigned short)(v.y >> 16));
+  b.x += bf16bits_to_f32((unsigned short)v.z); b.y += bf16bits_to_f32((unsigned short)(v.z >> 16));
+  b.z += bf16bits_to_f32((unsigned short)v.w); b.w += bf16bits_to_f32((unsigned short)(v.w >> 16));
+  xr[0] = a;
+  xr[1] = b;
+}
+#endif
 static inline void getp_rowskip_scatter_add_bf16(float *x, const __hip_bfloat16 *src,
                                                  const int *idx, const int *cnt, int H, int nrow,
                                                  hipStream_t st) {
   if (nrow <= 0) return;
+#if GETP_SMALL_VEC
+  if (H % 8 == 0) {
+    dim3 blk8(128), grd8((unsigned)((H / 8 + 127) / 128), (unsigned)nrow);
+    getp_rowskip_scatter_add_bf16_v8_kernel<<<grd8, blk8, 0, st>>>(x, src, idx, cnt, H);
+    return;
+  }
+#endif
   dim3 blk(256), grd((unsigned)((H + 255) / 256), (unsigned)nrow);
   getp_rowskip_scatter_add_bf16_kernel<<<grd, blk, 0, st>>>(x, src, idx, cnt, H);
 }
@@ -2221,9 +2433,30 @@ __global__ __launch_bounds__(256) void getp_rowskip_scatter_add_kernel(
   if (c >= H) return;
   x[(size_t)idx[blockIdx.y] * H + c] += src[(size_t)blockIdx.y * H + c];
 }
+#if GETP_SMALL_VEC
+__global__ __launch_bounds__(256) void getp_rowskip_scatter_add_v4_kernel(
+    float *__restrict__ x, const float *__restrict__ src,
+    const int *__restrict__ idx, const int *__restrict__ cnt, int H) {
+  if ((int)blockIdx.y >= *cnt) return;
+  const int c4 = blockIdx.x * blockDim.x + threadIdx.x;
+  if (c4 >= (H >> 2)) return;
+  const float4 v = reinterpret_cast<const float4 *>(src + (size_t)blockIdx.y * H)[c4];
+  float4 *xr = reinterpret_cast<float4 *>(x + (size_t)idx[blockIdx.y] * H) + c4;
+  float4 a = *xr;
+  a.x += v.x; a.y += v.y; a.z += v.z; a.w += v.w;
+  *xr = a;
+}
+#endif
 static inline void getp_rowskip_scatter_add(float *x, const float *src, const int *idx,
                                             const int *cnt, int H, int nrow, hipStream_t st) {
   if (nrow <= 0) return;
+#if GETP_SMALL_VEC
+  if (H % 4 == 0) {
+    dim3 blk4(256), grd4((unsigned)((H / 4 + 255) / 256), (unsigned)nrow);
+    getp_rowskip_scatter_add_v4_kernel<<<grd4, blk4, 0, st>>>(x, src, idx, cnt, H);
+    return;
+  }
+#endif
   dim3 blk(256), grd((unsigned)((H + 255) / 256), (unsigned)nrow);
   getp_rowskip_scatter_add_kernel<<<grd, blk, 0, st>>>(x, src, idx, cnt, H);
 }
@@ -2285,6 +2518,147 @@ __global__ void moe_gather_pairs_kernel(float *__restrict__ e_agg,
   }
 }
 
+
+#if GETP_SMALL_VEC
+// moe_gather_pairs_kernel with four consecutive columns per thread (H % 4 == 0; the launcher checks):
+// the same K additions in the same order on each element, so bit-exact.
+__global__ __launch_bounds__(256) void moe_gather_pairs_v4_kernel(float *__restrict__ e_agg,
+                                        float *__restrict__ x_resid,
+                                        int own_lo, int own_hi,
+                                        const float *__restrict__ z_partial,
+                                        const int *__restrict__ pair_pos, int H,
+                                        int K, int B,
+                                        const int *__restrict__ rowskip_rank,
+                                        int b_base, int store_bf16) {
+  const int c4 = blockIdx.x * blockDim.x + threadIdx.x;   // float4 index within the row
+  const int b = blockIdx.y + b_base;
+  const int H4 = H >> 2;
+  if (c4 >= H4 || b >= B) return;
+  const int base = b * K;
+  float4 s = make_float4(0.f, 0.f, 0.f, 0.f);
+  for (int k = 0; k < K; ++k) {
+    const int pos = pair_pos[base + k];
+    if (pos >= 0) {
+      const float4 z = reinterpret_cast<const float4 *>(z_partial + (size_t)pos * (size_t)H)[c4];
+      s.x += z.x; s.y += z.y; s.z += z.z; s.w += z.w;
+    }
+  }
+  if (b >= own_lo && b < own_hi) {
+    float4 *xr = reinterpret_cast<float4 *>(x_resid + (size_t)(b - own_lo) * (size_t)H) + c4;
+    float4 x = *xr;
+    x.x += s.x; x.y += s.y; x.z += s.z; x.w += s.w;
+    *xr = x;
+    return;
+  }
+  size_t row_off = (size_t)b * (size_t)H;
+#if GETP_ROWSKIP
+  if (rowskip_rank != nullptr) {
+    const int r = rowskip_rank[b];
+    if (r < 0) return;
+    const int Bslice = own_hi - own_lo;
+    const int slice = b / Bslice;
+    row_off = ((size_t)slice * Bslice + (size_t)r) * (size_t)H;
+  }
+#endif
+  (void)rowskip_rank;
+#if GETP_EAGG_BF16
+  if (store_bf16) {
+    uint2 p;
+    p.x = (unsigned)f32_to_bf16bits(s.x) | ((unsigned)f32_to_bf16bits(s.y) << 16);
+    p.y = (unsigned)f32_to_bf16bits(s.z) | ((unsigned)f32_to_bf16bits(s.w) << 16);
+    reinterpret_cast<uint2 *>(reinterpret_cast<unsigned short *>(e_agg) + row_off)[c4] = p;
+    return;
+  }
+#endif
+  (void)store_bf16;
+  reinterpret_cast<float4 *>(e_agg + row_off)[c4] = s;
+}
+#endif
+#if GETP_SMALL_VEC >= 2
+// One wave per token row, lane l owning float4 columns l, l+64, ...: a row that is neither ours nor
+// sent (rowskip rank < 0; 58 % of the 120B's rows) costs its wave one int load, and every lane keeps
+// H4/64 loads in flight per expert row. Same additions, same order: bit-exact.
+template <int H4>
+__global__ __launch_bounds__(256) void moe_gather_pairs_w_kernel(float *__restrict__ e_agg,
+                                        float *__restrict__ x_resid,
+                                        int own_lo, int own_hi,
+                                        const float *__restrict__ z_partial,
+                                        const int *__restrict__ pair_pos,
+                                        int K, int n,
+                                        const int *__restrict__ rowskip_rank,
+                                        int b_base, int store_bf16) {
+  constexpr int H = 4 * H4, NI = (H4 + 63) / 64;
+  const int lane = threadIdx.x & 63;
+  const int bi = blockIdx.x * 4 + (threadIdx.x >> 6);
+  if (bi >= n) return;
+  const int b = bi + b_base;
+  const bool own = b >= own_lo && b < own_hi;
+  size_t row_off = (size_t)b * H;
+#if GETP_ROWSKIP
+  if (!own && rowskip_rank != nullptr) {
+    const int r = rowskip_rank[b];
+    if (r < 0) return;
+    const int Bslice = own_hi - own_lo;
+    row_off = ((size_t)(b / Bslice) * Bslice + (size_t)r) * H;
+  }
+#endif
+  (void)rowskip_rank;
+  float4 s[NI];
+  #pragma unroll
+  for (int i = 0; i < NI; ++i) s[i] = make_float4(0.f, 0.f, 0.f, 0.f);
+  for (int k = 0; k < K; ++k) {
+    const int pos = pair_pos[b * K + k];
+    if (pos >= 0) {
+      const float4 *zr = reinterpret_cast<const float4 *>(z_partial + (size_t)pos * H);
+      #pragma unroll
+      for (int i = 0; i < NI; ++i) {
+        const int c4 = lane + 64 * i;
+        if (c4 < H4) {
+          const float4 z = zr[c4];
+          s[i].x += z.x; s[i].y += z.y; s[i].z += z.z; s[i].w += z.w;
+        }
+      }
+    }
+  }
+  if (own) {
+    float4 *xr = reinterpret_cast<float4 *>(x_resid + (size_t)(b - own_lo) * H);
+    #pragma unroll
+    for (int i = 0; i < NI; ++i) {
+      const int c4 = lane + 64 * i;
+      if (c4 < H4) {
+        float4 x = xr[c4];
+        x.x += s[i].x; x.y += s[i].y; x.z += s[i].z; x.w += s[i].w;
+        xr[c4] = x;
+      }
+    }
+    return;
+  }
+#if GETP_EAGG_BF16
+  if (store_bf16) {
+    uint2 *er = reinterpret_cast<uint2 *>(reinterpret_cast<unsigned short *>(e_agg) + row_off);
+    #pragma unroll
+    for (int i = 0; i < NI; ++i) {
+      const int c4 = lane + 64 * i;
+      if (c4 < H4) {
+        uint2 p;
+        p.x = (unsigned)f32_to_bf16bits(s[i].x) | ((unsigned)f32_to_bf16bits(s[i].y) << 16);
+        p.y = (unsigned)f32_to_bf16bits(s[i].z) | ((unsigned)f32_to_bf16bits(s[i].w) << 16);
+        er[c4] = p;
+      }
+    }
+    return;
+  }
+#endif
+  (void)store_bf16;
+  float4 *er = reinterpret_cast<float4 *>(e_agg + row_off);
+  #pragma unroll
+  for (int i = 0; i < NI; ++i) {
+    const int c4 = lane + 64 * i;
+    if (c4 < H4) er[c4] = s[i];
+  }
+}
+#endif
+
 static inline void moe_gather_pairs(float *e_agg, const float *z_partial,
                                     const int *pair_pos, int H, int K, int B,
                                     hipStream_t stream) {
@@ -2307,6 +2681,23 @@ static inline void moe_gather_pairs_acc(float *e_agg, float *x_resid,
                                         int store_bf16 = 0) {
   const int n = (b_count < 0) ? B : b_count;
   if (n <= 0) return;
+#if GETP_SMALL_VEC >= 2
+  if (H == 2880) {
+    moe_gather_pairs_w_kernel<720><<<(unsigned)((n + 3) / 4), 256, 0, stream>>>(
+        e_agg, x_resid, own_lo, own_hi, z_partial, pair_pos, K, n, rowskip_rank, b_base,
+        store_bf16);
+    return;
+  }
+#endif
+#if GETP_SMALL_VEC
+  if (H % 4 == 0) {
+    dim3 blk4(256), grd4((H / 4 + blk4.x - 1) / blk4.x, (unsigned)n);
+    moe_gather_pairs_v4_kernel<<<grd4, blk4, 0, stream>>>(e_agg, x_resid, own_lo, own_hi,
+                                                          z_partial, pair_pos, H, K, B,
+                                                          rowskip_rank, b_base, store_bf16);
+    return;
+  }
+#endif
   dim3 blk(256), grd((H + blk.x - 1) / blk.x, (unsigned)n);
   moe_gather_pairs_kernel<<<grd, blk, 0, stream>>>(e_agg, x_resid,
                                                    own_lo, own_hi,
@@ -2449,6 +2840,9 @@ new_matmul_qkv_fused_kernel(
   , __hip_bfloat16 *__restrict__ k_slot_bf16
   , __hip_bfloat16 *__restrict__ v_slot_bf16
   , int kv_cap
+  // GETP_KV8_K / _V: the scales of this slot (scale index GETP_KV_SIDX of the element offset).
+  , float *__restrict__ k_slot_scale
+  , float *__restrict__ v_slot_scale
   // 1/sqrt(head_dim); only read under GETP_Q_BF16. See qbf16.
   , float q_scale
 #endif
@@ -2754,6 +3148,59 @@ new_matmul_qkv_fused_kernel(
       sn[p] = rope_sin[d];
     }
     const bool in_q = (waveN0 < q_len);        // uniform across the wave
+#if GETP_KV8_K
+    if (!in_q) {
+      // K: rotate as below, then int8 per (row, head). The row's 64 dims sit on the 16 lanes of
+      // this lane group (CDj) x the lane's 2 pairs, so amax is the lane's 4 values then 4 shuffles.
+      signed char *dst8 = reinterpret_cast<signed char *>(k_slot_bf16);
+      const int head0 = waveN0 - q_len;          // the head's first K column
+      #pragma unroll
+      for (int iterWaveM = 0; iterWaveM < nIterWaveM; ++iterWaveM) {
+        #pragma unroll
+        for (int i = 0; i < GPRs_CD; ++i) {
+          const int CDi = 4 * (laneIdx / 16) + (i % 4);
+          const int global_y =
+              blockIdx.y * BM + WM * yInBlockTile + iterWaveM * MFMA_M + CDi;
+          float o[nPairN][2];
+          float amax = 0.f;
+          #pragma unroll
+          for (int p = 0; p < nPairN; ++p) {
+            const int gx1 = waveN0 + p * MFMA_N + CDj;
+            const int gx2 = gx1 + half;
+            float x1 = acc_local[iterWaveM * nIterWaveN + p][i];
+            float x2 = acc_local[iterWaveM * nIterWaveN + p + nPairN][i];
+            if (b) {
+              x1 += __bfloat162float(b[gx1]);
+              x2 += __bfloat162float(b[gx2]);
+            }
+            const float c = cs[p];
+            const float sgn = sn[p];
+            o[p][0] = x1 * c - x2 * sgn;
+            o[p][1] = x2 * c + x1 * sgn;
+            amax = fmaxf(amax, fmaxf(fabsf(o[p][0]), fabsf(o[p][1])));
+          }
+          amax = fmaxf(amax, __shfl_xor(amax, 1));
+          amax = fmaxf(amax, __shfl_xor(amax, 2));
+          amax = fmaxf(amax, __shfl_xor(amax, 4));
+          amax = fmaxf(amax, __shfl_xor(amax, 8));
+          if (global_y < M) {
+            const float inv = amax > 0.f ? 127.f / amax : 0.f;
+            #pragma unroll
+            for (int p = 0; p < nPairN; ++p) {
+              const int d1 = head0 + p * MFMA_N + CDj;
+              dst8[GETP_KV_OFF(0, global_y, d1, M, k_len, kv_cap)] =
+                  GETP_KV8_CODE(__float2int_rn(o[p][0] * inv));
+              dst8[GETP_KV_OFF(0, global_y, d1 + half, M, k_len, kv_cap)] =
+                  GETP_KV8_CODE(__float2int_rn(o[p][1] * inv));
+            }
+            if (CDj == 0)
+              k_slot_scale[GETP_KV_SIDX(GETP_KV_OFF(0, global_y, head0, M, k_len, kv_cap))] =
+                  amax * (1.f / 127.f);
+          }
+        }
+      }
+    } else
+#endif
     #pragma unroll
     for (int iterWaveM = 0; iterWaveM < nIterWaveM; ++iterWaveM) {
       #pragma unroll
@@ -2817,6 +3264,44 @@ new_matmul_qkv_fused_kernel(
   else if (rope_cos != nullptr && waveN0 < N) {
     // The v region: no rotation, but since kv_store_pair is gone this has to convert to bf16
     // itself and write the cache slot directly. v_len == kv_dim, so the row stride is identical.
+#if GETP_KV8_V
+    // int8 per (row, head): the row's 64 dims are this lane group's 16 lanes x 4 N tiles.
+    signed char *dst8 = reinterpret_cast<signed char *>(v_slot_bf16);
+    const int head0 = waveN0 - q_len - k_len;
+    #pragma unroll
+    for (int iterWaveM = 0; iterWaveM < nIterWaveM; ++iterWaveM) {
+      #pragma unroll
+      for (int i = 0; i < GPRs_CD; ++i) {
+        const int CDi = 4 * (laneIdx / 16) + (i % 4);
+        const int CDj = (laneIdx % 16);
+        const int global_y =
+            blockIdx.y * BM + WM * yInBlockTile + iterWaveM * MFMA_M + CDi;
+        float o[nIterWaveN];
+        float amax = 0.f;
+        #pragma unroll
+        for (int iterWaveN = 0; iterWaveN < nIterWaveN; ++iterWaveN) {
+          float r = acc_local[iterWaveM * nIterWaveN + iterWaveN][i];
+          if (b) r += __bfloat162float(b[waveN0 + iterWaveN * MFMA_N + CDj]);
+          o[iterWaveN] = r;
+          amax = fmaxf(amax, fabsf(r));
+        }
+        amax = fmaxf(amax, __shfl_xor(amax, 1));
+        amax = fmaxf(amax, __shfl_xor(amax, 2));
+        amax = fmaxf(amax, __shfl_xor(amax, 4));
+        amax = fmaxf(amax, __shfl_xor(amax, 8));
+        if (global_y < M) {
+          const float inv = amax > 0.f ? 127.f / amax : 0.f;
+          #pragma unroll
+          for (int iterWaveN = 0; iterWaveN < nIterWaveN; ++iterWaveN)
+            dst8[GETP_KV_OFF(0, global_y, head0 + iterWaveN * MFMA_N + CDj, M, v_len, kv_cap)] =
+                GETP_KV8_CODE(__float2int_rn(o[iterWaveN] * inv));
+          if (CDj == 0)
+            v_slot_scale[GETP_KV_SIDX(GETP_KV_OFF(0, global_y, head0, M, v_len, kv_cap))] =
+                amax * (1.f / 127.f);
+        }
+      }
+    }
+#else
     #pragma unroll
     for (int iterWaveM = 0; iterWaveM < nIterWaveM; ++iterWaveM) {
       #pragma unroll
@@ -2839,6 +3324,7 @@ new_matmul_qkv_fused_kernel(
         }
       }
     }
+#endif
   }
 #endif
   else
@@ -2882,6 +3368,8 @@ new_matmul_qkv_fused_kernel(
   (void)k_slot_bf16;
   (void)v_slot_bf16;
   (void)kv_cap;
+  (void)k_slot_scale;
+  (void)v_slot_scale;
 #endif
 }
 
@@ -2896,7 +3384,9 @@ static inline void getp_matmul_qkv_fused_bf16(
     // No default value: if any call site has not been updated, that must be a COMPILE ERROR
     // rather than a silent fall-through to the old path.
     , const float *rope_cos, const float *rope_sin,
-    __hip_bfloat16 *k_slot, __hip_bfloat16 *v_slot, int kv_cap
+    __hip_bfloat16 *k_slot, __hip_bfloat16 *v_slot, int kv_cap,
+    // GETP_KV8_K / _V: the slot's scales (nullptr for a bf16 tensor)
+    float *k_slot_scale, float *v_slot_scale
 #endif
     ) {
 #if GETP_KV_HEADMAJOR && !GETP_ROPE_FUSED_KV
@@ -2952,7 +3442,8 @@ static inline void getp_matmul_qkv_fused_bf16(
 #if GETP_ROPE_FUSED_KV
   // One more condition specific to the _KV step: kv_store_pair_fp32_to_bf16 is also gone, so
   // the KV slot may only be written if these two pointers really exist.
-  if (k_slot == nullptr || v_slot == nullptr) {
+  if (k_slot == nullptr || v_slot == nullptr || (GETP_KV8_K && k_slot_scale == nullptr) ||
+      (GETP_KV8_V && v_slot_scale == nullptr)) {
     std::cerr << "GETP_ROPE_FUSED_KV: missing KV slot pointer" << std::endl;
     std::abort();
   }
@@ -2961,12 +3452,12 @@ static inline void getp_matmul_qkv_fused_bf16(
     new_matmul_qkv_fused_kernel<true><<<grid, block, 0, stream>>>(
       q, k, v, x_bf16, w_qkv_bf16, b_qkv_bf16, n, q_len, k_len, v_len,
       batch_size, rope_ok ? rope_cos : nullptr, rope_sin, head_dim,
-      k_slot, v_slot, kv_cap, 1.0f / sqrtf((float)head_dim));
+      k_slot, v_slot, kv_cap, k_slot_scale, v_slot_scale, 1.0f / sqrtf((float)head_dim));
   else
     new_matmul_qkv_fused_kernel<false><<<grid, block, 0, stream>>>(
       q, k, v, x_bf16, w_qkv_bf16, b_qkv_bf16, n, q_len, k_len, v_len,
       batch_size, rope_ok ? rope_cos : nullptr, rope_sin, head_dim,
-      k_slot, v_slot, kv_cap, 1.0f / sqrtf((float)head_dim));
+      k_slot, v_slot, kv_cap, k_slot_scale, v_slot_scale, 1.0f / sqrtf((float)head_dim));
 #else
   if (ahead2)
     new_matmul_qkv_fused_kernel<true><<<grid, block, 0, stream>>>(
@@ -3566,7 +4057,8 @@ void getp_apply_rotary_emb(float *x, float *cos, float *sin, int n_heads,
 __global__ void router_topk_softmax_batch_kernel(
     const float *__restrict__ router_score, int n_experts,
     int experts_per_token, float *__restrict__ topk_v_out,
-    int *__restrict__ topk_i_out, const int *__restrict__ relabel) {
+    int *__restrict__ topk_i_out, const int *__restrict__ relabel,
+    const int *__restrict__ mask_on) {
   const int b = blockIdx.x;
   const int tid = threadIdx.x;
   const int K = experts_per_token;
@@ -3575,6 +4067,12 @@ __global__ void router_topk_softmax_batch_kernel(
   router_score += (size_t)b * n_experts;
   topk_v_out += (size_t)b * K;
   topk_i_out += (size_t)b * K;
+  // A finished sequence goes to no expert: id -1, weight 0. Every reader of the top-k table skips
+  // ids outside its expert range, so the row costs the MoE nothing. b is uniform over the block.
+  if (mask_on != nullptr && !mask_on[b]) {
+    for (int i = tid; i < K; i += blockDim.x) { topk_v_out[i] = 0.f; topk_i_out[i] = -1; }
+    return;
+  }
 
   extern __shared__ unsigned char smem_raw[];
   float *scores = reinterpret_cast<float *>(smem_raw);
@@ -3645,7 +4143,7 @@ __global__ void router_topk_softmax_batch_kernel(
 static inline void getp_router_topk_softmax_batch(
     const float *router_score, int n_experts, int experts_per_token,
     float *topk_v_out, int *topk_i_out, int batch_size, hipStream_t stream,
-    const int *relabel = nullptr) {
+    const int *relabel = nullptr, const int *mask_on = nullptr) {
 
 #if GETP_SMALL_TOPK
   // n_experts = 32 (20b) / 128 (120b), yet the block was still 1024 threads = 16 waves.
@@ -3691,7 +4189,7 @@ static inline void getp_router_topk_softmax_batch(
                        (size_t)BLK * (sizeof(float) + sizeof(int)) +
                        GETP_ROUTER_TOPK_MAXK * (sizeof(float) + sizeof(int));
   router_topk_softmax_batch_kernel<<<grid, block, shmem, stream>>>(
-      router_score, n_experts, experts_per_token, topk_v_out, topk_i_out, relabel);
+      router_score, n_experts, experts_per_token, topk_v_out, topk_i_out, relabel, mask_on);
 
 }
 
@@ -3742,8 +4240,28 @@ __global__ void vecadd_kernel(float *x, float *y, int size) {
   if (i >= size) return;
   x[i] += y[i];
 }
+#if GETP_SMALL_VEC
+// x[i] += y[i] over batch_size contiguous rows, four elements per thread.
+__global__ __launch_bounds__(256) void vecadd_v4_kernel(float4 *__restrict__ x,
+                                                        const float4 *__restrict__ y, size_t n4) {
+  const size_t i = (size_t)blockIdx.x * blockDim.x + threadIdx.x;
+  if (i >= n4) return;
+  float4 a = x[i];
+  const float4 b = y[i];
+  a.x += b.x; a.y += b.y; a.z += b.z; a.w += b.w;
+  x[i] = a;
+}
+#endif
 void getp_vecadd(float *x, float *y, int size, int batch_size,
                  hipStream_t stream) {
+#if GETP_SMALL_VEC
+  if (size % 4 == 0) {
+    const size_t n4 = (size_t)size / 4 * (size_t)batch_size;
+    vecadd_v4_kernel<<<(unsigned)((n4 + 255) / 256), 256, 0, stream>>>(
+        reinterpret_cast<float4 *>(x), reinterpret_cast<const float4 *>(y), n4);
+    return;
+  }
+#endif
 
   dim3 blockDim(1024);
   dim3 gridDim((size + blockDim.x - 1) / blockDim.x, batch_size);
@@ -3803,6 +4321,8 @@ flash_attn_decode_mfma16_kernel(
   const __hip_bfloat16 *__restrict__ key_cache,
   const __hip_bfloat16 *__restrict__ value_cache, const float *__restrict__ q,
   const int *__restrict__ mask_on,
+  // GETP_KV8_K / _V: the layer's scales, one per 64-element vector (GETP_KV_SIDX)
+  const float *__restrict__ k_scale, const float *__restrict__ v_scale,
   const float *__restrict__ attn_sinks, int head_dim, int n_attn_heads,
   int n_kv_heads, int pos, int batch_size, int kv_dim, int kv_mul,
   int sliding_window, int cache_tcap, float inv_sqrt_d
@@ -3894,6 +4414,23 @@ flash_attn_decode_mfma16_kernel(
 
   constexpr int nbLoadsKV = TILE * (HEAD_DIM / 8) / BLOCK_SIZE;
   constexpr int strideKV  = BLOCK_SIZE / (HEAD_DIM / 8);
+  constexpr int nbLoadsKVc = nbLoadsKV, strideKVc = strideKV;
+#if GETP_KV8_K
+  // Q^T in fp16 for the fp16 S MFMA
+  using f16x4 = _Float16 __attribute__((ext_vector_type(4)));
+  f16x4 qH[NCHUNK];
+  #pragma unroll
+  for (int c = 0; c < NCHUNK; ++c) {
+    #pragma unroll
+    for (int kk = 0; kk < 4; ++kk)
+      qH[c][kk] = (_Float16)__bfloat162float(bf16bits_to_bf16(qB[c][kk]));
+  }
+#endif
+#if GETP_KV8_V
+  using f16x4v = _Float16 __attribute__((ext_vector_type(4)));
+  // P goes into the fp16 PV MFMA as e * 2^15: fp16-normal down to e ~ 2e-9; undone at the end.
+  constexpr float PSCALE = 32768.f;
+#endif
   const int ly = threadIdx.x / (HEAD_DIM / 8);
   const int lx = threadIdx.x % (HEAD_DIM / 8);
 
@@ -3903,20 +4440,97 @@ flash_attn_decode_mfma16_kernel(
     *reinterpret_cast<uint2 *>(dst)     = make_uint2(v.x, v.y);
     *reinterpret_cast<uint2 *>(dst + 4) = make_uint2(v.z, v.w);
   };
-
-  for (int i = 0; i < nbLoadsKV; ++i) {
-    const int offset  = i * strideKV;
-    const int index_y = t_start + ly + offset;
-    if (index_y < t_end) {
-      const size_t off = GETP_KV_OFF(index_y % cache_tcap, b, kv_h * head_dim + 8 * lx,
-                                     batch_size, kv_dim, cache_tcap);
-      put16(&ks[ly + offset][lx * 8], *reinterpret_cast<const uint4 *>(key_cache + off));
-      put16(&vs[ly + offset][lx * 8], *reinterpret_cast<const uint4 *>(value_cache + off));
-    } else {
-      put16(&ks[ly + offset][lx * 8], make_uint4(0, 0, 0, 0));
-      put16(&vs[ly + offset][lx * 8], make_uint4(0, 0, 0, 0));
+  // ---- one tile (TILE keys) of K and V into registers, and from there into LDS. A bf16 tensor
+  // takes nbLoadsKV 16-byte loads per lane (key ly + i * strideKV, dims 8 * lx); an int8 tensor
+  // (GETP_KV8_*) takes one (key lane >> 2, dims 16 * (lane & 3)) plus its key's scale, and is
+  // staged as fp16 q * scale.
+#if GETP_KV8_ANY
+  static_assert(BLOCK_SIZE == 64, "the int8 tile loader assumes one wave per block (HPW = 8)");
+  static_assert(!FLASH_P_HILO, "FLASH_P_HILO is a bf16-P path");
+  const int ly8 = lane >> 2, lx8 = lane & 3;
+  using h2 = _Float16 __attribute__((ext_vector_type(2)));
+  // codes u of bytes sh, sh+1 of w -> the fp16 pair (u - 128) * scale: v_perm_b32 takes byte 0/1
+  // (or 2/3) of w for the low halves and 0x64 for the high ones (1024 + u, exact), then a packed
+  // subtract of 1152 (exact) and a packed multiply by the scale.
+  auto cvt2 = [](unsigned int w, int sh, h2 sc) {
+    h2 x = __builtin_bit_cast(h2, __builtin_amdgcn_perm(0x64646464u, w,
+                                                        sh == 0 ? 0x04010400u : 0x04030402u));
+    x = (x - (h2){(_Float16)1152.f, (_Float16)1152.f}) * sc;
+    return __builtin_bit_cast(unsigned int, x);
+  };
+  auto put8 = [&](unsigned short *dst, uint4 w, float scale) {
+    const h2 sc = {(_Float16)scale, (_Float16)scale};
+    put16(dst, make_uint4(cvt2(w.x, 0, sc), cvt2(w.x, 2, sc), cvt2(w.y, 0, sc), cvt2(w.y, 2, sc)));
+    put16(dst + 8,
+          make_uint4(cvt2(w.z, 0, sc), cvt2(w.z, 2, sc), cvt2(w.w, 0, sc), cvt2(w.w, 2, sc)));
+  };
+#else
+  (void)k_scale;
+  (void)v_scale;
+#endif
+  struct KvTile {
+    uint4 k[GETP_KV8_K ? 1 : nbLoadsKVc], v[GETP_KV8_V ? 1 : nbLoadsKVc];
+    float sk, sv;
+  };
+  auto load_tile = [&](int tile0) {
+    KvTile r;
+    r.sk = r.sv = 0.f;
+#if GETP_KV8_ANY
+    {
+      const int index_y = tile0 + ly8;
+      const bool ok = index_y < t_end;
+      const size_t off = ok ? GETP_KV_OFF(index_y % cache_tcap, b, kv_h * head_dim + 16 * lx8,
+                                          batch_size, kv_dim, cache_tcap) : 0;
+#if GETP_KV8_K
+      r.k[0] = ok ? *reinterpret_cast<const uint4 *>(
+                        reinterpret_cast<const signed char *>(key_cache) + off)
+                  : make_uint4(0, 0, 0, 0);
+      r.sk = ok ? k_scale[GETP_KV_SIDX(off - 16 * lx8)] : 0.f;
+#endif
+#if GETP_KV8_V
+      r.v[0] = ok ? *reinterpret_cast<const uint4 *>(
+                        reinterpret_cast<const signed char *>(value_cache) + off)
+                  : make_uint4(0, 0, 0, 0);
+      r.sv = ok ? v_scale[GETP_KV_SIDX(off - 16 * lx8)] : 0.f;
+#endif
     }
-  }
+#endif
+#if !GETP_KV8_K || !GETP_KV8_V
+    #pragma unroll
+    for (int i = 0; i < nbLoadsKVc; ++i) {
+      const int index_y = tile0 + ly + i * strideKVc;
+      const bool ok = index_y < t_end;
+      const size_t off = ok ? GETP_KV_OFF(index_y % cache_tcap, b, kv_h * head_dim + 8 * lx,
+                                          batch_size, kv_dim, cache_tcap) : 0;
+#if !GETP_KV8_K
+      r.k[i] = ok ? *reinterpret_cast<const uint4 *>(key_cache + off) : make_uint4(0, 0, 0, 0);
+#endif
+#if !GETP_KV8_V
+      r.v[i] = ok ? *reinterpret_cast<const uint4 *>(value_cache + off) : make_uint4(0, 0, 0, 0);
+#endif
+    }
+#endif
+    return r;
+  };
+  auto stage_tile = [&](const KvTile &r) {
+#if GETP_KV8_K
+    put8(&ks[ly8][16 * lx8], r.k[0], r.sk);
+#else
+    #pragma unroll
+    for (int i = 0; i < nbLoadsKVc; ++i) put16(&ks[ly + i * strideKVc][lx * 8], r.k[i]);
+#endif
+#if GETP_KV8_V
+    put8(&vs[ly8][16 * lx8], r.v[0], r.sv);
+#else
+    #pragma unroll
+    for (int i = 0; i < nbLoadsKVc; ++i) put16(&vs[ly + i * strideKVc][lx * 8], r.v[i]);
+#endif
+  };
+#if GETP_KV8_ANY && !GETP_ATTN_PREFETCH2
+#error "GETP_KV8_* is written for the GETP_ATTN_PREFETCH2 loop"
+#endif
+
+  stage_tile(load_tile(t_start));
   __syncthreads();
 
   f32x4 acc_o[NCHUNK];
@@ -3933,38 +4547,11 @@ flash_attn_decode_mfma16_kernel(
   // (loaded a trip earlier) and tile bt+2*TILE is loading into the other. The loop is unrolled by
   // hand, twice the old body with the sets swapped, so every array index stays a compile-time
   // constant and the sets stay in registers. The compute section is the old one, verbatim.
-  uint4 rK0[nbLoadsKV], rV0[nbLoadsKV], rK1[nbLoadsKV], rV1[nbLoadsKV];
-  if (t_start + TILE < t_end) {
-    #pragma unroll
-    for (int i = 0; i < nbLoadsKV; ++i) {
-      const int index_y = t_start + TILE + ly + i * strideKV;
-      if (index_y < t_end) {
-        const size_t off = GETP_KV_OFF(index_y % cache_tcap, b, kv_h * head_dim + 8 * lx,
-                                       batch_size, kv_dim, cache_tcap);
-        rK0[i] = *reinterpret_cast<const uint4 *>(key_cache + off);
-        rV0[i] = *reinterpret_cast<const uint4 *>(value_cache + off);
-      } else {
-        rK0[i] = rV0[i] = make_uint4(0, 0, 0, 0);
-      }
-    }
-  }
+  KvTile rt0 = load_tile(t_start + TILE), rt1 = rt0;
   for (int bt0 = t_start; bt0 < t_end; bt0 += 2 * TILE) {
     {
       const int bt = bt0;   // tile bt in LDS, tile bt + TILE (if any) in set 0
-      if (bt + 2 * TILE < t_end) {
-        #pragma unroll
-        for (int i = 0; i < nbLoadsKV; ++i) {
-          const int index_y = bt + 2 * TILE + ly + i * strideKV;
-          if (index_y < t_end) {
-            const size_t off = GETP_KV_OFF(index_y % cache_tcap, b, kv_h * head_dim + 8 * lx,
-                                           batch_size, kv_dim, cache_tcap);
-            rK1[i] = *reinterpret_cast<const uint4 *>(key_cache + off);
-            rV1[i] = *reinterpret_cast<const uint4 *>(value_cache + off);
-          } else {
-            rK1[i] = rV1[i] = make_uint4(0, 0, 0, 0);
-          }
-        }
-      }
+      if (bt + 2 * TILE < t_end) rt1 = load_tile(bt + 2 * TILE);
 
     // ---- S^T = K . Q^T : A[key][dim] read with one b64 instruction per chunk
     f32x4 st;
@@ -3972,10 +4559,17 @@ flash_attn_decode_mfma16_kernel(
     for (int i = 0; i < 4; ++i) st[i] = 0.f;
     #pragma unroll
     for (int c = 0; c < NCHUNK; ++c) {
+#if GETP_KV8_K
+      f16x4 kA;
+      *reinterpret_cast<uint2 *>(&kA) =
+          *reinterpret_cast<const uint2 *>(&ks[ln][c * TILE + 4 * g]);
+      st = __builtin_amdgcn_mfma_f32_16x16x16f16(kA, qH[c], st, 0, 0, 0);
+#else
       bf16x4 kA;
       *reinterpret_cast<uint2 *>(&kA) =
           *reinterpret_cast<const uint2 *>(&ks[ln][c * TILE + 4 * g]);
       st = __builtin_amdgcn_mfma_f32_16x16x16bf16_1k(kA, qB[c], st, 0, 0, 0);
+#endif
     }
 
     // ---- the lower mask. Out-of-range ks rows are zero-filled and so score 0, and
@@ -3997,16 +4591,24 @@ flash_attn_decode_mfma16_kernel(
     const float alpha = __expf(m_run - m_new);
 
     // ---- P^T = exp(S^T - m_new), rounded to bf16 straight away to serve as the B operand.
+#if GETP_KV8_V
+    f16x4v pB;
+#else
     bf16x4 pB;
+#endif
 #if FLASH_P_HILO
     bf16x4 pLo;
 #endif
     float lsum = 0.f;
     #pragma unroll
     for (int m = 0; m < 4; ++m) {
-      const float e = __expf(st[m] - m_new);   // = 0 khi st[m] = -INF
+      const float e = __expf(st[m] - m_new);   // = 0 when st[m] = -INF
       lsum += e;
+#if GETP_KV8_V
+      pB[m] = (_Float16)(e * PSCALE);
+#else
       pB[m] = f32_to_bf16bits(e);
+#endif
 #if FLASH_P_HILO
       pLo[m] = f32_to_bf16bits(e - __bfloat162float(bf16bits_to_bf16(pB[m])));
 #endif
@@ -4020,44 +4622,35 @@ flash_attn_decode_mfma16_kernel(
     // ---- O^T += V^T . P^T
     #pragma unroll
     for (int c = 0; c < NCHUNK; ++c) {
+#if GETP_KV8_V
+      f16x4v vA;
+      #pragma unroll
+      for (int kk = 0; kk < 4; ++kk)
+        vA[kk] = __builtin_bit_cast(_Float16, vs[4 * g + kk][c * TILE + ln]);
+      #pragma unroll
+      for (int i = 0; i < 4; ++i) acc_o[c][i] *= alpha;
+      acc_o[c] = __builtin_amdgcn_mfma_f32_16x16x16f16(vA, pB, acc_o[c], 0, 0, 0);
+#else
       bf16x4 vA;
       #pragma unroll
       for (int kk = 0; kk < 4; ++kk) vA[kk] = vs[4 * g + kk][c * TILE + ln];
       #pragma unroll
       for (int i = 0; i < 4; ++i) acc_o[c][i] *= alpha;
       acc_o[c] = __builtin_amdgcn_mfma_f32_16x16x16bf16_1k(vA, pB, acc_o[c], 0, 0, 0);
+#endif
 #if FLASH_P_HILO
       acc_o[c] = __builtin_amdgcn_mfma_f32_16x16x16bf16_1k(vA, pLo, acc_o[c], 0, 0, 0);
 #endif
     }
 
     __syncthreads();
-    if (bt + TILE < t_end) {
-      #pragma unroll
-      for (int i = 0; i < nbLoadsKV; ++i) {
-        put16(&ks[ly + i * strideKV][lx * 8], rK0[i]);
-        put16(&vs[ly + i * strideKV][lx * 8], rV0[i]);
-      }
-    }
+    if (bt + TILE < t_end) stage_tile(rt0);
     __syncthreads();
     }
     if (bt0 + TILE >= t_end) break;
     {
       const int bt = bt0 + TILE;   // tile bt in LDS, tile bt + TILE (if any) in set 1
-      if (bt + 2 * TILE < t_end) {
-        #pragma unroll
-        for (int i = 0; i < nbLoadsKV; ++i) {
-          const int index_y = bt + 2 * TILE + ly + i * strideKV;
-          if (index_y < t_end) {
-            const size_t off = GETP_KV_OFF(index_y % cache_tcap, b, kv_h * head_dim + 8 * lx,
-                                           batch_size, kv_dim, cache_tcap);
-            rK0[i] = *reinterpret_cast<const uint4 *>(key_cache + off);
-            rV0[i] = *reinterpret_cast<const uint4 *>(value_cache + off);
-          } else {
-            rK0[i] = rV0[i] = make_uint4(0, 0, 0, 0);
-          }
-        }
-      }
+      if (bt + 2 * TILE < t_end) rt0 = load_tile(bt + 2 * TILE);
 
     // ---- S^T = K . Q^T : A[key][dim] read with one b64 instruction per chunk
     f32x4 st;
@@ -4065,10 +4658,17 @@ flash_attn_decode_mfma16_kernel(
     for (int i = 0; i < 4; ++i) st[i] = 0.f;
     #pragma unroll
     for (int c = 0; c < NCHUNK; ++c) {
+#if GETP_KV8_K
+      f16x4 kA;
+      *reinterpret_cast<uint2 *>(&kA) =
+          *reinterpret_cast<const uint2 *>(&ks[ln][c * TILE + 4 * g]);
+      st = __builtin_amdgcn_mfma_f32_16x16x16f16(kA, qH[c], st, 0, 0, 0);
+#else
       bf16x4 kA;
       *reinterpret_cast<uint2 *>(&kA) =
           *reinterpret_cast<const uint2 *>(&ks[ln][c * TILE + 4 * g]);
       st = __builtin_amdgcn_mfma_f32_16x16x16bf16_1k(kA, qB[c], st, 0, 0, 0);
+#endif
     }
 
     // ---- the lower mask. Out-of-range ks rows are zero-filled and so score 0, and
@@ -4090,16 +4690,24 @@ flash_attn_decode_mfma16_kernel(
     const float alpha = __expf(m_run - m_new);
 
     // ---- P^T = exp(S^T - m_new), rounded to bf16 straight away to serve as the B operand.
+#if GETP_KV8_V
+    f16x4v pB;
+#else
     bf16x4 pB;
+#endif
 #if FLASH_P_HILO
     bf16x4 pLo;
 #endif
     float lsum = 0.f;
     #pragma unroll
     for (int m = 0; m < 4; ++m) {
-      const float e = __expf(st[m] - m_new);   // = 0 khi st[m] = -INF
+      const float e = __expf(st[m] - m_new);   // = 0 when st[m] = -INF
       lsum += e;
+#if GETP_KV8_V
+      pB[m] = (_Float16)(e * PSCALE);
+#else
       pB[m] = f32_to_bf16bits(e);
+#endif
 #if FLASH_P_HILO
       pLo[m] = f32_to_bf16bits(e - __bfloat162float(bf16bits_to_bf16(pB[m])));
 #endif
@@ -4113,25 +4721,29 @@ flash_attn_decode_mfma16_kernel(
     // ---- O^T += V^T . P^T
     #pragma unroll
     for (int c = 0; c < NCHUNK; ++c) {
+#if GETP_KV8_V
+      f16x4v vA;
+      #pragma unroll
+      for (int kk = 0; kk < 4; ++kk)
+        vA[kk] = __builtin_bit_cast(_Float16, vs[4 * g + kk][c * TILE + ln]);
+      #pragma unroll
+      for (int i = 0; i < 4; ++i) acc_o[c][i] *= alpha;
+      acc_o[c] = __builtin_amdgcn_mfma_f32_16x16x16f16(vA, pB, acc_o[c], 0, 0, 0);
+#else
       bf16x4 vA;
       #pragma unroll
       for (int kk = 0; kk < 4; ++kk) vA[kk] = vs[4 * g + kk][c * TILE + ln];
       #pragma unroll
       for (int i = 0; i < 4; ++i) acc_o[c][i] *= alpha;
       acc_o[c] = __builtin_amdgcn_mfma_f32_16x16x16bf16_1k(vA, pB, acc_o[c], 0, 0, 0);
+#endif
 #if FLASH_P_HILO
       acc_o[c] = __builtin_amdgcn_mfma_f32_16x16x16bf16_1k(vA, pLo, acc_o[c], 0, 0, 0);
 #endif
     }
 
     __syncthreads();
-    if (bt + TILE < t_end) {
-      #pragma unroll
-      for (int i = 0; i < nbLoadsKV; ++i) {
-        put16(&ks[ly + i * strideKV][lx * 8], rK1[i]);
-        put16(&vs[ly + i * strideKV][lx * 8], rV1[i]);
-      }
-    }
+    if (bt + TILE < t_end) stage_tile(rt1);
     __syncthreads();
     }
   }
@@ -4161,10 +4773,17 @@ flash_attn_decode_mfma16_kernel(
     for (int i = 0; i < 4; ++i) st[i] = 0.f;
     #pragma unroll
     for (int c = 0; c < NCHUNK; ++c) {
+#if GETP_KV8_K
+      f16x4 kA;
+      *reinterpret_cast<uint2 *>(&kA) =
+          *reinterpret_cast<const uint2 *>(&ks[ln][c * TILE + 4 * g]);
+      st = __builtin_amdgcn_mfma_f32_16x16x16f16(kA, qH[c], st, 0, 0, 0);
+#else
       bf16x4 kA;
       *reinterpret_cast<uint2 *>(&kA) =
           *reinterpret_cast<const uint2 *>(&ks[ln][c * TILE + 4 * g]);
       st = __builtin_amdgcn_mfma_f32_16x16x16bf16_1k(kA, qB[c], st, 0, 0, 0);
+#endif
     }
 
     // ---- the lower mask. Out-of-range ks rows are zero-filled and so score 0, and
@@ -4186,16 +4805,24 @@ flash_attn_decode_mfma16_kernel(
     const float alpha = __expf(m_run - m_new);
 
     // ---- P^T = exp(S^T - m_new), rounded to bf16 straight away to serve as the B operand.
+#if GETP_KV8_V
+    f16x4v pB;
+#else
     bf16x4 pB;
+#endif
 #if FLASH_P_HILO
     bf16x4 pLo;
 #endif
     float lsum = 0.f;
     #pragma unroll
     for (int m = 0; m < 4; ++m) {
-      const float e = __expf(st[m] - m_new);   // = 0 khi st[m] = -INF
+      const float e = __expf(st[m] - m_new);   // = 0 when st[m] = -INF
       lsum += e;
+#if GETP_KV8_V
+      pB[m] = (_Float16)(e * PSCALE);
+#else
       pB[m] = f32_to_bf16bits(e);
+#endif
 #if FLASH_P_HILO
       pLo[m] = f32_to_bf16bits(e - __bfloat162float(bf16bits_to_bf16(pB[m])));
 #endif
@@ -4209,12 +4836,22 @@ flash_attn_decode_mfma16_kernel(
     // ---- O^T += V^T . P^T
     #pragma unroll
     for (int c = 0; c < NCHUNK; ++c) {
+#if GETP_KV8_V
+      f16x4v vA;
+      #pragma unroll
+      for (int kk = 0; kk < 4; ++kk)
+        vA[kk] = __builtin_bit_cast(_Float16, vs[4 * g + kk][c * TILE + ln]);
+      #pragma unroll
+      for (int i = 0; i < 4; ++i) acc_o[c][i] *= alpha;
+      acc_o[c] = __builtin_amdgcn_mfma_f32_16x16x16f16(vA, pB, acc_o[c], 0, 0, 0);
+#else
       bf16x4 vA;
       #pragma unroll
       for (int kk = 0; kk < 4; ++kk) vA[kk] = vs[4 * g + kk][c * TILE + ln];
       #pragma unroll
       for (int i = 0; i < 4; ++i) acc_o[c][i] *= alpha;
       acc_o[c] = __builtin_amdgcn_mfma_f32_16x16x16bf16_1k(vA, pB, acc_o[c], 0, 0, 0);
+#endif
 #if FLASH_P_HILO
       acc_o[c] = __builtin_amdgcn_mfma_f32_16x16x16bf16_1k(vA, pLo, acc_o[c], 0, 0, 0);
 #endif
@@ -4244,7 +4881,11 @@ flash_attn_decode_mfma16_kernel(
     const float m_fin = fmaxf(m_run, sink);
     const float a     = __expf(m_run - m_fin);
     const float l     = l_run * a + __expf(sink - m_fin);
+#if GETP_KV8_V
+    const float scale = a / l * (1.f / 32768.f);   // P went into the PV MFMA as e * 2^15
+#else
     const float scale = a / l;
+#endif
     #pragma unroll
     for (int c = 0; c < NCHUNK; ++c)
       *reinterpret_cast<float4 *>(&ot[waveIdx * HPW + ln][c * TILE + 4 * g]) =
@@ -4476,7 +5117,7 @@ flash_attn_decode_even_layer_bf16_matrix_core_kernel(
           float osum = 0.f;
           #pragma unroll
           for (int j = 0; j < MFMA_N; ++j) {
-            const float e = __expf(s[j] - m_new);   // = 0 khi s[j] = -INF
+            const float e = __expf(s[j] - m_new);   // = 0 when s[j] = -INF
             lsum += e;
             osum += e * __bfloat162float(vs[t + j][laneIdx]);
           }
@@ -4717,7 +5358,7 @@ flash_attn_decode_odd_layer_bf16_matrix_core_kernel(
           float osum = 0.f;
           #pragma unroll
           for (int j = 0; j < MFMA_N; ++j) {
-            const float e = __expf(s[j] - m_new);   // = 0 khi s[j] = -INF
+            const float e = __expf(s[j] - m_new);   // = 0 when s[j] = -INF
             lsum += e;
             osum += e * __bfloat162float(vs[t + j][laneIdx]);
           }
@@ -4818,12 +5459,34 @@ static inline void getp_dump_attn(const float *tb, int batch_size,
 }
 #endif
 
+// The scale array of an int8 KV allocation: its upper half. The int8 data takes kv_elems bytes of
+// the kv_elems bf16 slots transformer.cpp allocates (the same formula), so the scales - kv_elems/64
+// floats - start at the next 256-byte boundary and end well inside the allocation.
+static inline float *getp_kv8_scales(void *cache, const Config *p, int B) {
+  const int kv_dim = p->head_dim * p->n_kv_heads;
+  const int even_layers = (p->n_layers + 1) / 2;
+  const int even_tcap = (p->sliding_window > 0 ? p->sliding_window : 1);
+  int odd_tcap = p->seq_len / 2;
+  if (odd_tcap < 1) odd_tcap = 1;
+  const size_t total_t = (size_t)even_layers * (size_t)even_tcap +
+                         (size_t)(p->n_layers - even_layers) * (size_t)odd_tcap;
+  const size_t kv_elems = (size_t)B * total_t * (size_t)kv_dim +
+                          (size_t)p->n_layers * GETP_KV_LAYER_PAD(B, kv_dim);
+  return reinterpret_cast<float *>(reinterpret_cast<char *>(cache) +
+                                   ((kv_elems + 255) & ~(size_t)255));
+}
+
 static inline void getp_flash_attn_decode_bf16(
     __hip_bfloat16 *tb_bf16, float *tb, const __hip_bfloat16 *key_cache_layer,
     const __hip_bfloat16 *value_cache_layer, const float *q, const int *mask_on,
     const float *attn_sinks_layer, int head_dim, int n_attn_heads,
     int n_kv_heads, int pos, int seq_len, int sliding_window, int layer_id,
-    int batch_size, int cache_tcap, hipStream_t stream) {
+    int batch_size, int cache_tcap, hipStream_t stream,
+    // GETP_KV8_K / _V: the layer's scales (nullptr for a bf16 tensor)
+    const float *k_scale_layer = nullptr, const float *v_scale_layer = nullptr) {
+#if GETP_KV8_ANY && !(FLASH_MFMA16_EVEN && FLASH_MFMA16_ODD)
+#error "GETP_KV8_* needs the mfma16 attention kernel on both layer kinds"
+#endif
 
   const int kv_dim = head_dim * n_kv_heads;
   const int kv_mul = n_attn_heads / n_kv_heads;
@@ -4837,7 +5500,7 @@ static inline void getp_flash_attn_decode_bf16(
     flash_attn_decode_mfma16_kernel<FLASH_HEADS_PER_WAVE, true><<<grid, block, 0, stream>>>
       (tb_bf16, tb, key_cache_layer,
        value_cache_layer, q,
-       mask_on,
+       mask_on, k_scale_layer, v_scale_layer,
        attn_sinks_layer, head_dim, n_attn_heads,
        n_kv_heads, pos, batch_size, kv_dim, kv_mul,
        sliding_window, cache_tcap, invsd);
@@ -4862,7 +5525,7 @@ static inline void getp_flash_attn_decode_bf16(
     flash_attn_decode_mfma16_kernel<FLASH_HEADS_PER_WAVE, false><<<grid, block, 0, stream>>>
       (tb_bf16, tb, key_cache_layer,
       value_cache_layer, q,
-      mask_on,
+      mask_on, k_scale_layer, v_scale_layer,
       attn_sinks_layer, head_dim, n_attn_heads,
       n_kv_heads, pos, batch_size, kv_dim, kv_mul,
       sliding_window, cache_tcap, invsd);
@@ -4909,6 +5572,148 @@ static inline void getp_gather_embedding_bf16(float *x,
 
 }
 
+
+// Split count of getp_matmul_router_bf16, factored out so the fused kernel can reproduce it.
+static inline int getp_router_splits(int M, int N, int K) {
+  constexpr int BM = 32, BK = 32;
+  const int BNt = 32 * GETP_BN_AGG;
+  const int gx = (N + BNt - 1) / BNt, gy = (M + BM - 1) / BM;
+  const int grid_xy = max(1, gx) * max(1, gy);
+  int dev = 0, cu = 104;
+  HIP_CHECK(hipGetDevice(&dev));
+  HIP_CHECK(hipDeviceGetAttribute(&cu, hipDeviceAttributeMultiprocessorCount, dev));
+  if (cu <= 0) cu = 104;
+  const int target_cta = cu * 4;
+  int splits = (grid_xy >= target_cta) ? 1 : (target_cta + grid_xy - 1) / grid_xy;
+  splits = min(8, max(1, splits));
+  return min(splits, max(1, (K + BK - 1) / BK));
+}
+
+#if GETP_ROUTER_FUSED
+// The router of getp_matmul_router_bf16, same bits, in one kernel. A workgroup owns a 16*RB x 16*CBW
+// output tile; its wave s computes split s: kBeg = s*kChunk, and for each 16 x 16 block the SAME
+// mfma chain as matmul_kernel_splitk_store_tuned, which walks 32-k tiles from kBeg while bk < kEnd,
+// two 16-k MFMAs per tile, zero-filling every 8-element group with kk + 7 >= kEnd. The partials then
+// meet in LDS and are summed in split order from 0.f, plus the bias, as reduce_splitk_with_bias does.
+// Each A load feeds CBW MFMAs and each B load RB; loads run one G-step chunk ahead of the MFMAs.
+constexpr int GETP_ROUTER_MAXT = 12;   // 32-k tiles per split: kChunk <= 384 (the launcher checks)
+template <int SPLITS, int RB, int CBW, int G>
+__global__ __launch_bounds__(64 * SPLITS) void router_fused_bf16_kernel(
+    float *__restrict__ out, const __hip_bfloat16 *__restrict__ xb,
+    const __hip_bfloat16 *__restrict__ w, const __hip_bfloat16 *__restrict__ bias,
+    int M, int N, int K, int kChunk) {
+  constexpr int NS = 2 * GETP_ROUTER_MAXT, NCH = NS / G;
+  static_assert(NS % G == 0, "G must divide the step count");
+  __shared__ float red[SPLITS][16 * RB][16 * CBW];
+  const int split = threadIdx.x >> 6, lane = threadIdx.x & 63;
+  const int xMF = lane & 15, yMF = lane >> 4;
+  const int r0 = blockIdx.x * 16 * RB, c0 = blockIdx.y * 16 * CBW;
+  const int kBeg = split * kChunk, kEnd = min(K, kBeg + kChunk);
+  const int nsteps = kBeg < kEnd ? 2 * ((kEnd - kBeg + 31) / 32) : 0;
+  const unsigned short *xs = reinterpret_cast<const unsigned short *>(xb);
+  const unsigned short *ws = reinterpret_cast<const unsigned short *>(w);
+  // A: row r, k .. k+3; B: column c, k .. k+3 - the operand layout of the block kernel's LDS reads
+  uint2 a[2][RB][G], b[2][CBW][G];
+  auto load = [&](int ch, int buf) {
+    #pragma unroll
+    for (int g = 0; g < G; ++g) {
+      const int u = ch * G + g;
+      const int k = kBeg + 16 * u + 4 * yMF;
+      const int kk = kBeg + 16 * u + ((4 * yMF) & ~7);   // the 8-element group the block kernel loads
+      const bool kok = u < nsteps && kk + 7 < kEnd;
+      #pragma unroll
+      for (int rb = 0; rb < RB; ++rb) {
+        const int row = r0 + 16 * rb + xMF;
+        a[buf][rb][g] = (kok && row < M)
+                            ? *reinterpret_cast<const uint2 *>(xs + (size_t)row * K + k)
+                            : make_uint2(0u, 0u);
+      }
+      #pragma unroll
+      for (int cb = 0; cb < CBW; ++cb) {
+        const int col = c0 + 16 * cb + xMF;
+        b[buf][cb][g] = (kok && col < N)
+                            ? *reinterpret_cast<const uint2 *>(ws + (size_t)col * K + k)
+                            : make_uint2(0u, 0u);
+      }
+    }
+  };
+  f32x4 d[RB][CBW];
+  #pragma unroll
+  for (int rb = 0; rb < RB; ++rb)
+    #pragma unroll
+    for (int cb = 0; cb < CBW; ++cb) d[rb][cb] = f32x4{0, 0, 0, 0};
+  load(0, 0);
+  #pragma unroll
+  for (int ch = 0; ch < NCH; ++ch) {
+    if (ch + 1 < NCH) load(ch + 1, (ch + 1) & 1);
+    #pragma unroll
+    for (int g = 0; g < G; ++g) {
+      if (ch * G + g < nsteps) {
+        #pragma unroll
+        for (int rb = 0; rb < RB; ++rb) {
+          const uint2 ua = a[ch & 1][rb][g];
+          const bf16x4 av = {(unsigned short)(ua.x & 0xFFFF), (unsigned short)(ua.x >> 16),
+                             (unsigned short)(ua.y & 0xFFFF), (unsigned short)(ua.y >> 16)};
+          #pragma unroll
+          for (int cb = 0; cb < CBW; ++cb) {
+            const uint2 ub = b[ch & 1][cb][g];
+            const bf16x4 bv = {(unsigned short)(ub.x & 0xFFFF), (unsigned short)(ub.x >> 16),
+                               (unsigned short)(ub.y & 0xFFFF), (unsigned short)(ub.y >> 16)};
+            d[rb][cb] = __builtin_amdgcn_mfma_f32_16x16x16bf16_1k(av, bv, d[rb][cb], 0, 0, 0);
+          }
+        }
+      }
+    }
+  }
+  #pragma unroll
+  for (int rb = 0; rb < RB; ++rb)
+    #pragma unroll
+    for (int cb = 0; cb < CBW; ++cb)
+      #pragma unroll
+      for (int i = 0; i < 4; ++i) red[split][16 * rb + 4 * yMF + i][16 * cb + xMF] = d[rb][cb][i];
+  __syncthreads();
+  for (int t = threadIdx.x; t < 16 * RB * 16 * CBW; t += 64 * SPLITS) {
+    const int r = t / (16 * CBW), c = t % (16 * CBW);
+    const int row = r0 + r, col = c0 + c;
+    if (row >= M || col >= N) continue;
+    float sum = 0.f;
+    #pragma unroll
+    for (int sp = 0; sp < SPLITS; ++sp) sum += red[sp][r][c];
+    if (bias) sum += __bfloat162float(bias[col]);
+    out[(size_t)row * N + col] = sum;
+  }
+}
+
+// True when the fused router reproduces getp_matmul_router_bf16 for this shape.
+static inline bool getp_router_fused_ok(int M, int N, int K) {
+  const int splits = getp_router_splits(M, N, K);
+  const int kChunk = (K + splits - 1) / splits;
+  return splits == 8 && kChunk <= 32 * GETP_ROUTER_MAXT && kChunk % 8 == 0 && K % 4 == 0 &&
+         N % 16 == 0;
+}
+
+// xout[M x N] = xb[M x K] . w[N x K]^T + b, with xb the bf16 copy of what getp_matmul_router_bf16
+// reads in fp32. Only call when getp_router_fused_ok.
+// Tile per wave, measured on norm + router (smallbench, us per layer; the split-K pair: 113 / 70):
+//              RB,CBW = 1,1   1,2   2,1   2,2   4,1   1,4
+//   20B  N =  32:        64    59    58    66    73     -
+//   120B N = 128:        81    68    67    57    68    71
+static inline void getp_matmul_router_fused(float *xout, const __hip_bfloat16 *xb,
+                                            const __hip_bfloat16 *w, const __hip_bfloat16 *b,
+                                            int n, int d, int batch_size, hipStream_t stream) {
+  const int M = batch_size, N = d, K = n;
+  const int kChunk = (K + 7) / 8;
+  constexpr int RB = 2;
+  const dim3 grid_x((unsigned)((M + 16 * RB - 1) / (16 * RB)));
+  if (N % 32 == 0 && N >= 64)
+    router_fused_bf16_kernel<8, RB, 2, GETP_ROUTER_G><<<dim3(grid_x.x, N / 32), 64 * 8, 0, stream>>>(
+        xout, xb, w, b, M, N, K, kChunk);
+  else
+    router_fused_bf16_kernel<8, RB, 1, GETP_ROUTER_G><<<dim3(grid_x.x, N / 16), 64 * 8, 0, stream>>>(
+        xout, xb, w, b, M, N, K, kChunk);
+}
+#endif
+
 static inline void getp_matmul_router_bf16(float *xout, float *x, __hip_bfloat16 *w, __hip_bfloat16 *b, int n, int d, int batch_size, hipStream_t stream) {
 
   const int M = batch_size, N = d, K = n;
@@ -4918,20 +5723,7 @@ static inline void getp_matmul_router_bf16(float *xout, float *x, __hip_bfloat16
   dim3 block(256);
   const int gx = (N + BNt - 1) / BNt;
   const int gy = (M + BM - 1) / BM;
-  const int grid_xy = max(1, gx) * max(1, gy);
-
-  int dev = 0, cu = 104;
-  HIP_CHECK(hipGetDevice(&dev));
-  HIP_CHECK(
-      hipDeviceGetAttribute(&cu, hipDeviceAttributeMultiprocessorCount, dev));
-  if (cu <= 0) cu = 104;
-
-  const int target_cta = cu * 4;
-  int splits =
-      (grid_xy >= target_cta) ? 1 : (target_cta + grid_xy - 1) / grid_xy;
-  splits = min(8, max(1, splits));
-  const int max_splits_by_K = max(1, (K + BK - 1) / BK);
-  splits = min(splits, max_splits_by_K);
+  const int splits = getp_router_splits(M, N, K);
 
   const size_t shmem = (size_t)2 * (size_t)BK * ((size_t)BM + (size_t)BNt) *
                        sizeof(unsigned short);
@@ -5070,7 +5862,7 @@ constexpr int attn_o_lds_pad_slots(int BM_, int BN_, int NKC) {
 // qkv:1392-1393 and logits:3656-3657). The two macros count two different things:
 //   GETP_LDS_PAD                : a count of SHORTS along the ROW axis of one k plane;
 //                                 any value is valid, it only changes performance;
-//                                 (autotune.sh:38-40 va run2.sh:35-37 quet
+//                                 (autotune.sh:38-40 and run2.sh:35-37 swept
 //                                 2 / 8 / 16).
 //   MATMUL_ATTN_O_LDS_PAD_SLOTS : a count of 8-BYTE SLOTS along the row axis of one slot plane;
 //                                 constrained, and the constraint depends on BK (table above).
@@ -5664,10 +6456,10 @@ __global__ void extract_argmax_pairs(const unsigned long long* pairs, int* out, 
 // The two quantities share a name but mean different things, have different validity conditions
 // and different units, so this kernel needs its OWN pad macro. GETP_LDS_PAD keeps its old
 // meaning and still serves the two remaining kernels on the [k][row] layout: qkv (:1392-1393)
-// va attn_o (:3324-3325).
+// and attn_o (:3324-3325).
 //
 //   Row stride = (BK+PAD) shorts = 2*(BK+PAD) bytes = (BK+PAD)/2 banks.
-//   Mot fragment MFMA = 4 short = 8 byte = 2 bank = 1 "double-bank".
+//   One MFMA fragment = 4 shorts = 8 bytes = 2 banks = 1 "double-bank".
 //   The 16 lanes of one ds_read_b64 phase move 16*8 = 128 bytes = exactly 32 banks.
 //   Within a phase, L/16 is CONSTANT so basek is fixed and row = row0 + (L&15)
 //   runs over 16 consecutive rows, i.e. db(i) = (S*i + c) mod 16 with S = (BK+PAD)/4.
@@ -6228,6 +7020,69 @@ static int *g_ag_idx[MAXIMUM_GPU];               // [device] -> rr_idx [EP][B]
 static int g_ag_cnt[MAXIMUM_GPU][MAXIMUM_GPU];   // [sending slice][receiving slice]
 #endif
 
+#ifndef GETP_XPULL
+#define GETP_XPULL 1
+#endif
+#if GETP_XPULL
+// Published once per device for the direct pulls: its row lists (rr_*) and 'my lists are built'
+// events, one slot per layer.
+static int *g_rr_idx[MAXIMUM_GPU], *g_rr_cnt[MAXIMUM_GPU];
+static hipEvent_t g_ev_ag[MAXIMUM_GPU][128];
+struct XPeers {
+  const __hip_bfloat16 *t[MAXIMUM_GPU];   // peer's ext_t_bf16 [EP * B][H]
+  const int *idx[MAXIMUM_GPU];            // peer's rr_idx [EP][B]: its rows destination sl needs
+  const int *cnt[MAXIMUM_GPU];            // peer's rr_cnt [EP]
+  const int *ti[MAXIMUM_GPU];             // peer's ext_topk_i [EP * B][K]
+  const float *tv[MAXIMUM_GPU];           // peer's ext_topk_v
+  const __hip_bfloat16 *e[MAXIMUM_GPU];   // peer's e_agg of this layer's parity, bf16 [EP][B][H]
+};
+// All-gather: block (slice j, i) copies row i of peer j's list for us from peer j's own slice into
+// ours; blocks with i >= that count also copy a chunk of peer j's top-k (ids and weights).
+__global__ __launch_bounds__(256) void xpull_ag_kernel(__hip_bfloat16 *__restrict__ t,
+                                                       int *__restrict__ ti, float *__restrict__ tv,
+                                                       XPeers pp, int own, int B, int H, int K) {
+  const int j = blockIdx.x;
+  if (j == own) return;
+  const int i = blockIdx.y;
+  // top-k of peer j's slice: B*K entries, 256 per block
+  const int nk = B * K;
+  for (int q = i * 256 + threadIdx.x; q < nk && i * 256 < nk; q += (int)gridDim.y * 256) {
+    ti[(size_t)j * nk + q] = pp.ti[j][(size_t)j * nk + q];
+    tv[(size_t)j * nk + q] = pp.tv[j][(size_t)j * nk + q];
+  }
+  if (i >= pp.cnt[j][own]) return;
+  const int b = pp.idx[j][(size_t)own * B + i];
+  const uint4 *src = reinterpret_cast<const uint4 *>(pp.t[j] + ((size_t)j * B + b) * H);
+  uint4 *dst = reinterpret_cast<uint4 *>(t + ((size_t)j * B + b) * H);
+  for (int k = threadIdx.x; k < (H >> 3); k += blockDim.x) dst[k] = src[k];
+}
+// Combine: thread (row b, 8 columns) adds each peer's partial sum of row b, in `order` (the old
+// scatter-adds' delta order): x += p1; x += p2; ... - the same fp32 additions, bit-exact.
+__global__ __launch_bounds__(128) void xpull_rs_kernel(float *__restrict__ x, XPeers pp,
+                                                       const int *__restrict__ rank,
+                                                       const int *__restrict__ order, int npeer,
+                                                       int own, int B, int H) {
+  const int b = blockIdx.y;
+  const int c8 = blockIdx.x * blockDim.x + threadIdx.x;
+  if (c8 >= (H >> 3)) return;
+  float4 *xr = reinterpret_cast<float4 *>(x + (size_t)b * H) + 2 * c8;
+  float4 a = xr[0], c = xr[1];
+  bool any = false;
+  for (int d = 0; d < npeer; ++d) {
+    const int ps = order[d];
+    const int r = rank[(size_t)ps * B + b];
+    if (r < 0) continue;
+    any = true;
+    const uint4 v = reinterpret_cast<const uint4 *>(pp.e[ps] + ((size_t)own * B + r) * H)[c8];
+    a.x += bf16bits_to_f32((unsigned short)v.x); a.y += bf16bits_to_f32((unsigned short)(v.x >> 16));
+    a.z += bf16bits_to_f32((unsigned short)v.y); a.w += bf16bits_to_f32((unsigned short)(v.y >> 16));
+    c.x += bf16bits_to_f32((unsigned short)v.z); c.y += bf16bits_to_f32((unsigned short)(v.z >> 16));
+    c.z += bf16bits_to_f32((unsigned short)v.w); c.w += bf16bits_to_f32((unsigned short)(v.w >> 16));
+  }
+  if (any) { xr[0] = a; xr[1] = c; }
+}
+#endif
+
 #if GETP_EVAGG
 // The 'my e_agg is written' event, one slot per layer. sp1 is still a barrier, so two ranks are
 // never more than one layer apart and 128 slots is far more than enough.
@@ -6288,6 +7143,19 @@ static inline void sync_workers_dev(hipStream_t rec_stream, hipStream_t wait_str
 #endif
 #ifndef GETP_EPLB_WINDOW
 #define GETP_EPLB_WINDOW 32  // each move is planned from the tiles of the WINDOW steps before it
+#endif
+// The smallest EXPERT_PARALLELISM that balances (2: the 20B's pairs too; 3: only the 120B).
+#ifndef GETP_EPLB_MIN_EP
+#define GETP_EPLB_MIN_EP 2
+#endif
+// Finished sequences (mask_on[b] == 0) are routed to no expert. The batch runs until its longest
+// sequence ends and attention already skipped the finished rows, but the MoE did not: 5.9 % of the
+// 20B's row-steps on the 8-GPU benchmark input, 3 % of the 120B's. Each MoE output row depends only
+// on its own pairs and the grids are sized from host constants, so with a fixed expert placement the
+// live rows are bit-exact. GETP_EPLB plans its moves from pair counts, which no longer include the
+// finished rows, so its moves - and the grouping of a token's partial sums - change with this.
+#ifndef GETP_DEAD_ROWS
+#define GETP_DEAD_ROWS 1
 #endif
 #ifndef GETP_EPLB_MOVES
 #define GETP_EPLB_MOVES 8    // experts allowed to change GPU, per layer and per move
@@ -6452,6 +7320,23 @@ int *getp_forward_120b(Transformer * /*transformer*/,
     HIP_CHECK(hipMalloc(&ag_ridx, sizeof(int) * (size_t)EXPERT_PARALLELISM * BATCH_SIZE));
     g_ag_send[device_index] = ag_send;
     g_ag_idx[device_index] = rr_idx;
+#if GETP_XPULL
+    g_rr_idx[device_index] = rr_idx;
+    g_rr_cnt[device_index] = rr_cnt;
+    for (int q = 0; q < 128; ++q)
+      HIP_CHECK(hipEventCreateWithFlags(&g_ev_ag[device_index][q], hipEventDisableTiming));
+    // peer access to every other GPU of the group: the pulls read their memory directly
+    for (int q = 0; q < EXPERT_PARALLELISM; ++q) {
+      const int pd = workers[q].device_index;
+      if (pd == device_index) continue;
+      const hipError_t e = hipDeviceEnablePeerAccess(pd, 0);
+      if (e != hipSuccess && e != hipErrorPeerAccessAlreadyEnabled) {
+        fprintf(stderr, "xpull: no peer access %d -> %d\n", device_index, pd);
+        abort();
+      }
+      (void)hipGetLastError();
+    }
+#endif
 #if GETP_EVAGG
     for (int q = 0; q < 128; ++q)
       HIP_CHECK(hipEventCreateWithFlags(&g_ev_eagg[device_index][q], hipEventDisableTiming));
@@ -6513,7 +7398,7 @@ int *getp_forward_120b(Transformer * /*transformer*/,
   int *&eplb_acc = g_eplb_acc[device_index];            // device [L][epd] tiles counted
   int *&eplb_relabel = g_eplb_relabel[device_index];    // device [L][E] expert -> label
   std::vector<int> &eplb_label = g_eplb_label[device_index];  // host copy of eplb_relabel
-  const bool eplb_on = (EXPERT_PARALLELISM > 2) && p->n_layers <= GETP_EPLB_MAXL &&
+  const bool eplb_on = (EXPERT_PARALLELISM >= GETP_EPLB_MIN_EP) && p->n_layers <= GETP_EPLB_MAXL &&
                        n_experts <= GETP_EPLB_MAXE;
   if (eplb_on && eplb_relabel == nullptr) {
     eplb_label.resize((size_t)p->n_layers * n_experts);
@@ -6669,14 +7554,19 @@ int *getp_forward_120b(Transformer * /*transformer*/,
                             (size_t)(is_even ? idx_half : even_layers + idx_half) *
                                 GETP_KV_LAYER_PAD(BATCH_SIZE, kv_dim);
 
-    __hip_bfloat16 *key_cache =
-        reinterpret_cast<__hip_bfloat16 *>(dev_s->key_cache);
-    __hip_bfloat16 *value_cache =
-        reinterpret_cast<__hip_bfloat16 *>(dev_s->value_cache);
-    __hip_bfloat16 *k_slot =
-        key_cache + base_off + GETP_KV_OFF(tslot, 0, 0, BATCH_SIZE, kv_dim, cache_tcap);
-    __hip_bfloat16 *v_slot =
-        value_cache + base_off + GETP_KV_OFF(tslot, 0, 0, BATCH_SIZE, kv_dim, cache_tcap);
+    const size_t slot_off = base_off + GETP_KV_OFF(tslot, 0, 0, BATCH_SIZE, kv_dim, cache_tcap);
+    __hip_bfloat16 *k_slot = GETP_KV_PTR_K(dev_s->key_cache, slot_off);
+    __hip_bfloat16 *v_slot = GETP_KV_PTR_V(dev_s->value_cache, slot_off);
+    float *k_slot_scale = nullptr, *v_slot_scale = nullptr;
+    const float *k_layer_scale = nullptr, *v_layer_scale = nullptr;
+#if GETP_KV8_K
+    k_slot_scale = getp_kv8_scales(dev_s->key_cache, p, BATCH_SIZE) + GETP_KV_SIDX(slot_off);
+    k_layer_scale = getp_kv8_scales(dev_s->key_cache, p, BATCH_SIZE) + GETP_KV_SIDX(base_off);
+#endif
+#if GETP_KV8_V
+    v_slot_scale = getp_kv8_scales(dev_s->value_cache, p, BATCH_SIZE) + GETP_KV_SIDX(slot_off);
+    v_layer_scale = getp_kv8_scales(dev_s->value_cache, p, BATCH_SIZE) + GETP_KV_SIDX(base_off);
+#endif
 
     float *k_step = dev_s->tb2;
     float *v_step = dev_s->tb2 + (size_t)BATCH_SIZE * (size_t)kv_dim;
@@ -6698,7 +7588,7 @@ int *getp_forward_120b(Transformer * /*transformer*/,
                                dev_w_qkv, dev_b_qkv, hidden_dim, head_dim,
                                p->n_attn_heads, p->n_kv_heads, BATCH_SIZE,
                                compute_stream, dev_cos_vals, dev_sin_vals,
-                               k_slot, v_slot, cache_tcap);
+                               k_slot, v_slot, cache_tcap, k_slot_scale, v_slot_scale);
 #if !GETP_ROPE_FUSED_KV
     kv_store_pair_fp32_to_bf16(k_slot, v_slot, k_step, v_step,
                                BATCH_SIZE * kv_dim, compute_stream);
@@ -6720,8 +7610,8 @@ int *getp_forward_120b(Transformer * /*transformer*/,
 #endif
 
     {
-      const __hip_bfloat16 *k_layer = key_cache + base_off;
-      const __hip_bfloat16 *v_layer = value_cache + base_off;
+      const __hip_bfloat16 *k_layer = GETP_KV_PTR_K(dev_s->key_cache, base_off);
+      const __hip_bfloat16 *v_layer = GETP_KV_PTR_V(dev_s->value_cache, base_off);
       const float *q_ptr = dev_s->q;
       const float *attn_sinks_layer =
           dev_w->attn_sinks + (size_t)l * p->n_attn_heads;
@@ -6729,7 +7619,7 @@ int *getp_forward_120b(Transformer * /*transformer*/,
           ext->attn_o_bf16, dev_s->tb,
           k_layer, v_layer, q_ptr, ext->mask_on, attn_sinks_layer, head_dim,
           p->n_attn_heads, p->n_kv_heads, pos, p->seq_len, p->sliding_window,
-          (int)l, BATCH_SIZE, cache_tcap, compute_stream);
+          (int)l, BATCH_SIZE, cache_tcap, compute_stream, k_layer_scale, v_layer_scale);
     }
 
     __hip_bfloat16 *dev_w_o =
@@ -6740,8 +7630,19 @@ int *getp_forward_120b(Transformer * /*transformer*/,
                                 head_dim * p->n_attn_heads, hidden_dim,
                                 BATCH_SIZE, compute_stream);
 
-    // The router reads ext_t fp32 and the peer copy reads ext_t_bf16: produce both in one
-    // pass, instead of a separate conversion kernel on memory_stream.
+#if GETP_ROUTER_FUSED
+    // The fused router reads ext_t_bf16, so nothing reads the fp32 ext_t any more.
+    const bool router_fused = getp_router_fused_ok(BATCH_SIZE, n_experts, hidden_dim);
+#else
+    const bool router_fused = false;
+#endif
+    // The router reads ext_t fp32 (unless fused) and the peer copy reads ext_t_bf16: produce both
+    // in one pass, instead of a separate conversion kernel on memory_stream.
+    if (router_fused)
+      getp_rmsnorm_bf16(ext->ext_t_bf16 + (size_t)own_slice * BATCH_SIZE * hidden_dim,
+                        dev_x, dev_w->rms_ffn_w + 1ll * l * hidden_dim,
+                        BATCH_SIZE, hidden_dim, compute_stream);
+    else
     getp_rmsnorm_f32_bf16(
         ext->ext_t + (size_t)own_slice * BATCH_SIZE * hidden_dim,
         ext->ext_t_bf16 + (size_t)own_slice * BATCH_SIZE * hidden_dim,
@@ -6752,6 +7653,14 @@ int *getp_forward_120b(Transformer * /*transformer*/,
     __hip_bfloat16 *dev_w_router =
         dev_w->w_router_bf16 + 1ll * l * hidden_dim * n_experts;
     __hip_bfloat16 *dev_b_router = dev_w->b_router_bf16 + 1ll * l * n_experts;
+#if GETP_ROUTER_FUSED
+    if (router_fused)
+      getp_matmul_router_fused(dev_s->router_score,
+                               ext->ext_t_bf16 + (size_t)own_slice * BATCH_SIZE * hidden_dim,
+                               dev_w_router, dev_b_router, hidden_dim, n_experts, BATCH_SIZE,
+                               compute_stream);
+    else
+#endif
     getp_matmul_router_bf16(
       dev_s->router_score,
       ext->ext_t + (size_t)(device_index - base_device_index) * BATCH_SIZE * hidden_dim,
@@ -6765,6 +7674,11 @@ int *getp_forward_120b(Transformer * /*transformer*/,
         BATCH_SIZE, compute_stream
 #if GETP_EPLB
         , eplb_on ? eplb_relabel + (size_t)l * n_experts : nullptr
+#else
+        , nullptr
+#endif
+#if GETP_DEAD_ROWS
+        , ext->mask_on
 #endif
         );
     HIP_CHECK(hipEventRecord(event_router_topk, compute_stream));
@@ -6775,10 +7689,15 @@ int *getp_forward_120b(Transformer * /*transformer*/,
       getp_rowskip_build_all_recv(ext->ext_topk_i, p->experts_per_token, BATCH_SIZE,
                                   EXPERT_PARALLELISM, own_slice, own_slice,
                                   rs_elo, rs_ehi, rr_rank, rr_idx, rr_cnt, compute_stream);
+#if GETP_XPULL
+      // the peers read our rows in place (xpull_ag_kernel): no packing
+      HIP_CHECK(hipEventRecord(g_ev_ag[device_index][l % 128], compute_stream));
+#else
       getp_agskip_gather_kernel<<<dim3((unsigned)EXPERT_PARALLELISM, (unsigned)BATCH_SIZE), 256,
                                   0, compute_stream>>>(
           ext->ext_t_bf16 + (size_t)own_slice * BATCH_SIZE * hidden_dim, ag_send, rr_idx, rr_cnt,
           own_slice, BATCH_SIZE, hidden_dim);
+#endif
     }
 #endif
 
@@ -6791,6 +7710,26 @@ int *getp_forward_120b(Transformer * /*transformer*/,
     // that rank's own topk and attention still matched. Acquiring on the receiving side and
     // fine-grained memory both failed to fix it. Pulling on the receiving device's own queue
     // plus an event is the pattern the e_agg path already used, and it measures clean.
+#if GETP_AGSKIP && GETP_XPULL
+    if (ag_on) {
+      // No drain: every rank has recorded its 'lists built' event once past this host barrier;
+      // then one kernel pulls everything this rank needs from the seven peers.
+      sync_point.wait();
+      XPeers pp = {};
+      for (int q = 0; q < EXPERT_PARALLELISM; ++q) {
+        const int pd = base_device_index + q;
+        if (q == own_slice) continue;
+        RunStateExt *pe = ext_get(pd);
+        pp.t[q] = pe->ext_t_bf16; pp.idx[q] = g_rr_idx[pd]; pp.cnt[q] = g_rr_cnt[pd];
+        pp.ti[q] = pe->ext_topk_i; pp.tv[q] = pe->ext_topk_v;
+        HIP_CHECK(hipStreamWaitEvent(compute_stream, g_ev_ag[pd][l % 128], 0));
+      }
+      xpull_ag_kernel<<<dim3((unsigned)EXPERT_PARALLELISM, (unsigned)BATCH_SIZE), 256, 0,
+                        compute_stream>>>(ext->ext_t_bf16, ext->ext_topk_i, ext->ext_topk_v, pp,
+                                          own_slice, BATCH_SIZE, hidden_dim,
+                                          p->experts_per_token);
+    } else
+#endif
 #if GETP_AGSKIP
     if (ag_on) {
       // Identical to the EP > 2 branch of sync_workers_dev, with one row-count read inserted in
@@ -6811,7 +7750,12 @@ int *getp_forward_120b(Transformer * /*transformer*/,
 #endif
     }
     HIP_CHECK(hipSetDevice(device_index));
-    for (int delta = 1, j = 0; delta < EXPERT_PARALLELISM; ++delta) {
+#if GETP_XPULL
+    const bool xp = ag_on;   // the all-gather already happened in xpull_ag_kernel
+#else
+    const bool xp = false;
+#endif
+    for (int delta = 1, j = 0; delta < EXPERT_PARALLELISM && !xp; ++delta) {
       int i = (device_index + delta) % EXPERT_PARALLELISM;
       GPUWorker *peer_worker = &workers[i];
       int peer_device_index = peer_worker->device_index;
@@ -6850,14 +7794,14 @@ int *getp_forward_120b(Transformer * /*transformer*/,
       HIP_CHECK(hipEventRecord(events_pull[j], GETP_CS(j)));
       ++j;
     }
-    for (int delta = 1, j = 0; delta < EXPERT_PARALLELISM; ++delta) {
+    for (int delta = 1, j = 0; delta < EXPERT_PARALLELISM && !xp; ++delta) {
       int i = (device_index + delta) % EXPERT_PARALLELISM;
       if (workers[i].device_index == device_index) continue;
       HIP_CHECK(hipStreamWaitEvent(compute_stream, events_pull[j], 0));
       ++j;
     }
 #if GETP_AGSKIP
-    if (ag_on) {
+    if (ag_on && !xp) {
       for (int delta = 1; delta < EXPERT_PARALLELISM; ++delta) {
         const int pd = workers[(device_index + delta) % EXPERT_PARALLELISM].device_index;
         if (pd == device_index) continue;
@@ -7008,6 +7952,9 @@ int *getp_forward_120b(Transformer * /*transformer*/,
     const int gp_bf16 = 0;
 #endif
     (void)gp_bf16;
+#if GETP_GP_OWN_LAST && GETP_DEVSYNC
+    const bool gp_own_last = !ag_on && EXPERT_PARALLELISM == 2;
+#endif
 #if GETP_GPSLICE
     // The rank that pulls from us first is D-1, and it wants its own slice. Emit that slice
     // separately first and fire an early event, so the pull chain need not wait for all 6144 tokens.
@@ -7032,6 +7979,16 @@ int *getp_forward_120b(Transformer * /*transformer*/,
                              (EXPERT_PARALLELISM - gp_first - 1) * BATCH_SIZE, gp_bf16);
     } else
 #endif
+#if GETP_GP_OWN_LAST && GETP_DEVSYNC
+    // EP = 2: only the peer's slice here; our own rows follow the sync point below.
+    if (gp_own_last)
+      moe_gather_pairs_acc(eagg_out, dev_x, own_slice * BATCH_SIZE,
+                           own_slice * BATCH_SIZE + BATCH_SIZE, ext->z_partial, ext->pair_pos,
+                           hidden_dim, p->experts_per_token, EXPERT_PARALLELISM * BATCH_SIZE,
+                           compute_stream, gp_rank, (1 - own_slice) * BATCH_SIZE, BATCH_SIZE,
+                           gp_bf16);
+    else
+#endif
     moe_gather_pairs_acc(eagg_out, dev_x,
                          own_slice * BATCH_SIZE,
                          own_slice * BATCH_SIZE + BATCH_SIZE,
@@ -7053,6 +8010,15 @@ int *getp_forward_120b(Transformer * /*transformer*/,
 #if GETP_DEVSYNC
     sync_workers_dev(compute_stream, memory_stream, sync_point, device_index,
                      EXPERT_PARALLELISM, base_device_index, 2 * (int)l + 1);
+#if GETP_GP_OWN_LAST
+    // Our own rows, into dev_x, while the peer pulls its slice. vecadd below comes after them on
+    // compute_stream.
+    if (gp_own_last)
+      moe_gather_pairs_acc(eagg_out, dev_x, own_slice * BATCH_SIZE,
+                           own_slice * BATCH_SIZE + BATCH_SIZE, ext->z_partial, ext->pair_pos,
+                           hidden_dim, p->experts_per_token, EXPERT_PARALLELISM * BATCH_SIZE,
+                           compute_stream, gp_rank, own_slice * BATCH_SIZE, BATCH_SIZE, gp_bf16);
+#endif
 #else
     sync_workers(compute_stream, sync_point);
 #endif
@@ -7069,12 +8035,36 @@ int *getp_forward_120b(Transformer * /*transformer*/,
       HIP_CHECK(hipMemcpy(rs_hcnt, rr_cnt, sizeof(int) * EXPERT_PARALLELISM,
                           hipMemcpyDeviceToHost));
 #if GETP_EVAGG
-    if (ag_on)
+    if (ag_on && !xp)
       for (int q = 0; q < EXPERT_PARALLELISM; ++q) rs_hcnt[q] = g_ag_cnt[own_slice][q];
 #endif
 #endif
+#if GETP_XPULL
+    if (xp) {
+      // Wait for each peer's gather, then add every peer's partial sums in the old delta order.
+      static thread_local int *xp_order = nullptr;
+      int horder[MAXIMUM_GPU], np = 0;
+      XPeers pp = {};
+      for (int delta = 1; delta < EXPERT_PARALLELISM; ++delta) {
+        const int pd = workers[(device_index + delta) % EXPERT_PARALLELISM].device_index;
+        if (pd == device_index) continue;
+        const int ps = pd - base_device_index;
+        horder[np++] = ps;
+        RunStateExt *pe = ext_get(pd);
+        pp.e[ps] = reinterpret_cast<const __hip_bfloat16 *>((l & 1) ? pe->ext_e_agg2 : pe->ext_e_agg);
+        HIP_CHECK(hipStreamWaitEvent(compute_stream, g_ev_eagg[pd][ev_k], 0));
+      }
+      if (xp_order == nullptr) {
+        HIP_CHECK(hipMalloc(&xp_order, sizeof(int) * MAXIMUM_GPU));
+        HIP_CHECK(hipMemcpy(xp_order, horder, sizeof(int) * np, hipMemcpyHostToDevice));
+      }
+      xpull_rs_kernel<<<dim3((unsigned)((hidden_dim / 8 + 127) / 128), (unsigned)BATCH_SIZE), 128, 0,
+                        compute_stream>>>(dev_x, pp, rr_rank, xp_order, np, own_slice, BATCH_SIZE,
+                                          hidden_dim);
+    }
+#endif
 
-    for (int delta = 1, j = 0; delta < EXPERT_PARALLELISM; ++delta) {
+    for (int delta = 1, j = 0; delta < EXPERT_PARALLELISM && !xp; ++delta) {
       int i = (device_index + delta) % EXPERT_PARALLELISM;
       GPUWorker *peer_worker = &workers[i];
       int peer_device_index = peer_worker->device_index;
@@ -7126,7 +8116,7 @@ int *getp_forward_120b(Transformer * /*transformer*/,
         ++j;
       }
     }
-    for (int delta = 1, j = 0; delta < EXPERT_PARALLELISM; ++delta) {
+    for (int delta = 1, j = 0; delta < EXPERT_PARALLELISM && !xp; ++delta) {
       int i = (device_index + delta) % EXPERT_PARALLELISM;
       GPUWorker *peer_worker = &workers[i];
       int peer_device_index = peer_worker->device_index;
@@ -7239,14 +8229,19 @@ int *getp_forward_20b(Transformer * /*transformer*/,
                             (size_t)(is_even ? idx_half : even_layers + idx_half) *
                                 GETP_KV_LAYER_PAD(BATCH_SIZE, kv_dim);
 
-    __hip_bfloat16 *key_cache =
-        reinterpret_cast<__hip_bfloat16 *>(dev_s->key_cache);
-    __hip_bfloat16 *value_cache =
-        reinterpret_cast<__hip_bfloat16 *>(dev_s->value_cache);
-    __hip_bfloat16 *k_slot =
-        key_cache + base_off + GETP_KV_OFF(tslot, 0, 0, BATCH_SIZE, kv_dim, cache_tcap);
-    __hip_bfloat16 *v_slot =
-        value_cache + base_off + GETP_KV_OFF(tslot, 0, 0, BATCH_SIZE, kv_dim, cache_tcap);
+    const size_t slot_off = base_off + GETP_KV_OFF(tslot, 0, 0, BATCH_SIZE, kv_dim, cache_tcap);
+    __hip_bfloat16 *k_slot = GETP_KV_PTR_K(dev_s->key_cache, slot_off);
+    __hip_bfloat16 *v_slot = GETP_KV_PTR_V(dev_s->value_cache, slot_off);
+    float *k_slot_scale = nullptr, *v_slot_scale = nullptr;
+    const float *k_layer_scale = nullptr, *v_layer_scale = nullptr;
+#if GETP_KV8_K
+    k_slot_scale = getp_kv8_scales(dev_s->key_cache, p, BATCH_SIZE) + GETP_KV_SIDX(slot_off);
+    k_layer_scale = getp_kv8_scales(dev_s->key_cache, p, BATCH_SIZE) + GETP_KV_SIDX(base_off);
+#endif
+#if GETP_KV8_V
+    v_slot_scale = getp_kv8_scales(dev_s->value_cache, p, BATCH_SIZE) + GETP_KV_SIDX(slot_off);
+    v_layer_scale = getp_kv8_scales(dev_s->value_cache, p, BATCH_SIZE) + GETP_KV_SIDX(base_off);
+#endif
 
     // float *k_step = dev_s->qkv;
     // float *v_step = dev_s->qkv + (size_t)BATCH_SIZE * (size_t)kv_dim;
@@ -7272,7 +8267,7 @@ int *getp_forward_20b(Transformer * /*transformer*/,
                                dev_w_qkv, dev_b_qkv, hidden_dim, head_dim,
                                p->n_attn_heads, p->n_kv_heads, batch_size,
                                nullptr, dev_cos_vals, dev_sin_vals,
-                               k_slot, v_slot, cache_tcap);
+                               k_slot, v_slot, cache_tcap, k_slot_scale, v_slot_scale);
 #if !GETP_ROPE_FUSED_KV
     kv_store_pair_fp32_to_bf16(k_slot, v_slot, k_step, v_step,
                                batch_size * kv_dim, nullptr);
@@ -7293,8 +8288,8 @@ int *getp_forward_20b(Transformer * /*transformer*/,
 #endif
 
     {
-      const __hip_bfloat16 *k_layer = key_cache + base_off;
-      const __hip_bfloat16 *v_layer = value_cache + base_off;
+      const __hip_bfloat16 *k_layer = GETP_KV_PTR_K(dev_s->key_cache, base_off);
+      const __hip_bfloat16 *v_layer = GETP_KV_PTR_V(dev_s->value_cache, base_off);
       const float *q_ptr = dev_s->q;
       const float *attn_sinks_layer =
           dev_w->attn_sinks + (size_t)l * p->n_attn_heads;
@@ -7302,7 +8297,7 @@ int *getp_forward_20b(Transformer * /*transformer*/,
           ext->attn_o_bf16, dev_s->tb,
           k_layer, v_layer, q_ptr, ext->mask_on, attn_sinks_layer, head_dim,
           p->n_attn_heads, p->n_kv_heads, pos, p->seq_len, p->sliding_window,
-          (int)l, batch_size, cache_tcap, nullptr);
+          (int)l, batch_size, cache_tcap, nullptr, k_layer_scale, v_layer_scale);
     }
 
     __hip_bfloat16 *dev_w_o =

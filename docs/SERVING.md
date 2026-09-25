@@ -256,7 +256,9 @@ const size_t total_t = (size_t)even_layers * (size_t)even_tcap +
   slots and index them as a ring, `tslot = pos % cache_tcap`. Nothing older than 128 positions is
   ever read, so nothing older is stored.
 - **Odd layers** are nominally full attention, but get `seq_len / 2` slots rather than `seq_len`.
-- Both are stored in bf16, not fp32.
+- Both are stored in bf16-sized buffers, not fp32. By default V's buffer holds int8 codes plus one
+  fp32 scale per 64-element vector (`GETP_KV8_V`, see [KERNELS.md](KERNELS.md)): that halves the bytes
+  attention reads, not the allocation, so the sizes below hold either way.
 
 The kernel matches the caps honestly rather than reading stale ring entries: the single attention
 template `flash_attn_decode_mfma16_kernel` picks its start from its compile-time `APPLY_MASK`
@@ -292,11 +294,12 @@ Weights are the other resident cost, and they are comfortably accounted for:
 | 20B   | 3.60 GB    | 19.12 GB                  | 22.7 GB          |
 | 120B  | 4.26 GB    | 28.68 GB                  | 32.9 GB          |
 
-Put the two tables together and the shipped constants do not fit the shipped `config.json`. With
-`max_seq_len = 2048` from [`tools/model_export/gpt-oss-20b/config.json`](../tools/model_export/gpt-oss-20b/config.json),
-the 20B configuration needs 43.5 + 22.7 ≈ 66 GB per device, more than a 64 GB MI250 GCD holds. The
-constants only fit a checkpoint exported with a smaller `max_seq_len`; at 1024 the total is about
-47 GB.
+Put the two tables together with `max_seq_len = 2048` from
+[`tools/model_export/gpt-oss-20b/config.json`](../tools/model_export/gpt-oss-20b/config.json) and the
+20B configuration needs 43.5 GB of KV cache, 0.9 GB of region pads (see [KERNELS.md](KERNELS.md)) and
+22.7 GB of weights, about 67 GB, against the 68.7 GB (64 GiB) of an MI250 GCD. With the per-row state
+below and the MoE buffers, a running 20B process occupies 68.4 of those 68.7 GB: it fits, with almost
+nothing to spare.
 
 Nothing in the code checks in advance — there is no memory probe and no capacity assert. What does
 happen is an abort. Three different `HIP_CHECK` macros are defined in this tree, and because it is
@@ -317,22 +320,23 @@ at position 512 — inside the measured run, not beyond it, and with no warning.
 `max_seq_len` is a batch-size knob and an attention-window knob at the same time, and the two pull in
 opposite directions: it must be at least twice the number of steps you intend to run for the odd
 layers to be exact, and small enough that `seq_len/2` slots per odd layer still fit alongside the
-weights. At `BATCH_SIZE = 1536` on a 64 GB GCD those two constraints do not both hold for a
-1024-step run; something has to give, and the honest levers are `BATCH_SIZE` and the step count.
+weights. At `BATCH_SIZE = 1536` and 1024 steps the shipped 2048 is the only value that meets both: it
+is exactly twice the step count, and there is no memory left for more. Running longer means giving up
+`BATCH_SIZE` or accepting a truncated window.
 
-The layout is `[layer][t][batch][kv_dim]` — batch-major _inside_ a time slot (the
-`layer_toff` / `tslot` / `base_off` arithmetic at the head of each layer in `getp_forward_120b`,
-[`forward.hip`](../src/hip/forward.hip)). That ordering exists for the write side: every
-step writes one slot for all 1536 rows at once, and batch-major makes that write fully coalesced.
-The read side pays for it with a strided gather, which the flash-decode kernel absorbs by staging
-16 positions at a time — the kernel's own `TILE`, the M = N = K of its MFMA — into shared memory,
-one thread block per (`n_kv_heads = 8`, batch row) pair (`flash_attn_decode_mfma16_kernel`, launched
-over `dim3 grid(n_kv_heads, batch_size)` in `getp_flash_attn_decode_bf16`,
-[`forward.hip`](../src/hip/forward.hip)).
+Inside a layer the layout is head-major, `[batch][kv_head][t][64]` with every (request, KV head)
+region padded (`GETP_KV_HEADMAJOR`, `GETP_KV_PAD`, `GETP_KV_OFF`; the `base_off` / `slot_off` arithmetic
+at the head of each layer in `getp_forward_120b`, [`forward.hip`](../src/hip/forward.hip)). That
+ordering serves the read side: the flash-decode kernel stages 16 positions at a time — the kernel's own
+`TILE`, the M = N = K of its MFMA — and in this layout a 16-key tile is one contiguous block, one thread
+block per (`n_kv_heads = 8`, batch row) pair (`flash_attn_decode_mfma16_kernel`, launched over
+`dim3 grid(n_kv_heads, batch_size)` in `getp_flash_attn_decode_bf16`). The write side pays with a
+scattered store of one slot per region, about 20 µs per layer on the 20B. The older time-major layout,
+`[t][batch][kv_dim]`, had it the other way round; [KERNELS.md](KERNELS.md) has the measurements.
 
 At the shipped 20B settings the marginal cost of one more sequence in the batch is about **16.1 MB**
 at `seq_len` 1024. The table row above accounts for 15.7 MB of that — it is KV only. The remaining
-0.41 MB, 2.5 % of the total, is the rest of the per-row state, and it is worth naming rather than
+0.40 MB, 2.5 % of the total, is the rest of the per-row state, and it is worth naming rather than
 waving away:
 
 - ~79 KB of `RunState` per row: `x`, `t`, `tb2` and `e_agg` at `hidden_dim` fp32, plus `tb` and `q`
@@ -346,24 +350,8 @@ waving away:
   the never-called generic collectives would have used.
 
 KV still dominates by a factor of forty, which is why the sizing argument above is the one that
-matters — but Line 349, replace "Line 349, replace "0.38 MB × 1536 rows is 0.58 GB" with "0.40 MB × 1536 rows is 0.62 GB", giving the full line:
-
-matters — but 0.40 MB × 1536 rows is 0.62 GB, which is not nothing on a device that is already
-
-Required companion edits in the same paragraph, or the doc contradicts itself:
-- Line 335: "The remaining 0.38 MB, 2.4 % of the total" -> "The remaining 0.40 MB, 2.5 % of the total"
-- Line 340: "- ~265 KB of `RunStateExt` per row." -> "- ~288 KB of `RunStateExt` per row."
-- Line 341: citation "[`src/getp/state_ext.cpp:20-75`](../src/getp/state_ext.cpp)" -> "[`src/getp/state_ext.cpp:20-95`](../src/getp/state_ext.cpp)" so the range covers the `expert_parallelism > 1` block that holds ext_t, ext_e_agg, ext_e_agg2 and peer_e_agg.
-Line 333's 16.1 MB is unchanged (15.7 + 0.40 = 16.1)." with "0.40 MB × 1536 rows is 0.62 GB", giving the full line:
-
-matters — but 0.40 MB × 1536 rows is 0.62 GB, which is not nothing on a device that is already
-
-Required companion edits in the same paragraph, or the doc contradicts itself:
-- Line 335: "The remaining 0.41 MB, 2.5 % of the total" -> "The remaining 0.40 MB, 2.5 % of the total"
-- Line 340: "- ~288 KB of `RunStateExt` per row." -> "- ~288 KB of `RunStateExt` per row."
-- Line 341: citation "[`src/getp/state_ext.cpp:20-75`](../src/getp/state_ext.cpp)" -> "[`src/getp/state_ext.cpp:20-95`](../src/getp/state_ext.cpp)" so the range covers the `expert_parallelism > 1` block that holds ext_t, ext_e_agg, ext_e_agg2 and peer_e_agg.
-Line 333's 16.1 MB is unchanged (15.7 + 0.40 = 16.1)., which is not nothing on a device that is already
-2 GB over budget at `seq_len` 2048.
+matters — but 0.40 MB × 1536 rows is 0.62 GB, which is not nothing on a device with under 2 GB to spare
+at `seq_len` 2048.
 
 ## Warm-up: where the 23 s and 176 s go
 
@@ -703,7 +691,7 @@ that would break first on a workload with a wide output-length distribution.
 Collected in one place, in rough order of how likely they are to bite:
 
 - **No continuous batching.** A finished row holds its slot, its KV cache and its share of every
-  dense GEMM until the whole group stops.
+  dense GEMM until the whole group stops; only attention and the expert GEMMs skip it.
 - **Fixed request counts.** `num_reqs` must be `n_devices × BATCH_SIZE`: 12288 for the 20B model on
   8 GPUs, a multiple of 6144 for the 120B model on 8 GPUs. _Every_ input file in the repository
   fails this; `run.sh`'s own `getp` example builds one with `mkinput` instead of using them. See
@@ -716,9 +704,8 @@ Collected in one place, in rough order of how likely they are to bite:
 - **KV cache versus `max_seq_len`.** The cache is sized per device as
   `(12 × 128 + 12 × max_seq_len/2)` time slots × 2 KiB per slot per request × `BATCH_SIZE`, the even
   layers being pinned to the 128-key window and the odd ones to `max_seq_len/2`. At the shipped 2048
-  that is about 43 GB on top of the weights, which does not fit in 64 GB; the largest export that
-  does is somewhere under 2048 rather than at any round number, so work it out for your own build
-  rather than trusting a single figure. Note also that lowering the export lowers the odd layers'
+  that is about 43 GB on top of the weights, and a running 20B process then occupies 68.4 of the GCD's
+  68.7 GB, so there is no room for a larger export at `BATCH_SIZE` 1536. Note also that lowering the export lowers the odd layers'
   window with it — at 1024 the window is 512, inside the default 1024-step run. Nothing checks either
   condition in advance; over-allocation shows up as a `HIP_CHECK` abort during warm-up.
 - **Warm-up is not amortised.** 23 s for the 20B model or 176 s for the 120B, spent reading the fp32
