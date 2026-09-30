@@ -103,9 +103,8 @@ bertscore_f1    0.977838
 
 Those two numbers come from the completions committed in `submission/`: `gpt-oss-20b` in `getp` mode
 on 8x AMD MI250, 12288 requests, scored over the first 4096. They clear both thresholds in
-`threshold.json` comfortably. They sit just under the METEOR 0.535 and BERTScore 0.978 in the
-[main README](../README.md) table, and that gap is a different engine rather than run-to-run noise --
-see the note under the 120B block.
+`threshold.json` comfortably. They are not the scores in the [main README](../README.md) table, which
+come from the current engine -- see the note under the 120B block.
 
 ```bash
 120b
@@ -117,45 +116,54 @@ bertscore_f1    0.98164
 ```
 
 Both models' completions in `submission/` come from runs on 8x AMD MI250, scored over the first 4096
-of 12288 (20B) and 6144 (120B) requests -- on the pre-rewrite build that ran at 33,979 and 13,149
-tok/s, not the current one, which scores METEOR 0.535 / BERTScore 0.978 on 20B and 0.561 / 0.981 on
-120B. Reproducing the table's last two columns therefore means re-running `getp` on this commit and
-re-scoring, not scoring the files committed here.
+of 12288 (20B) and 6144 (120B) requests -- on this engine's first complete version, which ran at
+33,979 and 13,149 tok/s, not the current one. The current one scores METEOR 0.516 / BERTScore 0.977
+on 20B and 0.548 / 0.980 on 120B at its largest batches, and 0.520 / 0.978 and 0.547 / 0.980 on
+`input.txt` as it is. Reproducing the table's last two columns therefore means re-running `getp` on
+this commit and re-scoring, not scoring the files committed here.
 
 **Expected runtime:** \~4 minutes for 4096 samples on 2 GPUs (your hardware and load may vary).
 
 ## Scoring your own run
 
-`getp` sizes its input off `n_devices x BATCH_SIZE` -- 1536 per GPU for 20B, 768 for 120B. The 20B
-path requires exactly that count; the 120B path walks the file in chunks, so it accepts any multiple.
-Meanwhile
-the reference files here hold 4096 completions. The two line up if you build the input by repeating
-`input.txt` and then score only the first 4096 outputs. On eight GPUs that is 12288 = 3 x 4096:
+`getp` takes the rows per GPU from the request count, `num_reqs / n_devices`, up to 1984 for 20B and
+1024 for 120B (see the [main README](../README.md)). The reference files here hold 4096 completions,
+one per prompt of `input.txt`, and `input.txt` is itself a valid input: on eight GPUs it runs at 512
+rows per GPU, and its output lines up one-for-one with the references:
 
 ```bash
-python3 ../tools/make_getp_input.py -m 20b -g 8 -s input.txt -o /tmp/input_12288.txt
-../run ../gpt-oss-20b.bin -m getp -i /tmp/input_12288.txt -o /tmp/out.txt -z ../tokenizer.bin
+../run ../gpt-oss-20b.bin -m getp -i input.txt -o /tmp/out.txt -z ../tokenizer.bin
+python eval.py -m 20b -s /tmp/out.txt
+```
+
+512 rows is a quality check, not the batch the throughput figures run at. To score the largest batch,
+repeat `input.txt` up to the largest count and score the first 4096 outputs; on eight GPUs that is
+15872 requests for 20B:
+
+```bash
+python3 ../tools/make_getp_input.py -m 20b -g 8 -s input.txt -o /tmp/input_15872.txt
+../run ../gpt-oss-20b.bin -m getp -i /tmp/input_15872.txt -o /tmp/out.txt -z ../tokenizer.bin
 head -4096 /tmp/out.txt > /tmp/submission.txt
 python eval.py -m 20b -s /tmp/submission.txt
 ```
 
 Completions are written in request order, so output line _i_ is the answer to prompt _i_.
 
-The engine is reproducible, bar the rare 20B case below: two runs of the same binary on the same
-input file produce identical output, and that is how changes are validated here -- the 20B against output hash 720709b86d36 and
-the 120B against eaf474501c3c, both with zero differing lines. (The 120B's hash has changed twice by
-design: efe1096ff64c became 18a57667bd03 when the expert-output exchange moved to bf16, and
-eaf474501c3c when experts started moving between GPUs to balance the load. Those two changes were
-accepted on their METEOR and BERTScore.) Hashing the output, not METEOR or
+The engine is reproducible: two runs of the same binary on the same input file produce identical
+output, and that is how changes are validated here -- the 20B against output hash 81e82a2c077f and
+the 120B against 5ab5041b86f2 on the standard inputs, both with zero differing lines. (Both hashes
+have changed by design along the way, each time a change that moves the numbers was accepted on its
+METEOR and BERTScore instead; the main README marks those rows.) Hashing the output, not METEOR or
 BERTScore, is therefore the gate for any change that is supposed to move no numbers; the scores are
 the coarse backstop, too noisy to accept or reject a sub-percent change.
 
 It was not always so. Before the expert exchange became a pull, a receiver could read a peer's buffer
 while it was still being written, and two 8-GPU runs of the same binary agreed on only 50 % to
-95 % of output lines, run pair by run pair. The 20B still has a rare exception: of its last twelve
-full-length runs one differed in 7 of 12,288 lines, all of them requests served by one GPU, and the
-same binary then gave the usual hash three times running - a leftover ordering race, not a change
-in the numbers (see the main README).
+95 % of output lines, run pair by run pair. The 20B kept a rarer exception for longer: about one
+full-length run in twelve differed in a few hundred lines of one GPU or one pair, more often under
+host load. A copy engine wrote the partner's expert output to HBM behind the L2, and the add kernel
+read stale lines; the pairs now exchange through kernels that read the peer's memory directly, and
+six runs under the same load are identical (see the main README).
 
 What the engine is still not is position-invariant: a completion depends on where its prompt sits in
 the batch. The same prompt at a different batch index takes a different numerical path through the

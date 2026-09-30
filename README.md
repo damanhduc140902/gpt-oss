@@ -22,9 +22,11 @@ both models on AMD GPUs in **plain C++ and HIP, with no external libraries at al
 hipBLAS, no RCCL, no MPI. Every kernel, every collective and the tokenizer are written from scratch in
 this repository. The only dependency is the HIP runtime itself.
 
-It began from [llama2.c](https://github.com/karpathy/llama2.c) and grew into a complete inference system.
-On a single node of 8 AMD MI250 GPUs it serves **84,450 tokens per second on the 20B model and 40,270 on
-the 120B model**, while keeping the generated text faithful to a CPU reference.
+The command-line program around it — its options, sampler and chat loop — follows
+[llama2.c](https://github.com/karpathy/llama2.c); the inference engine, everything that runs on the
+GPUs, was written here from scratch. On a single node of 8 AMD MI250 GPUs it serves **84,451 tokens
+per second on the 20B model and 40,271 on the 120B model**, while keeping the generated text faithful
+to a CPU reference.
 
 Two things are measured, and both have to hold:
 
@@ -239,11 +241,13 @@ Both inputs are the largest that fit, 1984 and 1024 rows per GPU (see [Run a bat
 The standard inputs of the earlier results, 12,288 and 6,144 requests at 1536 and 768 rows, run at
 82,013 and 37,216 tok/s.
 
-Where those numbers came from, one optimisation at a time on the 20B model:
+How the engine got there. The first row is its first complete version, already written from scratch
+like everything in this repository, and every row after it is one optimisation of that same code, on
+the 20B model:
 
 |                                                                        | Throughput | Change |
 | ---------------------------------------------------------------------- | ---------: | -----: |
-| Starting point                                                         |      33979 |      — |
+| First complete version of this engine                                  |      33979 |      — |
 | GEMM tile tuning and per-tile attention softmax                        |      42540 | +25.2% |
 | Attention rewritten on `mfma_f32_16x16x16bf16_1k`                      |      50464 | +18.6% |
 | LDS tiles stored k-contiguous in all five GEMMs                        |      56434 | +11.8% |
@@ -270,9 +274,9 @@ Where those numbers came from, one optimisation at a time on the 20B model:
 | Rows per GPU taken from the request count: 1984 on the largest input ∥ |      83305 |  +1.4% |
 | Router split of 6 or 7 rounded up to 8, so the largest batch keeps the fused router ∥ |  **84451** |  +1.2% |
 
-The 120B model reached 20,426 tok/s on that same work without a single change written for it: it runs
-the same kernels with the same defaults. Past that point it needed its own work, because its bottleneck
-is not the same one:
+The 120B model's first version ran at 13,149 tok/s, and the 20B work above took it to 20,426 without
+a single change written for it: it runs the same kernels with the same defaults. Past that point it
+needed its own work, because its bottleneck is not the same one:
 
 |                                                                        | Throughput | Change |
 | ---------------------------------------------------------------------- | ---------: | -----: |
@@ -455,14 +459,16 @@ Warm-up is dominated by reading the checkpoint off disk, so it depends on whethe
 the page cache; it is not part of what the optimisation work changed.
 
 Throughput is aggregate across all eight GPUs, not single-stream latency. The quality gates are METEOR
-0.3 and BERTScore 0.9, and both models clear them by a wide margin. The inexact rows cost the 20B
-0.022 of METEOR and the 120B 0.004, measured against the reference completions.
+0.3 and BERTScore 0.9, and both models clear them by a wide margin. The inexact rows, and the output
+changes that come with a larger batch, cost the 20B 0.019 of METEOR (0.535 while every change was
+still exact, 0.516 now) and the 120B 0.013 (0.561 to 0.548), measured against the reference
+completions.
 
-Every figure in that table comes from one run each. The completions committed in
-[`tests/submission/`](tests/submission/) are from the starting point of that table, before any of the
+The METEOR and BERTScore in the results table come from one run each, the throughput from the mean
+of two. The completions committed in
+[`tests/submission/`](tests/submission/) are from the first version in that table, before any of the
 optimisations in it, so they are not the ones those scores were computed from — but they can still be
-scored without a GPU: `./run.sh eval 20b` reports METEOR 0.533 and BERTScore 0.978 on them, a hair
-under the table's METEOR and the same BERTScore.
+scored without a GPU: `./run.sh eval 20b` reports METEOR 0.533 and BERTScore 0.978 on them.
 
 Repeating a run still moves throughput - by about 1 % between sessions, less within one: the two runs behind each figure spread over 0.3 % on the 20B and 0.14 % on the 120B - but it very rarely moves the completions.
 That was not always true: before the expert exchange was made pull-based, a receiver could read a peer's
