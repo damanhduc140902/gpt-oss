@@ -22,17 +22,17 @@ ${B}gpt-oss on AMD GPUs${R} ${DIM}- pure C++ and HIP inference, no external libr
 ${B}USAGE${R}
   ${GRN}./run.sh${R} ${YLW}build${R}   [fast|omp|debug|default]  compile the inference binary
   ${GRN}./run.sh${R} ${YLW}run${R}     <checkpoint> [options]    run the model
-  ${GRN}./run.sh${R} ${YLW}mkinput${R} [20b|120b] [gpus] <out>   build a correctly sized getp input file
-  ${GRN}./run.sh${R} ${YLW}decode${R}  [line] [-i <file>]        turn getp token ids back into text
-  ${GRN}./run.sh${R} ${YLW}tok${R}     "<text>"                  tokenize a string with the C tokenizer
-  ${GRN}./run.sh${R} ${YLW}eval${R}    [20b|120b]                score outputs with METEOR and BERTScore
+  ${GRN}./run.sh${R} ${YLW}mkinput${R} [20b|120b] [gpus] <out>   build a getp input file (-r <rows>, -s <prompts> pass through)
+  ${GRN}./run.sh${R} ${YLW}decode${R}  <line> [-i <file>]        turn getp token ids back into text (-1: all)
+  ${GRN}./run.sh${R} ${YLW}tok${R}     "<text>"                  tokenize a string with the C++ tokenizer
+  ${GRN}./run.sh${R} ${YLW}eval${R}    [20b|120b]                score tests/submission with METEOR and BERTScore
   ${GRN}./run.sh${R} ${YLW}clean${R}                             remove build artifacts
 
 ${B}BUILD MODES${R}
   ${YLW}fast${R}      -O3, the default and the one the benchmarks use
   ${YLW}omp${R}       -O3 with OpenMP and -march=native
-  ${YLW}debug${R}     -O0 with symbols, for gdb and valgrind
-  ${YLW}default${R}   -O0, no flags, most portable
+  ${YLW}debug${R}     symbols (-g) at hipcc's default -O3, for gdb and valgrind
+  ${YLW}default${R}   -O0 with symbols, no arch flags, most portable
 
 ${B}RUN OPTIONS${R} ${DIM}(passed straight through to ./run)${R}
   ${YLW}-m${R} <mode>    generate | chat | getp             ${DIM}default: generate${R}
@@ -60,14 +60,14 @@ ${B}EXAMPLES${R}
   ${DIM}# or 1024 (120b); mkinput writes the largest. The shipped files are small batches.${R}
   ./run.sh mkinput 20b 8 input_20b.txt  ${DIM}# 15872 requests${R}
   ./run.sh run gpt-oss-20b.bin -m getp -i input_20b.txt -o out.txt
-  ./run.sh decode -i out.txt            ${DIM}# read those completions back as text${R}
+  ./run.sh decode -1 -i out.txt         ${DIM}# read those completions back as text${R}
 
   ${DIM}# restrict to two GPUs (every visible GPU is used by default, up to 8)${R}
   ./run.sh mkinput 20b 2 input_2gpu.txt ${DIM}# 3968 requests${R}
   HIP_VISIBLE_DEVICES=0,1 ./run.sh run gpt-oss-20b.bin -m getp -i input_2gpu.txt -o out.txt
 
   ${DIM}# tokenizer sanity check${R}
-  ./run.sh tok "Hello world"           ${DIM}# -> 13225 2375${R}
+  ./run.sh tok "Hello world"            ${DIM}# -> 13225 2375${R}
 
 ${B}DOCS${R}
   docs/MODEL.md  docs/KERNELS.md  docs/PARALLELISM.md  docs/SERVING.md  tests/README.md
@@ -101,7 +101,8 @@ cmd_mkinput() {
   local model="${1:-20b}" gpus="${2:-8}" out="${3:-}"
   [ -n "$out" ] || die "mkinput needs an output file: ./run.sh mkinput 20b 8 input_20b.txt"
   case "$model" in 20b|120b) ;; *) die "unknown model '$model' (expected: 20b or 120b)" ;; esac
-  exec python3 tools/make_getp_input.py -m "$model" -g "$gpus" -o "$out"
+  shift 3
+  exec python3 tools/make_getp_input.py -m "$model" -g "$gpus" -o "$out" "$@"
 }
 
 cmd_decode() {

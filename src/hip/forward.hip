@@ -35,10 +35,10 @@
 // Fold the RoPE rotation into the QKV kernel epilogue. See the long note just above the
 // epilogue: the partner at dim+head_dim/2 lands in the same lane, so no shuffle is needed.
 #ifndef GETP_ROPE_FUSED
-#define GETP_ROPE_FUSED 1   // on by default (measured end to end: -0,73 ms/step); set 0 to A/B
+#define GETP_ROPE_FUSED 1   // on by default (measured end to end: -0.73 ms/step); set 0 to A/B
 #endif
 // One step further: write the KV cache slot directly as bf16 from the epilogue and drop
-// kv_store_pair. A separate flag, because it trades store efficiency (2 bytes/lane) for 12,6 MB/layer.
+// kv_store_pair. A separate flag, because it trades store efficiency (2 bytes/lane) for 12.6 MB/layer.
 #ifndef GETP_ROPE_FUSED_KV
 #define GETP_ROPE_FUSED_KV 1   // on by default (the same rotation, applied to K); set 0 to A/B
 #endif
@@ -61,8 +61,8 @@
 // Merge the fourteen row-list launches per layer into two: one BLOCK per slice instead of one
 // LAUNCH per slice. Each of the old launches cost 8 us but sat 60 us apart, so almost all of
 // the cost was launching them in sequence rather than the work itself. Same arithmetic, only a
-// different launch count, so it is bit-exact. Measured on the 120B: 22.807 -> 23.136 tok/s
-// (+1,4 %), md5 efe1096ff64c unchanged. Set 0 to go back to one launch per slice.
+// different launch count, so it is bit-exact. Measured on the 120B: 22,807 -> 23,136 tok/s
+// (+1.4 %), md5 efe1096ff64c unchanged. Set 0 to go back to one launch per slice.
 #ifndef GETP_RS_MERGE
 #define GETP_RS_MERGE 1
 #endif
@@ -70,23 +70,25 @@
 // Sync point 2 orders the exchange with one EVENT per peer instead of a drain plus a barrier.
 // The old sequence was: GPU finishes gather_pairs -> the host wakes out of hipStreamSynchronize
 // -> eight threads meet at a barrier -> the host issues the pulls -> only then does the GPU
-// pull. That whole round trip through the host sat in a 1,57 ms gap per layer. With events the
+// pull. That whole round trip through the host sat in a 1.57 ms gap per layer. With events the
 // pulls are already queued and start the instant the peer has written. A HOST barrier stays
 // here, but WITHOUT the drain: it only guarantees that every thread has ISSUED its
 // hipEventRecord before anyone waits, since waiting on an event that has not been recorded yet
 // returns immediately. REQUIRES GETP_AGSKIP: it puts the row counts in g_ag_cnt before the sp1
 // barrier, which is what lets the blocking hipMemcpy here be deleted. That read is exactly what
-// made the older event path pick up garbage and report hipErrorInvalidValue. Sync point 1 KEEPS
-// its drain, deliberately: it is cheap (0,20 ms against 0,86 ms for sp2) and it stops two ranks
-// drifting more than one layer apart, so an event slot is never reused under a waiter. The
-// older attempt converted BOTH sync points, so the host ran arbitrarily far ahead - 15 % slower.
-// Measured on the 120B: 23.910 -> 24.341 tok/s (+1,8 %), output hash unchanged.
+// made the older event path pick up garbage and report hipErrorInvalidValue. Sync point 1 kept
+// its drain at the time, deliberately: it was cheap (0.20 ms against 0.86 ms for sp2) and it
+// stopped two ranks drifting more than one layer apart, so an event slot was never reused under a
+// waiter. The older attempt converted BOTH sync points, so the host ran arbitrarily far ahead -
+// 15 % slower. Measured on the 120B: 23,910 -> 24,341 tok/s (+1.8 %), output hash unchanged.
+// (GETP_XPULL, on by default, later replaced sync point 1's copies and its drain with kernels
+// that read the peers' memory; this event path is the one GETP_XPULL=0 keeps.)
 // Emit moe_gather_pairs one destination slice at a time, so the peer that pulls from us first
 // can start as soon as ITS slice is ready instead of waiting for all eight. Rank D pulls from
 // D+1 first, and D+1 owes it slice D, so each rank emits slice (own-1) first and records an
 // early event for it. Splitting the b range touches no arithmetic: every e_agg cell is still
 // written exactly once and each token's sum keeps its order, so this is bit-exact.
-// Measured on the 120B: 24.313 -> 24.685 tok/s (+1,5 %), output hash unchanged.
+// Measured on the 120B: 24,313 -> 24,685 tok/s (+1.5 %), output hash unchanged.
 #ifndef GETP_GPSLICE
 #define GETP_GPSLICE 1
 #endif
@@ -104,19 +106,18 @@
 
 // The all-gather sends only the rows each peer actually needs, mirroring GETP_ROWSKIP, which
 // trimmed the reduce-scatter leg alone. The old code sent all BATCH_SIZE rows to every peer,
-// 31,0 MB per layer, while each rank pair uses only 326/768 = 42,4 % of them - nothing reads
+// 31.0 MB per layer, while each rank pair uses only 326/768 = 42.4 % of them - nothing reads
 // the rest, because ext_t_bf16 is only ever fetched through the pair list (tok_idx/e_dev).
-// So dropping them is bit-exact. 31,0 -> 13,2 MB per layer. Measured on the 120B: 23.022 ->
-// 23.910 tok/s (+3,9 %), output hash unchanged. Set 0 to go back to sending every row.
+// So dropping them is bit-exact. 31.0 -> 13.2 MB per layer. Measured on the 120B: 23,022 ->
+// 23,910 tok/s (+3.9 %), output hash unchanged. Set 0 to go back to sending every row.
 // Send the reduce-scatter leg as bf16 instead of fp32. After GETP_AGSKIP the outbound leg is
 // already bf16, which left the return leg as the larger of the two purely because of its element
-// type: 26,6 MB against 13,2 MB per layer. Halving it costs no extra kernel and no extra launch.
+// type: 26.6 MB against 13.2 MB per layer. Halving it costs no extra kernel and no extra launch.
 // This is the one change here that is NOT bit-exact. The rounding applies only to what crosses
 // the wire - a rank's own slice still adds into dev_x in fp32 - and it is measured, not argued:
-// METEOR 0,5608 -> 0,5603 and BERTScore 0,9814 -> 0,9805, against thresholds of 0,3 and 0,9.
-// It is gated on rs_on, so at EXPERT_PARALLELISM = 2 the 20B path never takes it and keeps its
-// exact-output gate (720709b86d36) as a cheap check for everything else.
-// Measured on the 120B: 24.902 -> 26.011 tok/s (+4,5 %).
+// METEOR 0.5608 -> 0.5603 and BERTScore 0.9814 -> 0.9805, against thresholds of 0.3 and 0.9.
+// It is gated on rs_on, so at EXPERT_PARALLELISM = 2 the 20B path never takes it.
+// Measured on the 120B: 24,902 -> 26,011 tok/s (+4.5 %).
 #ifndef GETP_EAGG_BF16
 #define GETP_EAGG_BF16 1
 #endif
@@ -136,11 +137,11 @@
 #endif
 
 #ifndef GETP_SMALL_TOPK
-#define GETP_SMALL_TOPK 1   // on by default (measured end to end: -2,09 ms/step); set 0 to A/B
+#define GETP_SMALL_TOPK 1   // on by default (measured end to end: -2.09 ms/step); set 0 to A/B
 #endif
 #ifndef GETP_SMALL_NOSCATTER
-#define GETP_SMALL_NOSCATTER 0   // MEASURED and LOST: dropping the scatter kernel (-1,42 ms/step)
-                                 // but mlp1 has to gather rows itself, so +1,66 ms/step.
+#define GETP_SMALL_NOSCATTER 0   // MEASURED and LOST: dropping the scatter kernel (-1.42 ms/step)
+                                 // but mlp1 has to gather rows itself, so +1.66 ms/step.
 #endif
 
 #ifndef GETP_ROUTER_TOPK_MAXK
@@ -1038,10 +1039,10 @@ mlp1_swiglu_bf16_bucketed_kernel_outbf16_tuned(
 
   // --- Rows of tile A ------------------------------------------------------
   // The old code: a separate kernel copied a_in[pos][:] = ext_t_bf16[tok_idx[pos]][:]
-  // for all 6144 pairs (20b, EP=2) and then mlp1 read it back. That was 35,4 MB read + 35,4 MB
+  // for all 6144 pairs (20b, EP=2) and then mlp1 read it back. That was 35.4 MB read + 35.4 MB
   // written per layer just to reorder rows - and a_in had no consumer other than mlp1. Now mlp1
   // gathers for itself: A_in points straight at ext_t_bf16 and the row is tok_idx[pos]. One
-  // more gain: the source table is 17,7 MB instead of 35,4 MB (each token appears ONCE rather
+  // more gain: the source table is 17.7 MB instead of 35.4 MB (each token appears ONCE rather
   // than once per local expert of its own), so the 23 column blocks share L2 better.
   // This index does not depend on k, so it is computed ONCE here (nbLoadsX = 2 at BM = 128,
   // strideX8 = 64) rather than inside the k loop: it costs +2 VGPRs but
@@ -1353,8 +1354,8 @@ mlp1_swiglu_bf16_bucketed_kernel_outbf16_tuned(
     // 0x0100 = LDS read, 0x0008 = MFMA. Issue every load first, then the LDS reads, then the MFMA.
     // Earlier pinning rounds only pinned MFMA and LDS reads, so the compiler still scattered the 12
     // loads through the MFMA chain, each one dragging an s_waitcnt vmcnt with it. Measured on 8 GPUs
-    // over 1024 steps, two interleaved pairs: 64.505 / 64.512 against 64.299 / 64.248 (+0,4 %), bit-exact.
-    // The 'one LDS read every 4 MFMA' pattern was tried and was SLOWER (mlp1 1.797 against 1.688 us/call).
+    // over 1024 steps, two interleaved pairs: 64,505 / 64,512 against 64,299 / 64,248 (+0.4 %), bit-exact.
+    // The 'one LDS read every 4 MFMA' pattern was tried and was SLOWER (mlp1 1,797 against 1,688 us/call).
     __builtin_amdgcn_sched_group_barrier(0x0020, 12, 0);
     __builtin_amdgcn_sched_group_barrier(0x0100, 20, 0);
     __builtin_amdgcn_sched_group_barrier(0x0008, 64, 0);
@@ -1951,7 +1952,7 @@ mlp2_partial_bf16_bucketed_splitk_kernel_inbf16_tuned(
     // Force a schedule on this region: read substep 0's 6 fragments first, then one ds_read of
     // substep 1 every 3 MFMA, with the remaining MFMA at the end. Without it the compiler pulls
     // the ds_read right up against its use, so every following MFMA waits a full LDS latency
-    // (ISA: W M W M ...). mlp2 measured 1.272 -> 1.172 us/call (-7,9 %), bit-exact. The trailing fence keeps MFMA from sinking past the barrier.
+    // (ISA: W M W M ...). mlp2 measured 1,272 -> 1,172 us/call (-7.9 %), bit-exact. The trailing fence keeps MFMA from sinking past the barrier.
     __builtin_amdgcn_sched_group_barrier(0x0100, 6, 0);
     __builtin_amdgcn_sched_group_barrier(0x0008, 3, 0);
     __builtin_amdgcn_sched_group_barrier(0x0100, 1, 0);
@@ -2010,7 +2011,7 @@ mlp2_partial_bf16_bucketed_splitk_kernel_inbf16_tuned(
   // The old version loaded the bias and w_by_bucket INSIDE the store loop, after the per-row
   // `continue` branches: the ISA came out as 208 global_load_dword + 192 global_load_ushort +
   // 784 serial s_waitcnt, plus 192 CAS loops of the float atomicAdd for the split-K branch
-  // - 8.102 instructions running once per block, longer than the main loop itself. Here each
+  // - 8,102 instructions running once per block, longer than the main loop itself. Here each
   // lane loads its 6 biases and 16 row weights ONCE, and what is left is arithmetic and stores.
   // The arithmetic order is unchanged ((acc + bias) * w), so the result is bit-exact.
   const int xD = lane & 15;
@@ -2486,7 +2487,7 @@ __global__ void moe_gather_pairs_kernel(float *__restrict__ e_agg,
     x_resid[(size_t)(b - own_lo) * (size_t)H + row] += s;
   } else {
     // OVERWRITE, do not accumulate: every cell is written exactly once (the B x H grid covers
-    // it completely), so the 35,4 MB memset that used to precede this is no longer needed.
+    // it completely), so the 35.4 MB memset that used to precede this is no longer needed.
 #if GETP_ROWSKIP
     if (rowskip_rank != nullptr) {
       // A zero row is neither written nor sent. Non-zero rows are packed to the FRONT of their
@@ -4154,10 +4155,10 @@ static inline void getp_router_topk_softmax_batch(
   // n_experts = 32 (20b) / 128 (120b), yet the block was still 1024 threads = 16 waves.
   // Two consequences, both of them dead time:
   //   * occupancy: 16 waves/block, capped at 8 waves/SIMD -> 2 blocks/CU -> 208 blocks
-  //     resident out of 1536 -> 7,4 serial passes;
+  //     resident out of 1536 -> 7.4 serial passes;
   //   * the reduction loop runs log2(1024) = 10 stages, EACH with a __syncthreads
   //     of 16 waves, repeated K = 4 times -> roughly 44 heavy barriers per block.
-  // Measured at 2,5 ms/step for 250 KB of traffic (a floor of 0,2 us): almost all of it is
+  // Measured at 2.5 ms/step for 250 KB of traffic (a floor of 0.2 us): almost all of it is
   // barriers and serialised execution, not memory.
   //
   // WHY IT IS BIT-EXACT to shrink the block to BLK = 2^ceil(log2(n_experts)) >= 64:
@@ -5804,8 +5805,8 @@ static inline void getp_matmul_router_bf16(float *xout, float *x, __hip_bfloat16
 // The macro tile below is used only with GETP_ATTN_O_AUTO_TILE=0. By default the launcher picks
 // between BN 128 / WN 64 and BN 64 / WN 32 at run time, because no single tile suits both models:
 // the grid is (N/BN, BATCH_SIZE/BM) and the two models run different batch sizes. Measured, paired:
-//   120B (BATCH_SIZE 768):  BN 128 -> 64  +0,6 %    (138 workgroups -> 270)
-//   20B  (BATCH_SIZE 1536): BN 128 -> 64  -2,7 %    (276 workgroups -> 540)
+//   120B (BATCH_SIZE 768):  BN 128 -> 64  +0.6 %    (138 workgroups -> 270)
+//   20B  (BATCH_SIZE 1536): BN 128 -> 64  -2.7 %    (276 workgroups -> 540)
 // At BN 128 the kernel runs at 3 waves/SIMD, i.e. 3 workgroups per CU, 312 slots on 104 CUs, so the
 // 120B fills 44 % of the machine and the 20B 88 %. The rule is to halve the tile when the wide one
 // would fill less than half the resident slots; see getp_matmul_attn_o_bf16_acc.
@@ -6327,7 +6328,7 @@ static inline void getp_matmul_attn_o_bf16(
 }
 
 // As above but ADDS into xout (the fp32 residual) instead of overwriting. Removes the tb2
-// tensor entirely: one 17,7 MB write and one 17,7 MB read per layer.
+// tensor entirely: one 17.7 MB write and one 17.7 MB read per layer.
 static inline void getp_matmul_attn_o_bf16_acc(
     float *x_resid, const __hip_bfloat16 *x_bf16,
     const __hip_bfloat16 *w, const __hip_bfloat16 *b,
@@ -6448,7 +6449,7 @@ __global__ void extract_argmax_pairs(const unsigned long long* pairs, int* out, 
 #endif
 #ifndef GETP_LOGITS_SWZ_G
 // A group's X working set is G x BM x K x (4 or 2) bytes, and the best G is the one that keeps
-// it inside the 8 MB L2. With fp32 X (1,47 MB/tile) the peak is at G=2; with bf16 X (737 KB/tile) it moves to G=6.
+// it inside the 8 MB L2. With fp32 X (1.47 MB/tile) the peak is at G=2; with bf16 X (737 KB/tile) it moves to G=6.
 //   X fp32:  G=2 20.783 | G=3 21.071 | G=4 21.455 | G=6 22.467   (control 21.521)
 //   X bf16:  G=0 18.125 | G=2 15.903 | G=3 15.487 | G=4 15.312 | G=6 15.178 | G=12 15.182
 #define GETP_LOGITS_SWZ_G 6
@@ -6517,7 +6518,7 @@ __global__ void extract_argmax_pairs(const unsigned long long* pairs, int* out, 
 // The argmax epilogue reduces in registers before touching LDS (see GETP_LOGITS_EPI).
 // 0 = the old path, bit-identical. Enable with -DGETP_LOGITS_EPI=1.
 #ifndef GETP_LOGITS_EPI
-#define GETP_LOGITS_EPI 1   // on by default (measured end to end: -0,35 ms/step); set 0 to A/B
+#define GETP_LOGITS_EPI 1   // on by default (measured end to end: -0.35 ms/step); set 0 to A/B
 #endif
 
 // A single source of truth for the logits tile geometry.
@@ -7069,8 +7070,9 @@ struct XPeers {
   const float *tv[MAXIMUM_GPU];           // peer's ext_topk_v
   const __hip_bfloat16 *e[MAXIMUM_GPU];   // peer's e_agg of this layer's parity, bf16 [EP][B][H]
 };
-// All-gather: block (slice j, i) copies row i of peer j's list for us from peer j's own slice into
-// ours; blocks with i >= that count also copy a chunk of peer j's top-k (ids and weights).
+// All-gather: block (slice j, i) copies row i of peer j's list for us, when i is below that list's
+// count, from peer j's own slice into ours; the first B*K/256 blocks of each slice also copy a
+// chunk of peer j's top-k (ids and weights).
 __global__ __launch_bounds__(256) void xpull_ag_kernel(__hip_bfloat16 *__restrict__ t,
                                                        int *__restrict__ ti, float *__restrict__ tv,
                                                        XPeers pp, int own, int B, int H, int K) {
@@ -7144,8 +7146,8 @@ static inline void sync_workers_dev(hipStream_t rec_stream, hipStream_t wait_str
     sync_point.wait();          // every device has created its events
   }
   // Only take the event path when there are FEW peers. Measured on 8 GPUs over 1024 steps: at
-  // EXPERT_PARALLELISM = 2 (20b) it is 0,7 % faster (63.788 -> 64.361); at EXPERT_PARALLELISM =
-  // 8 (120b) it is 15 % SLOWER (20.003 -> 16.931), because each sync point queues 7
+  // EXPERT_PARALLELISM = 2 (20b) it is 0.7 % faster (63,788 -> 64,361); at EXPERT_PARALLELISM =
+  // 8 (120b) it is 15 % SLOWER (20,003 -> 16,931), because each sync point queues 7
   // hipStreamWaitEvent on memory_stream and, with the host no longer throttling, that queue
   // grows deeper and deeper. With many peers the throttle is the cheaper option.
   if (n_dev > 2) {
@@ -7482,7 +7484,8 @@ int *getp_forward_120b(Transformer * /*transformer*/,
   // working on contiguous ranges. The WINDOW steps before each move count each slot's padded tiles; at
   // the start of a move step every rank agrees on the same swaps (eplb_plan), pulls the experts it receives into a
   // staging buffer, waits until every rank has done the same, copies them into the vacated slots,
-  // and installs the new labels. Only at EP > 2 (rs_on); the table stays the identity otherwise.
+  // and installs the new labels. Only at EXPERT_PARALLELISM >= GETP_EPLB_MIN_EP (2: both models);
+  // the table stays the identity otherwise.
   const int eplb_epd = worker->expert_end - worker->expert_start;
   // Per worker SLOT, not per thread: the 120B starts fresh threads for every wave of requests,
   // and a new thread must keep using the labels that match the weights already moved.
@@ -7997,7 +8000,7 @@ int *getp_forward_120b(Transformer * /*transformer*/,
       hidden_dim, compute_stream);
 #endif
 
-  // (the 35,4 MB memset is gone: moe_gather_pairs now overwrites this whole region)
+  // (the 35.4 MB memset is gone: moe_gather_pairs now overwrites this whole region)
 
   __hip_bfloat16 *w1_base = dev_w->w_mlp1 + 1ll * l * experts_per_device * 2 * p->intermediate_dim * hidden_dim;
   __hip_bfloat16 *b1_base = dev_w->b_mlp1 + 1ll * l * experts_per_device * 2 * p->intermediate_dim;
@@ -8009,7 +8012,7 @@ int *getp_forward_120b(Transformer * /*transformer*/,
   // The copy kernel (just removed) read this same memory, at this same point.
   //
   // WAR - this is where the real change is, and it is NOT obvious: mlp1 reads ext_t_bf16 far
-  // later than the copy kernel did (49 ms later, rather than 1,4 ms), while LAYER l+1's pull
+  // later than the copy kernel did (49 ms later, rather than 1.4 ms), while LAYER l+1's pull
   // OVERWRITES the peer slices of this same buffer, on memory_stream - and memory_stream never
   // waits on our compute_stream (sync_workers_dev only waits on the PEERS' events). Safety
   // comes from a transitive chain
@@ -8054,10 +8057,10 @@ int *getp_forward_120b(Transformer * /*transformer*/,
       hidden_dim, experts_per_device, total_blocks_mlp2, compute_stream);
 
     // The own_slice slice goes straight into dev_x; the other slices still go to ext_e_agg
-    // because peers will pull them. That removes one vecadd entirely (17,7 MB read + 17,7 MB written).
+    // because peers will pull them. That removes one vecadd entirely (17.7 MB read + 17.7 MB written).
     // The two buffers alternate by layer parity - see the note on RunStateExt::ext_e_agg2.
-    // Measured on 8 GPUs over 1024 steps: the same binary run twice self-matched on 49,5 % of
-    // lines with one buffer and 89,8 % with two; throughput unchanged.
+    // Measured on 8 GPUs over 1024 steps: the same binary run twice self-matched on 49.5 % of
+    // lines with one buffer and 89.8 % with two; throughput unchanged.
     float *eagg_out = (l & 1) ? ext->ext_e_agg2 : ext->ext_e_agg;
 #if GETP_ROWSKIP
     const int *gp_rank = rs_on ? rs_rank : nullptr;
@@ -8065,7 +8068,7 @@ int *getp_forward_120b(Transformer * /*transformer*/,
     const int *gp_rank = nullptr;
 #endif
 #if GETP_EAGG_BF16
-    // Gated on rs_on: EP = 2 (20b) never enables it, so md5 720709b86d36 stays intact.
+    // Gated on rs_on: EP = 2 (20b) never enables it, so the 20B's exchange stays exact.
     const int gp_bf16 = rs_on ? 1 : 0;
 #else
     const int gp_bf16 = 0;

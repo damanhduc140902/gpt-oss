@@ -77,8 +77,11 @@ dequantizes the FP4 tensors and flattens everything into one blob.
 python tools/model_export/gpt-oss-20b/export_model_bin.py \
   --input  /path/to/gpt-oss-20b/original/model.safetensors \
   --config tools/model_export/gpt-oss-20b/config.json \
-  --output gpt-oss-20b.bin                 # or gpt-oss-120b/
+  --output gpt-oss-20b.bin
 ```
+
+For the 120B, use the `gpt-oss-120b/` script and config and pass the `original/` directory itself as
+`--input`: that checkpoint is sharded, and the script follows its `model.safetensors.index.json`.
 
 | Model          | Hugging Face                                                      | Export script                                                          |
 | -------------- | ----------------------------------------------------------------- | ---------------------------------------------------------------------- |
@@ -86,7 +89,7 @@ python tools/model_export/gpt-oss-20b/export_model_bin.py \
 | `gpt-oss-120b` | [openai/gpt-oss-120b](https://huggingface.co/openai/gpt-oss-120b) | [`tools/model_export/gpt-oss-120b/`](tools/model_export/gpt-oss-120b/) |
 | `gpt-oss-7m`   | [tiny-random/gpt-oss](https://huggingface.co/tiny-random/gpt-oss) | [`tools/model_export/gpt-oss-7m/`](tools/model_export/gpt-oss-7m/)     |
 
-The 7M model is randomly initialised and says nothing sensible, but it is two layers wide and loads in a
+The 7M model is randomly initialised and says nothing sensible, but it is two layers deep and loads in a
 second — use it to prove the build works before committing to a 65 GB download.
 
 ### 3. Build
@@ -94,7 +97,7 @@ second — use it to prove the build works before committing to a 65 GB download
 ```bash
 ./run.sh build          # -O3, the one the benchmarks use
 ./run.sh build omp      # -O3 with OpenMP and -march=native
-./run.sh build debug    # -O0 with symbols
+./run.sh build debug    # symbols (-g), at hipcc's default -O3
 ```
 
 `run.sh` wraps the `Makefile`; `make runfast`, `make runomp` and the rest still work. Building also
@@ -102,7 +105,8 @@ regenerates `tokenizer.bin` from the `o200k_harmony` encoding.
 
 ### 4. Run one prompt
 
-Start here. If this prints an answer, everything is wired up:
+Start here. `generate` and `chat` run the CPU forward pass in [`src/run.cpp`](src/run.cpp), so an
+answer proves the build, the weights and the tokenizer; the GPUs are only used by `getp` (step 5):
 
 ```bash
 ./run.sh run gpt-oss-20b.bin -m generate -i "1+1="
@@ -128,17 +132,19 @@ Interactive chat, optionally with a system prompt:
 **The request count sets the batch.** Before it uploads any weight, `warm_up` reads the count on the
 input file's first line and, when it divides evenly by the number of GPUs, serves `count / n_devices`
 rows on each GPU at once. Each step then produces that many tokens per GPU for nearly the same weight
-traffic, so the largest input is the fastest one. The ceiling is what fits in a 64 GB MI250 device:
-1984 rows for the 20B model and 1024 for the 120B (`GETP_BATCH_CAP_20B` and `GETP_BATCH_CAP_120B` in
-[`src/getp/run.cpp`](src/getp/run.cpp)). On eight GPUs that is 15,872 and 8,192 requests, the two
-counts in the [results table](#results). A count over the ceiling stops right there, with
+traffic, so the largest input is the fastest one. The ceiling is set by a 64 GB MI250 device
+(`GETP_BATCH_CAP_20B` and `GETP_BATCH_CAP_120B` in [`src/getp/run.cpp`](src/getp/run.cpp)): 1024
+rows is the most the 120B can allocate, and 1984 the fastest for the 20B, which still fits 2016 but
+runs them 0.5 % slower. On eight GPUs that is 15,872 and 8,192 requests, the two counts in the
+[results table](#results). A count over the ceiling stops right there, with
 `N requests need R rows per GPU; at most C fit`.
 
 A count that does not divide by the GPU count cannot be split into equal batches. `warm_up` then keeps
 the old fixed batches, 1536 rows for the 20B and 768 for the 120B, and the request-count asserts in
 `inference()` reject the file, after warm-up has already run. `GETP_BATCH=<rows>` fixes the rows per
-GPU instead of reading them from the file, and skips the ceiling; the count must then be
-`n_devices × GETP_BATCH`.
+GPU instead of reading them from the file, and skips the ceiling; the count must then be exactly
+`n_devices × GETP_BATCH` for the 20B, and a multiple of it for the 120B, which serves the batches one
+after another.
 
 The input files shipped in this repository declare 32, 256, 448, 3584 and 4096 requests. All are
 multiples of eight, so on eight GPUs they run as batches of 4 to 512 rows: enough for a check, far
@@ -147,6 +153,7 @@ from full speed. For throughput, build the largest:
 ```bash
 ./run.sh mkinput 20b 8 input_20b.txt        # 15872 requests
 ./run.sh run gpt-oss-20b.bin -m getp -i input_20b.txt -o out.txt
+./run.sh mkinput 120b 8 input_120b.txt -s tests/input.txt   # 8192 requests, the reference prompts
 ```
 
 The output file holds token ids, not text. Turn them back into words:
@@ -157,10 +164,14 @@ The output file holds token ids, not text. Turn them back into words:
 ```
 
 Every visible GPU is used automatically — `warm_up` takes the count from `hipGetDeviceCount` and uses
-all of it. Eight is the ceiling, though: [`include/transformer.hpp`](include/transformer.hpp) pins `MAXIMUM_GPU` at 8, and the per-device sync state in [`src/hip/forward.hip`](src/hip/forward.hip) — `g_ev_sync` and its `g_ev_sync_ready` flags — is declared `[MAXIMUM_GPU]` and indexed by the absolute device index, before any peer-count check. `warm_up` never clamps the count, so past the eighth device the engine writes off the end of those arrays. To use fewer, regenerate the input for that count — the ceiling is per GPU, so the largest input follows
-the device count. The count itself has to be even for the 20B model, which pins
-`EXPERT_PARALLELISM = 2` and exits during warm-up when the device count is not divisible by it,
-however the input was sized:
+all of it. Eight is the ceiling, though: [`include/transformer.hpp`](include/transformer.hpp) pins
+`MAXIMUM_GPU` at 8, and the per-device sync state in [`src/hip/forward.hip`](src/hip/forward.hip) —
+`g_ev_sync` and its `g_ev_sync_ready` flags — is declared `[MAXIMUM_GPU]` and indexed by the absolute
+device index, before any peer-count check. `warm_up` never clamps the count, so past the eighth device
+the engine writes off the end of those arrays. To use fewer, regenerate the input for that count — the
+ceiling is per GPU, so the largest input follows the device count. The count itself has to be even
+for the 20B model, which pins `EXPERT_PARALLELISM = 2` and exits during warm-up when the device count
+is not divisible by it, however the input was sized:
 
 ```bash
 ./run.sh mkinput 20b 2 input_2gpu.txt       # 3968 requests
@@ -206,7 +217,8 @@ python3 tests/test_tokenizer.py \
 
 This decodes `tests/submission/` against `tests/references/` and reports METEOR and BERTScore F1, failing
 if either falls under the threshold in [`tests/threshold.json`](tests/threshold.json). A GPU is strongly
-recommended; see [`tests/README.md`](tests/README.md).
+recommended; see [`tests/README.md`](tests/README.md), which also shows how to
+[score a run of your own](tests/README.md#scoring-your-own-run).
 
 ### All options
 
@@ -235,92 +247,99 @@ Measured on one node of 8× AMD MI250 in batch (`getp`) mode.
 | Model          | Requests | Warm-up (s) | Inference (s) | Throughput (TPS) | METEOR | BERTScore |
 | -------------- | -------: | ----------: | ------------: | ---------------: | -----: | --------: |
 | `gpt-oss-20b`  |    15872 |          25 |           180 |        **84451** |  0.516 |     0.977 |
-| `gpt-oss-120b` |     8192 |          45 |           201 |        **40271** |  0.548 |     0.980 |
+| `gpt-oss-120b` |     8192 |          38 |           201 |        **40271** |  0.552 |     0.980 |
 
-Both inputs are the largest that fit, 1984 and 1024 rows per GPU (see [Run a batch](#5-run-a-batch)).
-The standard inputs of the earlier results, 12,288 and 6,144 requests at 1536 and 768 rows, run at
-82,013 and 37,216 tok/s.
+Both inputs are the largest the engine accepts, 1984 and 1024 rows per GPU (see
+[Run a batch](#5-run-a-batch)). The standard inputs of the earlier results, 12,288 and 6,144 requests
+at 1536 and 768 rows, run at 82,013 and 37,216 tok/s. Every input is built by the repository's own
+tool, so each figure can be rerun: `./run.sh mkinput 20b 8 input_20b.txt` cycles the 32 prompts of
+[`tests/data/input.txt`](tests/data/input.txt), and `./run.sh mkinput 120b 8 input_120b.txt -s
+tests/input.txt` the 4096 reference prompts of [`tests/input.txt`](tests/input.txt); `-r 1536` and
+`-r 768` give the standard inputs.
 
 How the engine got there. The first row is its first complete version, already written from scratch
 like everything in this repository, and every row after it is one optimisation of that same code, on
 the 20B model:
 
-|                                                                        | Throughput | Change |
-| ---------------------------------------------------------------------- | ---------: | -----: |
-| First complete version of this engine                                  |      33979 |      — |
-| GEMM tile tuning and per-tile attention softmax                        |      42540 | +25.2% |
-| Attention rewritten on `mfma_f32_16x16x16bf16_1k`                      |      50464 | +18.6% |
-| LDS tiles stored k-contiguous in all five GEMMs                        |      56434 | +11.8% |
-| Per-step allocations, events and a dead 35 MB memset removed           |      57019 |  +1.0% |
-| Argmax made independent of block arrival order                         |      57343 |  +0.6% |
-| mlp2 block 64 -> 96 with a matching register budget                    |      58309 |  +1.7% |
-| Attention scratch LDS reused; five HBM round-trips removed             |      60850 |  +4.4% |
-| mlp2 block 96 -> 128 (64-row wave tile), split-K pinned off            |      62937 |  +3.4% |
-| MoE host read-backs removed; grids sized from the worst case           |      63444 |  +0.8% |
-| Expert exchange made pull-based; two runs now agree on 100 % of output |      62841 |  -1.0% |
-| mlp2 k-loop schedule pinned; per-layer queue drains removed            |      64143 |  +2.1% |
-| mlp1 k-loop schedule pinned, including the HBM loads                   |      64509 |  +0.6% |
-| RoPE folded into the qkv epilogue; router block sized to the expert count; argmax reduced in registers |      65651 |  +1.8% |
-| LM head rastered in groups of two row blocks so the weight tile lands in L2 |      66096 |  +0.7% |
-| LM head activations converted to bf16 once, which widens the grouping to six |      68424 |  +3.5% |
-| q written pre-scaled as bf16, since attention rounded it to bf16 anyway |      69309 |  +1.3% |
-| Expert GEMMs load HBM two k tiles ahead, without branches, between the MFMAs |      70734 |  +1.9% |
-| KV cache head-major with padded regions; attention-out loads two k tiles ahead; two KV tiles in flight |      75369 |  +6.5% |
+|                                                                                                                | Throughput | Change |
+| -------------------------------------------------------------------------------------------------------------- | ---------: | -----: |
+| First complete version of this engine                                                                          |      33979 |      — |
+| GEMM tile tuning and per-tile attention softmax                                                                |      42540 | +25.2% |
+| Attention rewritten on `mfma_f32_16x16x16bf16_1k`                                                              |      50464 | +18.6% |
+| LDS tiles stored k-contiguous in all five GEMMs                                                                |      56434 | +11.8% |
+| Per-step allocations, events and a dead 35 MB memset removed                                                   |      57019 |  +1.0% |
+| Argmax made independent of block arrival order                                                                 |      57343 |  +0.6% |
+| mlp2 block 64 -> 96 with a matching register budget                                                            |      58309 |  +1.7% |
+| Attention scratch LDS reused; five HBM round-trips removed                                                     |      60850 |  +4.4% |
+| mlp2 block 96 -> 128 (64-row wave tile), split-K pinned off                                                    |      62937 |  +3.4% |
+| MoE host read-backs removed; grids sized from the worst case                                                   |      63444 |  +0.8% |
+| Expert exchange made pull-based; two runs now agree on 100 % of output                                         |      62841 |  -1.0% |
+| mlp2 k-loop schedule pinned; per-layer queue drains removed                                                    |      64143 |  +2.1% |
+| mlp1 k-loop schedule pinned, including the HBM loads                                                           |      64509 |  +0.6% |
+| RoPE folded into the qkv epilogue; router block sized to the expert count; argmax reduced in registers         |      65651 |  +1.8% |
+| LM head rastered in groups of two row blocks so the weight tile lands in L2                                    |      66096 |  +0.7% |
+| LM head activations converted to bf16 once, which widens the grouping to six                                   |      68424 |  +3.5% |
+| q written pre-scaled as bf16, since attention rounded it to bf16 anyway                                        |      69309 |  +1.3% |
+| Expert GEMMs load HBM two k tiles ahead, without branches, between the MFMAs                                   |      70734 |  +1.9% |
+| KV cache head-major with padded regions; attention-out loads two k tiles ahead; two KV tiles in flight         |      75369 |  +6.5% |
 | RMSNorm one wave per row; router GEMM fused; expert-output gather at 16 bytes a thread, the pair's slice first |      77145 |  +2.4% |
-| The value half of the KV cache stored as int8 § |      78502 |  +2.3% |
-| Experts moved between the two GPUs of each pair too ¶ |      78955 |  +0.6% |
-| Finished requests routed to no expert |      81100 |  +2.8% |
-| Attention-out operands padded off a power-of-two row stride |      82181 |  +0.9% |
-| Rows per GPU taken from the request count: 1984 on the largest input ∥ |      83305 |  +1.4% |
-| Router split of 6 or 7 rounded up to 8, so the largest batch keeps the fused router ∥ |  **84451** |  +1.2% |
+| The value half of the KV cache stored as int8 §                                                                |      78502 |  +2.3% |
+| Experts moved between the two GPUs of each pair too ¶                                                          |      78955 |  +0.6% |
+| Finished requests routed to no expert                                                                          |      81100 |  +2.8% |
+| Attention-out operands padded off a power-of-two row stride                                                    |      82181 |  +0.9% |
+| Rows per GPU taken from the request count: 1984 on the largest input ∥                                         |      83305 |  +1.4% |
+| Router split of 6 or 7 rounded up to 8, so the largest batch keeps the fused router ∥                          |  **84451** |  +1.2% |
 
 The 120B model's first version ran at 13,149 tok/s, and the 20B work above took it to 20,426 without
 a single change written for it: it runs the same kernels with the same defaults. Past that point it
 needed its own work, because its bottleneck is not the same one:
 
-|                                                                        | Throughput | Change |
-| ---------------------------------------------------------------------- | ---------: | -----: |
-| Same kernels as the 20B model, no changes specific to the 120B          |      20426 |      — |
-| Only the non-zero rows sent in the expert-output exchange               |      22760 | +11.4% |
-| The fourteen row-list launches per layer merged into two                |      23136 |  +1.4% |
-| Only the rows each peer needs sent in the expert-input exchange         |      23910 |  +3.9% |
-| The second sync point on per-peer events instead of a barrier           |      24341 |  +1.8% |
-| The expert output emitted one destination slice at a time               |      24685 |  +1.5% |
-| The attention-out tile chosen at run time from how full the GPU is      |      24902 |  +0.6% |
-| The expert-output exchange sent as bf16 instead of fp32 †               |      26033 |  +4.5% |
-| Experts moved between GPUs every 100 steps to even out the load ‡       |      28670 | +10.2% |
-| The peer pulls spread over four copy streams                            |      30349 |  +6.2% |
-| Expert GEMMs load HBM two k tiles ahead, without branches, between the MFMAs |      30224 |  +1.7% |
-| KV cache head-major with padded regions; qkv loads two k tiles ahead; two KV tiles in flight |      32297 |  +5.1% |
+|                                                                                                     | Throughput | Change |
+| --------------------------------------------------------------------------------------------------- | ---------: | -----: |
+| Same kernels as the 20B model, no changes specific to the 120B                                      |      20426 |      — |
+| Only the non-zero rows sent in the expert-output exchange                                           |      22760 | +11.4% |
+| The fourteen row-list launches per layer merged into two                                            |      23136 |  +1.4% |
+| Only the rows each peer needs sent in the expert-input exchange                                     |      23910 |  +3.9% |
+| The second sync point on per-peer events instead of a barrier                                       |      24341 |  +1.8% |
+| The expert output emitted one destination slice at a time                                           |      24685 |  +1.5% |
+| The attention-out tile chosen at run time from how full the GPU is                                  |      24902 |  +0.6% |
+| The expert-output exchange sent as bf16 instead of fp32 †                                           |      26033 |  +4.5% |
+| Experts moved between GPUs every 100 steps to even out the load ‡                                   |      28670 | +10.2% |
+| The peer pulls spread over four copy streams                                                        |      30349 |  +6.2% |
+| Expert GEMMs load HBM two k tiles ahead, without branches, between the MFMAs                        |      30224 |  +1.7% |
+| KV cache head-major with padded regions; qkv loads two k tiles ahead; two KV tiles in flight        |      32297 |  +5.1% |
 | RMSNorm one wave per row; router GEMM fused; expert-output gather and row adds at 16 bytes a thread |      34526 |  +6.5% |
-| Both expert exchanges as one kernel each, reading the peers' memory directly |      36111 |  +4.2% |
-| The value half of the KV cache stored as int8 § |      36564 |  +1.6% |
-| Finished requests routed to no expert |      36978 |  +1.1% |
-| Attention-out operands padded off a power-of-two row stride |      37216 |  +0.5% |
-| Rows per GPU taken from the request count: 1024 on the largest input ∥ |  **40271** |  +8.2% |
+| Both expert exchanges as one kernel each, reading the peers' memory directly                        |      36111 |  +4.2% |
+| The value half of the KV cache stored as int8 §                                                     |      36564 |  +1.6% |
+| Finished requests routed to no expert                                                               |      36978 |  +1.1% |
+| Attention-out operands padded off a power-of-two row stride                                         |      37216 |  +0.5% |
+| Rows per GPU taken from the request count: 1024 on the largest input ∥                              |  **40271** |  +8.2% |
 
 Each percentage is a paired measurement: the two builds run alternately in one session, against the
-same input, mostly twice each - except the four-stream and expert-move rows, which rest on one to three
-runs each (the four-stream figure was repeated at 29,750 and 30,300 in a later session), and the
-head-major KV row, whose change is the ratio of two paired sessions. Absolute throughput moves about
-1 % between sessions, so the rows are not strictly comparable across the table. The last five rows of
-each table were measured on top of each other in one sitting and then verified together against the
-previous shipped build: 81,100 against 75,209 tok/s on the 20B (+7.8 %) and 36,978 against 32,532 on the 120B
-(+13.7 %). The numbers that stand behind the summary above are those verification runs: the median of
-five full-length 20B runs (81,022 to 81,308 tok/s, inference 144.7-145.2 s) and the lower of two 120B runs (36,978 and
-37,118). The rows after them were verified the same way against that shipped build, one sitting per
-model: its two runs on the standard input, 81,583 and 81,552 on the 20B and 37,054 and 37,042 on the
-120B, against two runs of the new build on the largest input, 84,581 and 84,321 on the 20B and 40,299
-and 40,244 on the 120B. In all, +3.5 % on the 20B and +8.7 % on the 120B. The router row does not
-touch the 120B, whose split is always 8.
+same input, mostly twice each - except the four-stream and expert-move rows, which rest on one to
+three runs each (the four-stream figure was repeated at 29,750 and 30,300 in a later session), and
+the head-major KV row, whose change is the ratio of two paired sessions. Absolute throughput moves
+about 1 % between sessions, so the rows are not strictly comparable across the table. The rows from
+the RMSNorm one to the finished-requests one were measured on top of each other in one sitting and
+then verified together against the release before them: 81,100 against 75,209 tok/s on the 20B
+(+7.8 %) and 36,978 against 32,532 on the 120B (+13.7 %). The previous release, e82ab27, took its 81,100
+and 36,978 from those verification runs: the median of five full-length 20B runs (81,022 to 81,308
+tok/s, inference 144.7-145.2 s) and the lower of two 120B runs (36,978 and 37,118). The rows after
+the finished-requests one, three on the 20B and two on the 120B, were verified the same way against
+e82ab27, alternating with its runs on the standard input. The 20B's figure is the mean of two runs
+in one sitting, 84,581 and 84,321, against 81,583 and 81,552: +3.5 %. The 120B's is the median of
+seven runs over three sittings, against the median of four of e82ab27's (37,043 to 37,135): +8.7 %.
+Five of the seven ran between 40,252 and 40,320; one that read the checkpoint off a cold page cache
+ran at 39,774, and one at 38,202 for no reason the host's counters show - same output, 5 % more
+time. The router row does not touch the 120B, whose split is always 8.
 
 Every row is bit-exact except the marked ones, which change the numbers by design and were therefore
 accepted on METEOR and BERTScore (thresholds 0.3 and 0.9) rather than on a hash. The two 120B rows
 marked † and ‡ are gated on `EXPERT_PARALLELISM > 2`; the 20B took no inexact change until the int8 V
-cache, and hashed to `720709b86d36` (the 16-step gate) up to the row before it. The last row is exact
-for a fixed expert placement (the bf16 20B build without expert moves keeps its full-length hash,
-`4bfba1c91770`), but the expert moves are planned from pair counts that no longer include finished
-requests, so with them on it changes the output like the moves themselves do.
+cache, and hashed to `720709b86d36` (the 16-step gate) up to the row before it. The finished-requests
+row is exact for a fixed expert placement (the bf16 20B build without expert moves keeps its
+full-length hash, `4bfba1c91770`), but the expert moves are planned from pair counts that no longer
+include finished requests, so with them on it changes the output like the moves themselves do.
 
 † The expert partial sums cross the interconnect as bf16: `efe1096ff64c` became `18a57667bd03`,
 METEOR 0.5608 to 0.5603, BERTScore 0.9814 to 0.9805.
@@ -336,21 +355,22 @@ the 120B's 0.5545 became 0.548. Keys stay bf16: with K in int8 as well the 20B f
 
 ¶ The same moves as ‡, now inside each 20B pair: METEOR 0.519 to 0.512 (with § in place).
 
-∥ The batch row compares not two builds on one input but one build on two: the largest inputs hold 29 % (20B) and 33 %
-(120B) more requests than the standard ones, the same prompts cycled, and the rows per GPU follow.
-Every row keeps its hashes on the standard inputs (`81e82a2c077f`, `5ab5041b86f2`); the largest
-inputs hash to `22ce0d3418b7` and `6bc533706417` from run to run, and were scored on METEOR and
-BERTScore at their batch. The router row changes the largest 20B input only, from a sum over seven
-splits to the eight-split sum every smaller batch uses (`5393df93d79b` before it). Its output
-changes, so does its length, and on this input the two ∥ rows split the gain unevenly: the prompts
-cycled from the benchmark file generate 957.6 tokens per request at 1536 rows, 947.0 at 1984 rows with
-seven splits and 959.1 with eight. So the batch row's +1.4 % is on 1.1 % fewer tokens a request and
-the router row's +1.2 % on 1.3 % more, in the same 180 s. On the reference prompts, where both router
-builds generate the same tokens to within 0.01 %, the router row is worth +0.9 % (190.1 against 191.8
-s, across two sittings). The total from the shipped build compares like with like: 957.6 against
-959.1 tokens a request on the 20B, 987.8 against 988.7 on the 120B.
+∥ The batch row compares not two builds on one input but one build on two: the largest inputs hold
+29 % (20B) and 33 % (120B) more requests than the standard ones, the same prompts cycled, and the
+rows per GPU follow. Every row keeps its hashes on the standard inputs (`81e82a2c077f`,
+`5ab5041b86f2`); the largest inputs hash to `22ce0d3418b7` and `8254b50f71f9` from run to run, and
+were scored on METEOR and BERTScore at their batch. The router row changes the largest 20B input
+only, from a sum over seven splits to the eight-split sum every smaller batch uses (`5393df93d79b`
+before it). Its output changes, so does its length, and on this input the two ∥ rows split the gain
+unevenly: the 32 prompts of the 20B inputs generate 957.6 tokens per request at 1536 rows,
+947.0 at 1984 rows with seven splits and 959.1 with eight. So the batch row's +1.4 % is on 1.1 %
+fewer tokens a request and the router row's +1.2 % on 1.3 % more, in the same 180 s. On the
+reference prompts, where both router builds generate the same tokens to within 0.01 %, the router
+row is worth +0.9 % (190.1 against 191.8 s, across two sittings). The total over the previous
+release compares like with like: 957.6 against 959.1 tokens a request on the 20B, 987.8 against
+988.0 on the 120B.
 
-This build scores METEOR 0.5159 and BERTScore 0.9771 on the 20B at 1984 rows, 0.5484 and 0.9800 on the
+This build scores METEOR 0.5159 and BERTScore 0.9771 on the 20B at 1984 rows, 0.5524 and 0.9800 on the
 120B at 1024 rows (the first 4096 completions of each largest run, on the reference prompts), and
 0.5198 / 0.9777 and 0.5470 / 0.9798 on the shipped 4096-request input, which runs at 512 rows.
 
@@ -402,19 +422,20 @@ than one. Why the earlier attempts lost is not established - they ran on a diffe
 dense fp32 blocks and a host barrier at both sync points. What is measured is that the number of
 *hardware queues* matters: raising `GPU_MAX_HW_QUEUES` from its default of 4 to 16 turns the
 seven-stream version from the fastest into a collapse (14,202 tok/s) while four streams barely notice
-(29,786). The shipped build uses four.
+(29,786). The build used four. Since then both exchanges have become kernels that read the peers'
+memory directly (below), and the four copy streams are left only behind `GETP_XPULL=0`.
 
-The last two rows of both tables came from measuring kernels one at a time instead of end to end:
-each kernel has a single-GPU harness that runs it on the model's real shapes, times it and hashes its
-output, so a change is judged in two minutes on one GPU and only then confirmed on all eight.
-Two findings carried them. First, the GEMMs spent their load latency in the open: every one of them
-issued k tile _t+1_ at the top of step _t_ and needed it at the end of the same step, from branchy
-basic blocks the scheduler could not interleave. Removing the loads altogether made the expert GEMMs
-10-13 % faster while serving their weights from L2 saved only 1-6 %, so the cost was latency, not
-bandwidth. Loading two tiles ahead, from clamped addresses instead of branches, took the expert GEMMs
-of a 120B rank from 1912 to 1824 µs per layer and a 20B rank from 3127 to 2946 µs, bit-exact; the same
-loop is used where it wins elsewhere - attention-out's wide tile (the 20B, 503 to 446 µs) and qkv at
-the 120B's batch (275 to 258 µs) - and not where it loses.
+The expert-GEMM prefetch and head-major KV rows of both tables came from measuring kernels one at a
+time instead of end to end: each kernel has a single-GPU harness that runs it on the model's real
+shapes, times it and hashes its output, so a change is judged in two minutes on one GPU and only
+then confirmed on all eight. Two findings carried them. First, the GEMMs spent their load latency in
+the open: every one of them issued k tile _t+1_ at the top of step _t_ and needed it at the end of
+the same step, from branchy basic blocks the scheduler could not interleave. Removing the loads
+altogether made the expert GEMMs 10-13 % faster while serving their weights from L2 saved only
+1-6 %, so the cost was latency, not bandwidth. Loading two tiles ahead, from clamped addresses instead
+of branches, took the expert GEMMs of a 120B rank from 1912 to 1824 µs per layer and a 20B rank from
+3127 to 2946 µs, bit-exact; the same loop is used where it wins elsewhere - attention-out's wide
+tile (the 20B, 503 to 446 µs) and qkv at the 120B's batch (275 to 258 µs) - and not where it loses.
 
 Second, decode attention read its KV cache at 0.8 TB/s, half of HBM, with the L1 waiting on L2 88 %
 of the time. The cache was time-major, so each key a workgroup reads was its own 128-byte piece, 1.5
@@ -427,16 +448,16 @@ keys, 653 to 388 µs on a sliding one, 2098 to 1343 µs on a full 120B layer - b
 addresses change. Keeping two KV tiles in flight per wave, which gained nothing on the old layout, adds
 another 2-4 % on the new one.
 
-The newest rows come from what was left once the big kernels were close to their limits: the expert
-GEMMs run 73-85 % matrix-core-busy and the LM head 89 %, so the remaining time was in the small
-kernels around them, in the exchange, and in work nobody needed. The norms, the router and the
-expert-output gather were rewritten to keep every addition in its old order, so they are exact
-(+2.4 % and +6.5 %). On the 120B both expert exchanges became one kernel each that reads the peers'
-memory directly, which removed some 35 peer copies and a stream drain per layer (+4.2 %, exact).
-Requests that have finished were still routed through the expert GEMMs, 5.9 % of the 20B's row-steps
-on the benchmark input; they now go to no expert (+2.8 % and +1.1 %). Two changes trade exactness for
-speed: the value half of the KV cache in int8, which takes a full 20B attention layer at 1024 keys
-from 2605 to 1952 µs, and expert moves inside the 20B's pairs.
+The four rows after those in each table come from what was left once the big kernels were close to
+their limits: the expert GEMMs run 73-85 % matrix-core-busy and the LM head 89 %, so the remaining
+time was in the small kernels around them, in the exchange, and in work nobody needed. The norms,
+the router and the expert-output gather were rewritten to keep every addition in its old order, so
+they are exact (+2.4 % and +6.5 %). On the 120B both expert exchanges became one kernel each that
+reads the peers' memory directly, which removed some 35 peer copies and a stream drain per layer
+(+4.2 %, exact). Requests that have finished were still routed through the expert GEMMs, 5.9 % of
+the 20B's row-steps on the benchmark input; they now go to no expert (+2.8 % and +1.1 %). Two
+changes trade exactness for speed: the value half of the KV cache in int8, which takes a full 20B
+attention layer at 1024 keys from 2605 to 1952 µs, and expert moves inside the 20B's pairs.
 
 The last rows are about memory and the shape of the input. The attention-out GEMM ran well under the
 LM head on the same tile: its loads waited on L2 69 % of the time, and its matrix cores were 51 % busy
@@ -461,27 +482,29 @@ the page cache; it is not part of what the optimisation work changed.
 Throughput is aggregate across all eight GPUs, not single-stream latency. The quality gates are METEOR
 0.3 and BERTScore 0.9, and both models clear them by a wide margin. The inexact rows, and the output
 changes that come with a larger batch, cost the 20B 0.019 of METEOR (0.535 while every change was
-still exact, 0.516 now) and the 120B 0.013 (0.561 to 0.548), measured against the reference
+still exact, 0.516 now) and the 120B 0.009 (0.561 to 0.552), measured against the reference
 completions.
 
 The METEOR and BERTScore in the results table come from one run each, the throughput from the mean
-of two. The completions committed in
-[`tests/submission/`](tests/submission/) are from the first version in that table, before any of the
-optimisations in it, so they are not the ones those scores were computed from — but they can still be
-scored without a GPU: `./run.sh eval 20b` reports METEOR 0.533 and BERTScore 0.978 on them.
+of two. The completions committed in [`tests/submission/`](tests/submission/) are from this engine's
+first complete version, at 33,979 and 13,149 tok/s, before any of the optimisations above, so they
+are not the ones those scores were computed from — but they can still be scored without a GPU:
+`./run.sh eval 20b` reports METEOR 0.533 and BERTScore 0.978 on them.
 
-Repeating a run still moves throughput - by about 1 % between sessions, less within one: the two runs behind each figure spread over 0.3 % on the 20B and 0.14 % on the 120B - but it very rarely moves the completions.
-That was not always true: before the expert exchange was made pull-based, a receiver could read a peer's
-buffer while it was still being written, so two runs of the _same binary_ at 8 GPUs agreed on only about
-50 % to 95 % of output lines, run pair by run pair. With the pull in place the 120B reproduces its hash from run to run, and every optimisation listed above
+Repeating a run still moves throughput - by about 1 % between sessions, less within one: the two
+20B runs behind its figure spread over 0.3 %, five of the seven 120B runs over 0.17 % - but it very
+rarely moves the completions. That was not always true: before the expert exchange was made pull-based, a
+receiver could read a peer's buffer while it was still being written, so two runs of the _same
+binary_ at 8 GPUs agreed on only about 50 % to 95 % of output lines, run pair by run pair. With the
+pull in place the 120B reproduces its hash from run to run, and every optimisation listed above
 except the marked ones was checked by hashing the output rather than by scoring it - the 20B against
-720709b86d36 and the 120B against the hash of the build before it, both with zero differing lines. The
-marked ones change the numbers by design; they were judged on METEOR and BERTScore instead, and the
-output still hashes identically from one run to the next (`5ab5041b86f2` on the 120B and `81e82a2c077f` on
-the 20B's standard input today, `6bc533706417` and `22ce0d3418b7` on the largest; the 20B's 16-step gate
-is now `edddca087af7`). A hash is a far sharper
-instrument than METEOR when the claim is that a change moved no numbers, and it is what makes a 0.6%
-win safe to accept.
+its 16-step gate (`720709b86d36` until the int8 V cache) and the 120B against the hash of the build
+before it, both with zero differing lines. The marked ones change the numbers by design; they were
+judged on METEOR and BERTScore instead, and the output still hashes identically from one run to the
+next (`5ab5041b86f2` on the 120B and `81e82a2c077f` on the 20B's standard input today,
+`8254b50f71f9` and `22ce0d3418b7` on the largest; the 20B's 16-step gate is now `edddca087af7`). A
+hash is a far sharper instrument than METEOR when the claim is that a change moved no numbers, and
+it is what makes a 0.6% win safe to accept.
 
 The 20B took longer. Its full-length runs used to disagree now and then - about one run in twelve
 on an idle host, a few hundred lines of one GPU or one pair from some step on - and one run in three
@@ -504,7 +527,7 @@ speed, and six runs under the same CPU load all identical.
 | --------------- | ----------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- | ------------------------------------- |
 | **Model**       | The architecture as this code implements it, the `.bin` weight format and its FP4 dequantization, the `o200k_harmony` tokenizer and the sampling path.                                                                        | [MODEL.md](docs/MODEL.md)             |
 | **Kernels**     | A blocktiled GEMM issued entirely on the matrix cores with double buffering, a FlashAttention-style attention kernel that exploits grouped-query attention, and one fused kernel that serves every expert in a single launch. | [KERNELS.md](docs/KERNELS.md)         |
-| **Parallelism** | Expert × Data parallelism across the GPUs, with all-gather and reduce-scatter built from peer-to-peer copies alone and ordered so PCIe runs full-duplex.                                                                      | [PARALLELISM.md](docs/PARALLELISM.md) |
+| **Parallelism** | Expert × Data parallelism across the GPUs: the all-gather and reduce-scatter are kernels that read the peers' memory directly, and experts move between GPUs during the run to even out the load.                             | [PARALLELISM.md](docs/PARALLELISM.md) |
 | **Serving**     | The `getp` batch runtime: how requests are batched and scheduled, what the warm-up buys, and where the throughput actually comes from.                                                                                        | [SERVING.md](docs/SERVING.md)         |
 
 ### Code structure
@@ -513,7 +536,7 @@ speed, and six runs under the same CPU load all identical.
 gpt-oss/
 ├── include/            # shared headers
 ├── src/
-│   ├── run.cpp         # entry point, CLI, sampling, chat and generate loops
+│   ├── run.cpp         # entry point, CLI, CPU forward pass, sampling, chat and generate loops
 │   ├── tokenizer.cpp   # o200k_harmony tokenizer
 │   ├── decode.cpp      # token ids -> text utility
 │   ├── getp/           # batch serving: runtime, scheduling, collectives
@@ -537,5 +560,6 @@ came from — is on its way. Until it lands, [`docs/`](docs/) carries the same m
 
 This project was part of the GPU Engineer Training Program, a collaboration between
 [Moreh](https://www.linkedin.com/company/moreh-vietnam/) and
-[THUNDER Research Group](http://snuvm.snu.ac.kr/) (Seoul National University). It started from
+[THUNDER Research Group](http://snuvm.snu.ac.kr/) (Seoul National University). Its command-line
+program — the options, sampler and chat loop — comes from
 [llama2.c](https://github.com/karpathy/llama2.c) by Andrej Karpathy.

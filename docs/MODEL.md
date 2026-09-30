@@ -8,7 +8,7 @@ Both `gpt-oss-20b` and `gpt-oss-120b` can be visualised as shown below. Residual
 
 ![gpt-oss overview](assets/model-overview.png)
 
-The two models are the same network with different depth and expert count. That is the single most useful fact about them from an implementation point of view: nothing in the forward pass needs a per-model code path, so one binary serves both. Every shape is read from the checkpoint header at load time.
+The two models are the same network with different depth and expert count. That is the single most useful fact about them from an implementation point of view: nothing in the forward pass needs a per-model code path, so one binary serves both. Every shape is read from the checkpoint header at load time; the GPU attention kernel does fix one geometry at compile time, the one both models share — `head_dim` = 64 and 8 query heads per KV head, both asserted.
 
 | Field (`config.json`)    | `Config` member          | 20B      | 120B     |
 | ------------------------ | ------------------------ | -------- | -------- |
@@ -59,7 +59,7 @@ The win is in memory, not arithmetic. Half the layers only ever need 128 cached 
 
 Rotary embeddings use base 150000 with YaRN: `scaling_factor` 32 over an `initial_context_length` of 4096, the `0.1 * log(s) + 1` attention-concentration factor, and an NTK-by-parts ramp between two cut frequencies. `ntk_beta = 32.0` and `ntk_alpha = 1.0` are _not_ in `config.json`; they are hardcoded at the call sites in both implementations — in `forward` ([`src/run.cpp`](../src/run.cpp)), and in `getp_forward_120b`, which serves both models, as well as in the never-called `getp_forward_20b` ([`src/hip/forward.hip`](../src/hip/forward.hip)). If you ever export a model with different YaRN parameters, the header will not carry them.
 
-The two implementations are line-for-line equivalent, with one difference: the CPU keeps `assert(0 < low && low < high && high < d_half - 1)` as a sanity check on the ramp bounds; the kernel drops it, since an assert per thread block is not worth the register pressure and the bounds are a function of the config, not of the data.
+The two implementations are line-for-line equivalent, with one difference: the CPU keeps `assert(0 < low && low < high && high < d_half - 1)` as a sanity check on the ramp bounds; the kernel (`compute_inv_freq_kernel`) drops it; the bounds are a function of the config, not of the data.
 
 ## The mixture-of-experts block
 
@@ -85,7 +85,7 @@ val *= (1.0f / (1.0f + expf(-alpha * val)));
 val *= (up_val + 1.0f); // gpt-oss adds an extra bias of 1 to the up layer
 ```
 
-One deliberate asymmetry to be aware of when comparing outputs: the CPU clamps `gate` only from above (matching the reference `clamp(gate, max=limit)`), while the fused kernel clamps it symmetrically to `[-7, +7]`. The divergence only bites for gate values below −7, where `silu` has already saturated to roughly −4×10⁻⁵, so it is invisible at the metric level; it is called out here only so that a bit-exactness investigation does not start in the wrong place.
+One deliberate asymmetry to be aware of when comparing outputs: the CPU clamps `gate` only from above (matching the reference `clamp(gate, max=limit)`), while the fused kernel clamps it symmetrically to `[-7, +7]`. The divergence only bites for gate values below −7, where the gpt-oss `silu` (`x · σ(1.702 x)`) is only −4.7×10⁻⁵ at the clamp and closer to zero below it, so it is invisible at the metric level; it is called out here only so that a bit-exactness investigation does not start in the wrong place.
 
 The experts dominate the parameter count, and that is the whole reason expert parallelism exists:
 
@@ -97,7 +97,7 @@ The experts dominate the parameter count, and that is the whole reason expert pa
 
 Everything that is not an expert — embedding, unembedding, attention, router, norms — is **1.798 B parameters on the 20B model and 2.128 B on the 120B**. Subtracting the expert biases as well as `w_mlp1` + `w_mlp2`: 20,914,757,184 − 19,116,933,120 and 116,829,156,672 − 114,701,598,720.
 
-The two figures differ because the non-expert share scales with depth, not with expert count. Both models carry the same 1.158 B in the embedding and unembedding matrices — gpt-oss does not tie them, so both 201088 × 2880 copies are stored — and the remainder is 26.6 M per layer of QKV, `w_o`, norms and sinks (26.9 M on the 120B, whose router is 128 rows wide instead of 32), times 24 or 36 layers. Either way it is small enough to replicate on every device, which is exactly what the parallelism strategy does.
+The two figures differ because the non-expert share scales with depth, not with expert count. Both models carry the same 1.158 B in the embedding and unembedding matrices — gpt-oss does not tie them, so both 201088 × 2880 copies are stored — and the remainder is 26.6 M per layer of QKV, `w_o`, router, norms and sinks (26.9 M on the 120B, whose router is 128 rows wide instead of 32), times 24 or 36 layers. Either way it is small enough to replicate on every device, which is exactly what the parallelism strategy does.
 
 ## The `.bin` weight format
 
@@ -129,13 +129,13 @@ There is no magic number, no version field, no per-tensor metadata and no length
 | 15  | `w_mlp2`                | `L × n_experts × 2880 × 2880` |
 | 16  | `b_mlp2`                | `L × n_experts × 2880`        |
 
-The file size is read with `ftell`, but it is only used for `mmap`/`munmap` — it is never checked against what the header implies. A header that disagrees with the blob produces silently wrong pointers, not an error. This is the llama2.c bargain, kept on purpose: the format costs nothing to read, the loader is thirty lines, and the producer is a script in this repository rather than a third party. If you hand-edit a `config.json` and re-export, re-export the weights too.
+The file size is read with `ftell`, but it is only used for `mmap`/`munmap` — it is never checked against what the header implies. A header that disagrees with the blob produces silently wrong pointers, not an error. The bargain is deliberate: the format costs nothing to read, the loader is a single pointer walk, and the producer is a script in this repository rather than a third party. If you hand-edit a `config.json` and re-export, re-export the weights too.
 
 Loading is a `mmap(NULL, file_size, PROT_READ, MAP_PRIVATE, fd, 0)`. Nothing is copied; `TransformerWeights` is pure pointers into the mapping and the CPU forward pass runs directly off page cache.
 
 ## The export pipeline
 
-`.safetensors` → `.bin` is [`tools/model_export/`](../tools/model_export/), one script per model size. For 20B:
+`.safetensors` → `.bin` is [`tools/model_export/`](../tools/model_export/), one exporter each for the 20B and the 120B (the 7M test model in `gpt-oss-7m/` has its own two-step pair). For 20B:
 
 ```bash
 python tools/model_export/gpt-oss-20b/export_model_bin.py \
@@ -175,11 +175,11 @@ Three choices are worth explaining:
 
 - **Block geometry is read, not assumed.** `B` comes from `blocks.shape[-1]`, so one scale covers `2B` values — 16 bytes → 32 values for standard MXFP4, but a checkpoint with a different group size still exports correctly.
 - **Chunking.** `rows_per_chunk = 16384 * 512` (8,388,608 rows per pass) bounds the peak of the two `int64` index tensors, which are otherwise the largest intermediates.
-- **bfloat16 as the intermediate dtype is lossless here.** Every E2M1 value needs at most two explicit mantissa bits, and the scale is a power of two, so `ldexp` cannot introduce rounding: bf16's 8-bit significand represents the product exactly. The later widening to fp32 is exact too. Using fp16 instead would risk overflow on large exponents for no accuracy gain.
+- **bfloat16 as the intermediate dtype is lossless here.** Every E2M1 value has at most two significant bits (one mantissa bit), and the scale is a power of two, so `ldexp` cannot introduce rounding: bf16's 8-bit significand represents the product exactly. The later widening to fp32 is exact too. Using fp16 instead would risk overflow on large exponents for no accuracy gain.
 
 ### Output dtype and file size
 
-`--dtype` defaults to `float32`, which is what the CPU reference path expects. That has a consequence worth stating plainly before you start an export:
+`--dtype` defaults to `float32`, and that is the only dtype the loader reads: `memory_map_weights` steps through the blob as `float *` for both paths, and `getp` converts to bf16 itself during the upload. That has a consequence worth stating plainly before you start an export:
 
 | Model | Parameters      | `--dtype float32`   | `--dtype bfloat16` |
 | ----- | --------------- | ------------------- | ------------------ |
@@ -196,7 +196,7 @@ The original MXFP4 checkpoints are roughly **a third** of the bf16 figure, not a
 | bf16 export, from the table above | 41.8 GB      | 233.7 GB     |
 | Ratio                             | 3.0×         | 3.6×         |
 
-So the export is where the disk goes — a factor of three at `bfloat16`, six to seven if you leave `--dtype` at its `float32` default. With `--dtype bfloat16` the raw 16-bit payload is written via `view(torch.uint16)`, so nothing is silently re-converted.
+So the export is where the disk goes — a factor of three at `bfloat16`, six to seven at the `float32` that `run` needs. With `--dtype bfloat16` the raw 16-bit payload is written via `view(torch.uint16)`, so nothing is silently re-converted, but nothing in this repository loads such a file: the loader would read it as fp32.
 
 ### One sharp edge
 
@@ -208,12 +208,12 @@ The CPU path runs off the mapping directly. The GPU path does not: [`src/getp/tr
 
 The upload is split into two allocations along the parallelism boundary:
 
-- `dev_linear_bf16` — embedding, unembedding, QKV, output projection, router. Replicated on every device.
-- `dev_experts` — only this device's `[expert_start, expert_end)` slice, copied layer by layer so that the expert axis stays contiguous and the MoE kernel can index it with a single stride.
+- `dev_linear_bf16` — embedding, unembedding, QKV, output projection (each `w_o` row padded by `GETP_AO_PAD` = 32 elements), router, and their biases. Replicated on every device.
+- `dev_experts` — only this device's `[expert_start, expert_end)` slice, copied layer by layer so that the expert axis stays contiguous and the MoE kernel can index it with a single stride. That is the initial placement: `GETP_EPLB`, on by default, moves a few experts per layer between devices during the run to even out the load (see [PARALLELISM.md](PARALLELISM.md#moving-experts-to-balance-the-load)).
 
 | Per device                      | 20B @ EP=2                | 120B @ EP=8               |
 | ------------------------------- | ------------------------- | ------------------------- |
-| Replicated (`dev_linear_bf16`)  | 3.35 GiB                  | 3.96 GiB                  |
+| Replicated (`dev_linear_bf16`)  | 3.35 GiB                  | 3.97 GiB                  |
 | Experts (`dev_experts`)         | 17.80 GiB                 | 26.71 GiB                 |
 | KV cache time slots (`total_t`) | 13,824 (12×128 + 12×1024) | 20,736 (18×128 + 18×1024) |
 | `BATCH_SIZE`                    | 1536 (largest input 1984) | 768 (largest input 1024)  |
@@ -221,7 +221,7 @@ The upload is split into two allocations along the parallelism boundary:
 
 K is bf16; V holds int8 codes and one fp32 scale per 64 values by default and is allocated at exactly that size (see [KERNELS.md](KERNELS.md)): 21.7 MB of cache per 20B sequence and 32.5 MB per 120B sequence. The row leaves out the region pads. `total_t` is where the alternating window pays off: windowed layers get 128 slots, full layers get `seq_len / 2 = 1024`, and the cache is addressed as a ring with `pos % cache_tcap`. A uniform 2048 slots per layer would have cost the 20B model roughly 3.5× the cache it actually uses.
 
-The two configurations land at close to the same total because `BATCH_SIZE` is the free variable: it fills whatever HBM the weights leave. It follows the input - `n_devices × BATCH_SIZE` requests - up to the most sequences that fit, 1984 per device for the 20B and 1024 for the 120B, and the fixed 1536 and 768 remain the defaults for a count that does not divide evenly. EP=2 for the 20B model is chosen for the same reason — the model fits on one device, but halving the expert footprint buys batch size, and batch size is throughput.
+The two configurations land at close to the same total because `BATCH_SIZE` is the free variable: it fills whatever HBM the weights leave. It follows the input: `warm_up` sets it to the request count divided by the device count when that divides evenly, capped at 1984 rows per device for the 20B (2016 still fits but runs 0.5 % slower) and 1024 for the 120B (1040 does not fit), and exits if the count needs more. A count that does not divide evenly keeps the fixed 1536 and 768, and the request split then fails an assert; `GETP_BATCH` fixes the rows per device instead. EP=2 for the 20B model is chosen for the same reason — the model fits on one device, but halving the expert footprint buys batch size, and batch size is throughput.
 
 One caveat in the cache sizing: a full-attention layer silently becomes a 1024-position window once `pos` passes 1023, because `t_start = MAX(0, pos + 1 - cache_tcap)`. The default `-n 1024` never reaches that point, but `-n 0` (which snaps `steps` to `seq_len = 2048`) would.
 
@@ -259,15 +259,15 @@ One leftover: `Tokenizer::byte_tokens[256]` is populated at load and never read 
 
 The harmony format wraps messages in control tokens. The ids appear in comments at the top of `generate()` and of the `getp` loops:
 
-| Token | id | Used in code? |
-| --- | ---: | --- |
-| `<\|endoftext\|>` | 199999 | yes — stop token |
-| `<\|return\|>` | 200002 | yes — stop token |
-| `<\|constrain\|>` | 200003 | no |
-| `<\|channel\|>` | 200005 | no |
-| `<\|start\|>` | 200006 | inert (see below) |
-| `<\|end\|>` | 200007 | no |
-| `<\|message\|>` | 200008 | no |
+| Token             |     id | Used in code?     |
+| ----------------- | -----: | ----------------- |
+| `<\|endoftext\|>` | 199999 | yes — stop token  |
+| `<\|return\|>`    | 200002 | yes — stop token  |
+| `<\|constrain\|>` | 200003 | no                |
+| `<\|channel\|>`   | 200005 | no                |
+| `<\|start\|>`     | 200006 | inert (see below) |
+| `<\|end\|>`       | 200007 | no                |
+| `<\|message\|>`   | 200008 | no                |
 
 Only the first two are acted on. Both `generate()` and the batch loop retire a sequence when the sampled token is 199999 or 200002. The one other live occurrence, `decode_piece(tokenizer, 200006, token)`, is inert because `decode_piece` discards its `prev_token` argument outright.
 
@@ -279,11 +279,11 @@ So the honest summary is: **no harmony template is rendered anywhere in this rep
 
 Two different length limits apply, which is easy to trip over: prompts are truncated at `initial_context_length` (4096) tokens inside `encode()`, while the generation loop is capped at `seq_len` (2048) and defaults to 1024 steps. The larger of the two is the tokenizer's.
 
-Scoring ([`tests/eval.py`](../tests/eval.py)) compares `tests/submission/output_{20b,120b}_token_ids.txt` against pre-baked references and asserts METEOR ≥ 0.3 and BERTScore F1 ≥ 0.9 (`tests/threshold.json`). Nothing in this repository regenerates those reference files, so the prompt formatting behind them cannot be verified from the tree alone. [`tools/run_transformers.py`](../tools/run_transformers.py) is a standalone Hugging Face demo with a hardcoded path and prompt — useful for a sanity check, not the reference generator, though it does tokenize with `add_special_tokens=False`.
+Scoring ([`tests/eval.py`](../tests/eval.py)) compares a submission against pre-baked references in `tests/references/` and asserts METEOR ≥ 0.3 and BERTScore F1 ≥ 0.9 (`tests/threshold.json`). With `-m` alone the submission is `tests/submission/output_{20b,120b}_token_ids.txt`: the completions of this engine's first complete version, which ran at 33,979 and 13,149 tok/s, not of the current one (the 20B file scores METEOR 0.533 / BERTScore 0.978); `-s` scores any other file. Nothing in this repository regenerates those reference files, so the prompt formatting behind them cannot be verified from the tree alone. [`tools/run_transformers.py`](../tools/run_transformers.py) is a standalone Hugging Face demo with a hardcoded path and prompt — useful for a sanity check, not the reference generator, though it does tokenize with `add_special_tokens=False`.
 
-The references used to be the wrong _shape_ for the runtime as well. Both `tests/references/output_{20b,120b}_token_ids.txt` hold exactly **4096 lines**, one completion each, and so do the two files under `tests/submission/`. At the old fixed batches, 1536 rows per device for the 20B and 768 for the 120B, `getp` accepted exactly 12288 requests for the 20B and multiples of 6144 for the 120B on eight devices, so no run could line up with them one-for-one. `warm_up` now takes the rows per device from the request count ([`src/getp/run.cpp`](../src/getp/run.cpp)), and [`tests/input.txt`](../tests/input.txt), which holds the 4096 prompts, runs as it is: 512 rows on each of eight devices, one completion per reference line. At 512 rows that is a quality check, not a throughput measurement. The full-speed inputs are 15872 requests for the 20B and 8192 for the 120B, and scoring one of those means scoring its first 4096 lines.
+The references used to be the wrong _shape_ for the runtime as well. Both `tests/references/output_{20b,120b}_token_ids.txt` hold exactly **4096 lines**, one completion each, and so do the two files under `tests/submission/`. At the old fixed batches, 1536 rows per device for the 20B and 768 for the 120B, `getp` accepted exactly 12288 requests for the 20B and multiples of 6144 for the 120B on eight devices, so no run could line up with them one-for-one. `warm_up` now takes the rows per device from the request count ([`src/getp/run.cpp`](../src/getp/run.cpp)), and [`tests/input.txt`](../tests/input.txt), which holds the 4096 prompts, runs as it is: 512 rows on each of eight devices, one completion per reference line. At 512 rows that is a quality check, not a throughput measurement; the current engine scores METEOR 0.5198 / BERTScore 0.9777 on it with the 20B and 0.5470 / 0.9798 with the 120B. The full-speed inputs are 15872 requests for the 20B and 8192 for the 120B, and scoring one of those means scoring its first 4096 lines: 0.5159 / 0.9771 and 0.5524 / 0.9800.
 
-`eval.py` will not tell you. It aligns by index over `n = min(len(refs), len(subm))`, so a full-speed 15872-line 20B submission is silently scored on its first 4096 lines against these references, and a threshold met on about a quarter of the output reads exactly like a threshold met on all of it.
+`eval.py` does not warn about that. It aligns by index over `n = min(len(refs), len(subm))`, so a full-speed 15872-line 20B submission is scored on its first 4096 lines against these references with nothing but `items 4096` in the output to say so, and a threshold met on about a quarter of the output reads exactly like a threshold met on all of it.
 
 ## Sampling
 
@@ -300,7 +300,7 @@ if (sampler->temperature == 0.0f) {
 }
 ```
 
-At temperature 0 the raw logits are used — no division, no softmax, no RNG draw. Since **0.0 is the default**, the default run is bit-reproducible for a fixed build (on the 20B, all but a rare full-length run - see the README), and both `-p 0.9` (top-p) and `-s` (seed, otherwise `time(NULL)`) are dead unless `-t` is raised. Above zero it is the llama2.c path unchanged: divide, softmax, then `sample_mult` or `sample_topp`, the latter cropping candidates below `(1 - topp) / (n - 1)` before a `qsort` so the nucleus filter does not sort 201,088 entries.
+At temperature 0 the raw logits are used — no division, no softmax, no RNG draw. Since **0.0 is the default**, the default run is bit-reproducible for a fixed build, and both `-p 0.9` (top-p) and `-s` (seed, otherwise `time(NULL)`) are dead unless `-t` is raised. Above zero it is the llama2.c path unchanged: divide, softmax, then `sample_mult` or `sample_topp`, the latter cropping candidates below `(1 - topp) / (n - 1)` before a `qsort` so the nucleus filter does not sort 201,088 entries.
 
 | Flag             | Default      | Note                                       |
 | ---------------- | ------------ | ------------------------------------------ |
@@ -311,7 +311,7 @@ At temperature 0 the raw logits are used — no division, no softmax, no RNG dra
 
 ### Throughput path (`getp`)
 
-`getp` is greedy unconditionally. `coop_getp_generate` receives a `Sampler *`, ignores it — the parameter name is commented out and the call site passes `(Sampler *)NULL` — and the next token arrives from `getp_matmul_logits_argmax_bf16`, which **fuses the unembedding GEMM with the argmax**. The 201,088-wide logit row is reduced inside the kernel and never written to memory; `dev_s->logits` is left null. At batch 1536 that avoids materialising and re-reading roughly 1.2 GB of fp32 logits per step, which is the entire point.
+`getp` is greedy unconditionally. `coop_getp_generate` receives a `Sampler *`, ignores it — the parameter name is commented out and the call site passes `(Sampler *)NULL` — and the next token arrives from `getp_matmul_logits_argmax_bf16`, which **fuses the unembedding GEMM with the argmax**. The 201,088-wide logit row is reduced inside the kernel and never written to memory; `dev_s->logits` is left null. At 1536 rows that avoids materialising and re-reading roughly 1.2 GB of fp32 logits per device per step (1.6 GB at 1984), which is the entire point.
 
 The reduction carries a packed `(value, index)` pair in one 64-bit word and merges tiles with a single `atomicMax` on a monotone key:
 
@@ -325,19 +325,20 @@ The value sits in the high half in an order-preserving bit pattern, the index in
 The **intra-block** reduction inside `matmul_logits_argmax_bf16_kernel_tuned` looks like the router's rule and is not. It is two passes over the same accumulators:
 
 ```c
-// pass 1: value only, no epsilon
-float mv = atomicMaxFloat(&smax[ly], v);
-// pass 2: index, against the finished maximum
-float mv = smax[ly];
-float thr = 1e-6f * fmaxf(fabsf(v), fabsf(mv));
-if (fabsf(v - mv) <= thr) atomicMin(&sidx[ly], gx);
+// pass 1: value only, no epsilon (v: max over the lane's columns and its 16-lane group)
+if (lane16 == 0 && v > -INFINITY) atomicMaxFloat(&smax[ly], v);
+// pass 2: index, against the finished maximum (v: one accumulator)
+const float mv = smax[ly];
+const float thr = 1e-6f * fmaxf(fabsf(v), fabsf(mv));
+const bool hit = (gx < N) && (gy < M) && (fabsf(v - mv) <= thr);
+if (hit && gx < cand) cand = gx;   // then a 16-lane min and one atomicMin(&sidx[ly], cand)
 ```
 
-The first pass is a plain `atomicMaxFloat` with no tolerance at all, so after the `__syncthreads()` `smax[row]` holds the block's **exact** maximum. Only then does the second pass apply the epsilon, comparing every element against that fixed reference and taking `atomicMin` over the columns that qualify. The reference point does not move, so the smallest column within epsilon of the block maximum wins regardless of the order threads arrive in.
+The first pass is a plain `atomicMaxFloat` with no tolerance at all, so after the `__syncthreads()` `smax[row]` holds the block's **exact** maximum. Only then does the second pass apply the epsilon, comparing every element against that fixed reference and taking the minimum over the columns that qualify. Both passes reduce in registers and across the 16 lanes of a group with `__shfl_xor` before one lane per row issues the atomic (`GETP_LOGITS_EPI`, on by default); with `GETP_LOGITS_EPI=0` every element issues its own atomic, with the same result. The reference point does not move, so the smallest column within epsilon of the block maximum wins regardless of the order threads arrive in.
 
 The cross-block merge no longer has a second predicate to compare against. It used to measure against a moving reference — a candidate compared with whatever pair currently occupied the slot, which is not yet the global maximum — and since "within epsilon" is not a transitive relation, the winner depended on the order blocks arrived in, so the same binary could return different tokens on two runs. Packing `(value, −index)` into one monotone 64-bit key removed that: `atomicMax` on the key is a total order, so for a given set of logits the cross-block stage is exact and order-independent, and only the intra-block stage still carries an epsilon. `extract_argmax_pairs` reads back `unpack_idx` and throws the value away.
 
-The surviving intra-block epsilon is deliberately **more tolerant** than the CPU, not stricter: CPU `sample_argmax` uses a plain `>` and so also keeps the lowest index on an _exact_ tie, but it does not treat near-equal logits as tied. The epsilon buys no reproducibility, though: measured against a moving reference it was itself the source of run-to-run flips, which is why the cross-block stage dropped it. It is safe intra-block only because the reference there is already the block's exact maximum.
+The surviving intra-block epsilon is deliberately **more tolerant** than the CPU, not stricter: CPU `sample_argmax` uses a plain `>` and so also keeps the lowest index on an _exact_ tie, but it does not treat near-equal logits as tied. The epsilon buys no reproducibility, though: measured against a moving reference it was itself the source of run-to-run flips, which is why the cross-block stage dropped it. It is safe intra-block only because the reference there is already the block's exact maximum. With the expert exchanges fixed as well ([PARALLELISM.md](PARALLELISM.md)), two runs of the same binary on the same input file produce identical output; a completion still depends on where its prompt sits in the batch ([tests/README.md](../tests/README.md)).
 
 The genuinely divergent path is on the CPU side: `topk()` sorts router scores with `qsort` and a comparator returning 0 on equality, so expert ordering among equal router scores is unspecified there. Router weights are softmaxed over the selected top-k only, after selection, on both sides.
 

@@ -4,7 +4,9 @@ This directory contains scripts to prepare the **7m parameter GPT-OSS model** fo
 The process converts the Hugging Face checkpoint into a single `.bin` file that can be directly loaded.
 
 1. **Convert state dict**
-   Run the key conversion script on the downloaded Hugging Face weights. This step renames tensors’ keys into the expected format.
+   Run the key conversion script on the downloaded Hugging Face weights. This step renames the
+   tensors' keys into the expected format, concatenates q, k and v into one `qkv` tensor per layer,
+   transposes the expert weights and copies the embedding as the unembedding.
 
 ```bash
 python "${GPT_OSS_REPO_ROOT}/tools/model_export/gpt-oss-7m/convert_state_dict.py" \

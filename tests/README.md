@@ -67,9 +67,13 @@ srun --gres=gpu:2 python eval.py -m 120b
 - `-e, --encoding NAME` (default: `o200k_harmony`)
   Tiktoken encoding used to decode token IDs.
 
-Run `python eval.py -h` for the full help text. See the docstring in `eval.py` for details on defaults and behavior.
+Run `python eval.py -h` for the full help text. See the docstring in `eval.py` for details on
+defaults and behavior.
 
-> `threshold.json` must be present in the `tests/` folder: `eval.py` opens it before it even parses arguments, so a missing file aborts the run with `FileNotFoundError`. It holds the target thresholds for METEOR and BERTScore F1, and the script **raises an `AssertionError`** if either metric is below its threshold.
+> `threshold.json` must be present in the `tests/` folder: `eval.py` opens it before it even parses
+> arguments, so a missing file aborts the run with `FileNotFoundError`. It holds the target
+> thresholds for METEOR and BERTScore F1, and the script **raises an `AssertionError`** if either
+> metric is below its threshold.
 
 ## Sample output (truncated)
 
@@ -118,7 +122,7 @@ bertscore_f1    0.98164
 Both models' completions in `submission/` come from runs on 8x AMD MI250, scored over the first 4096
 of 12288 (20B) and 6144 (120B) requests -- on this engine's first complete version, which ran at
 33,979 and 13,149 tok/s, not the current one. The current one scores METEOR 0.516 / BERTScore 0.977
-on 20B and 0.548 / 0.980 on 120B at its largest batches, and 0.520 / 0.978 and 0.547 / 0.980 on
+on 20B and 0.552 / 0.980 on 120B at its largest batches, and 0.520 / 0.978 and 0.547 / 0.980 on
 `input.txt` as it is. Reproducing the table's last two columns therefore means re-running `getp` on
 this commit and re-scoring, not scoring the files committed here.
 
@@ -127,9 +131,9 @@ this commit and re-scoring, not scoring the files committed here.
 ## Scoring your own run
 
 `getp` takes the rows per GPU from the request count, `num_reqs / n_devices`, up to 1984 for 20B and
-1024 for 120B (see the [main README](../README.md)). The reference files here hold 4096 completions,
-one per prompt of `input.txt`, and `input.txt` is itself a valid input: on eight GPUs it runs at 512
-rows per GPU, and its output lines up one-for-one with the references:
+1024 for 120B (see [Run a batch](../README.md#5-run-a-batch) in the main README). The reference files
+here hold 4096 completions, one per prompt of `input.txt`, and `input.txt` is itself a valid input: on
+eight GPUs it runs at 512 rows per GPU, and its output lines up one-for-one with the references:
 
 ```bash
 ../run ../gpt-oss-20b.bin -m getp -i input.txt -o /tmp/out.txt -z ../tokenizer.bin
@@ -151,11 +155,12 @@ Completions are written in request order, so output line _i_ is the answer to pr
 
 The engine is reproducible: two runs of the same binary on the same input file produce identical
 output, and that is how changes are validated here -- the 20B against output hash 81e82a2c077f and
-the 120B against 5ab5041b86f2 on the standard inputs, both with zero differing lines. (Both hashes
-have changed by design along the way, each time a change that moves the numbers was accepted on its
-METEOR and BERTScore instead; the main README marks those rows.) Hashing the output, not METEOR or
-BERTScore, is therefore the gate for any change that is supposed to move no numbers; the scores are
-the coarse backstop, too noisy to accept or reject a sub-percent change.
+the 120B against 5ab5041b86f2 on the standard inputs (22ce0d3418b7 and 8254b50f71f9 on the largest),
+both with zero differing lines. (The hashes have changed by design along the way, each time a change
+that moves the numbers was accepted on its METEOR and BERTScore instead; the main README marks those
+rows.) Hashing the output, not METEOR or BERTScore, is therefore the gate for any change that is
+supposed to move no numbers; the scores are the coarse backstop, too noisy to accept or reject a
+sub-percent change.
 
 It was not always so. Before the expert exchange became a pull, a receiver could read a peer's buffer
 while it was still being written, and two 8-GPU runs of the same binary agreed on only 50 % to
