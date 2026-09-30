@@ -23,7 +23,7 @@ hipBLAS, no RCCL, no MPI. Every kernel, every collective and the tokenizer are w
 this repository. The only dependency is the HIP runtime itself.
 
 It began from [llama2.c](https://github.com/karpathy/llama2.c) and grew into a complete inference system.
-On a single node of 8 AMD MI250 GPUs it serves **81,100 tokens per second on the 20B model and 36,978 on
+On a single node of 8 AMD MI250 GPUs it serves **84,450 tokens per second on the 20B model and 40,270 on
 the 120B model**, while keeping the generated text faithful to a CPU reference.
 
 Two things are measured, and both have to hold:
@@ -123,19 +123,27 @@ Interactive chat, optionally with a system prompt:
 
 `getp` is the batch serving mode, and the one every throughput number on this page comes from.
 
-**It will not take an arbitrary request count.** `inference()` asserts that each model replica's slice
-of the file divides evenly into `EXPERT_PARALLELISM × BATCH_SIZE` blocks — 2 × 1536 = 3072 requests for
-the 20B model, 8 × 768 = 6144 for the 120B on eight GPUs. The 20B path then pins the total exactly:
-`Model_20b::distribute_requests` asserts `requests_per_model == EXPERT_PARALLELISM × BATCH_SIZE`, which
-works out to `n_devices × 1536` requests and nothing else — 12,288 on eight GPUs. The 120B path carries
-no such assert; `Model_120b::distribute_requests` walks its slice in chunks of
-`EXPERT_PARALLELISM × BATCH_SIZE`, so any positive multiple of 6,144 runs, one chunk after another. The
-two counts in the [results table](#results) are 12,288 and 6,144. A count that satisfies neither rule
-trips an assert in [`src/getp/run.cpp`](src/getp/run.cpp), and **none of the input files shipped in
-this repository is the right length**; they declare 32, 256, 448, 3584 and 4096. Build one that fits:
+**The request count sets the batch.** Before it uploads any weight, `warm_up` reads the count on the
+input file's first line and, when it divides evenly by the number of GPUs, serves `count / n_devices`
+rows on each GPU at once. Each step then produces that many tokens per GPU for nearly the same weight
+traffic, so the largest input is the fastest one. The ceiling is what fits in a 64 GB MI250 device:
+1984 rows for the 20B model and 1024 for the 120B (`GETP_BATCH_CAP_20B` and `GETP_BATCH_CAP_120B` in
+[`src/getp/run.cpp`](src/getp/run.cpp)). On eight GPUs that is 15,872 and 8,192 requests, the two
+counts in the [results table](#results). A count over the ceiling stops right there, with
+`N requests need R rows per GPU; at most C fit`.
+
+A count that does not divide by the GPU count cannot be split into equal batches. `warm_up` then keeps
+the old fixed batches, 1536 rows for the 20B and 768 for the 120B, and the request-count asserts in
+`inference()` reject the file, after warm-up has already run. `GETP_BATCH=<rows>` fixes the rows per
+GPU instead of reading them from the file, and skips the ceiling; the count must then be
+`n_devices × GETP_BATCH`.
+
+The input files shipped in this repository declare 32, 256, 448, 3584 and 4096 requests. All are
+multiples of eight, so on eight GPUs they run as batches of 4 to 512 rows: enough for a check, far
+from full speed. For throughput, build the largest:
 
 ```bash
-./run.sh mkinput 20b 8 input_20b.txt        # 12288 requests
+./run.sh mkinput 20b 8 input_20b.txt        # 15872 requests
 ./run.sh run gpt-oss-20b.bin -m getp -i input_20b.txt -o out.txt
 ```
 
@@ -147,13 +155,13 @@ The output file holds token ids, not text. Turn them back into words:
 ```
 
 Every visible GPU is used automatically — `warm_up` takes the count from `hipGetDeviceCount` and uses
-all of it. Eight is the ceiling, though: [`include/transformer.hpp`](include/transformer.hpp) pins `MAXIMUM_GPU` at 8, and the per-device sync state in [`src/hip/forward.hip`](src/hip/forward.hip) — `g_ev_sync` and its `g_ev_sync_ready` flags — is declared `[MAXIMUM_GPU]` and indexed by the absolute device index, before any peer-count check. `warm_up` never clamps the count, so past the eighth device the engine writes off the end of those arrays. To use fewer, regenerate the input for that count — the required size follows
+all of it. Eight is the ceiling, though: [`include/transformer.hpp`](include/transformer.hpp) pins `MAXIMUM_GPU` at 8, and the per-device sync state in [`src/hip/forward.hip`](src/hip/forward.hip) — `g_ev_sync` and its `g_ev_sync_ready` flags — is declared `[MAXIMUM_GPU]` and indexed by the absolute device index, before any peer-count check. `warm_up` never clamps the count, so past the eighth device the engine writes off the end of those arrays. To use fewer, regenerate the input for that count — the ceiling is per GPU, so the largest input follows
 the device count. The count itself has to be even for the 20B model, which pins
 `EXPERT_PARALLELISM = 2` and exits during warm-up when the device count is not divisible by it,
 however the input was sized:
 
 ```bash
-./run.sh mkinput 20b 2 input_2gpu.txt       # 3072 requests
+./run.sh mkinput 20b 2 input_2gpu.txt       # 3968 requests
 HIP_VISIBLE_DEVICES=0,1 ./run.sh run gpt-oss-20b.bin -m getp -i input_2gpu.txt -o out.txt
 ```
 
@@ -224,8 +232,12 @@ Measured on one node of 8× AMD MI250 in batch (`getp`) mode.
 
 | Model          | Requests | Warm-up (s) | Inference (s) | Throughput (TPS) | METEOR | BERTScore |
 | -------------- | -------: | ----------: | ------------: | ---------------: | -----: | --------: |
-| `gpt-oss-20b`  |    12288 |          29 |           145 |        **81100** |  0.513 |     0.976 |
-| `gpt-oss-120b` |     6144 |          40 |           164 |        **36978** |  0.550 |     0.980 |
+| `gpt-oss-20b`  |    15872 |          25 |           180 |        **84451** |  0.516 |     0.977 |
+| `gpt-oss-120b` |     8192 |          45 |           201 |        **40271** |  0.548 |     0.980 |
+
+Both inputs are the largest that fit, 1984 and 1024 rows per GPU (see [Run a batch](#5-run-a-batch)).
+The standard inputs of the earlier results, 12,288 and 6,144 requests at 1536 and 768 rows, run at
+82,013 and 37,216 tok/s.
 
 Where those numbers came from, one optimisation at a time on the 20B model:
 
@@ -253,7 +265,10 @@ Where those numbers came from, one optimisation at a time on the 20B model:
 | RMSNorm one wave per row; router GEMM fused; expert-output gather at 16 bytes a thread, the pair's slice first |      77145 |  +2.4% |
 | The value half of the KV cache stored as int8 § |      78502 |  +2.3% |
 | Experts moved between the two GPUs of each pair too ¶ |      78955 |  +0.6% |
-| Finished requests routed to no expert |  **81100** |  +2.8% |
+| Finished requests routed to no expert |      81100 |  +2.8% |
+| Attention-out operands padded off a power-of-two row stride |      82181 |  +0.9% |
+| Rows per GPU taken from the request count: 1984 on the largest input ∥ |      83305 |  +1.4% |
+| Router split of 6 or 7 rounded up to 8, so the largest batch keeps the fused router ∥ |  **84451** |  +1.2% |
 
 The 120B model reached 20,426 tok/s on that same work without a single change written for it: it runs
 the same kernels with the same defaults. Past that point it needed its own work, because its bottleneck
@@ -276,7 +291,9 @@ is not the same one:
 | RMSNorm one wave per row; router GEMM fused; expert-output gather and row adds at 16 bytes a thread |      34526 |  +6.5% |
 | Both expert exchanges as one kernel each, reading the peers' memory directly |      36111 |  +4.2% |
 | The value half of the KV cache stored as int8 § |      36564 |  +1.6% |
-| Finished requests routed to no expert |  **36978** |  +1.1% |
+| Finished requests routed to no expert |      36978 |  +1.1% |
+| Attention-out operands padded off a power-of-two row stride |      37216 |  +0.5% |
+| Rows per GPU taken from the request count: 1024 on the largest input ∥ |  **40271** |  +8.2% |
 
 Each percentage is a paired measurement: the two builds run alternately in one session, against the
 same input, mostly twice each - except the four-stream and expert-move rows, which rest on one to three
@@ -287,7 +304,11 @@ each table were measured on top of each other in one sitting and then verified t
 previous shipped build: 81,100 against 75,209 tok/s on the 20B (+7.8 %) and 36,978 against 32,532 on the 120B
 (+13.7 %). The numbers that stand behind the summary above are those verification runs: the median of
 five full-length 20B runs (81,022 to 81,308 tok/s, inference 144.7-145.2 s) and the lower of two 120B runs (36,978 and
-37,118).
+37,118). The rows after them were verified the same way against that shipped build, one sitting per
+model: its two runs on the standard input, 81,583 and 81,552 on the 20B and 37,054 and 37,042 on the
+120B, against two runs of the new build on the largest input, 84,581 and 84,321 on the 20B and 40,299
+and 40,244 on the 120B. In all, +3.5 % on the 20B and +8.7 % on the 120B. The router row does not
+touch the 120B, whose split is always 8.
 
 Every row is bit-exact except the marked ones, which change the numbers by design and were therefore
 accepted on METEOR and BERTScore (thresholds 0.3 and 0.9) rather than on a hash. The two 120B rows
@@ -311,7 +332,23 @@ the 120B's 0.5545 became 0.548. Keys stay bf16: with K in int8 as well the 20B f
 
 ¶ The same moves as ‡, now inside each 20B pair: METEOR 0.519 to 0.512 (with § in place).
 
-The shipped build scores METEOR 0.5135 and BERTScore 0.9763 on the 20B, 0.5496 and 0.9798 on the 120B.
+∥ The batch row compares not two builds on one input but one build on two: the largest inputs hold 29 % (20B) and 33 %
+(120B) more requests than the standard ones, the same prompts cycled, and the rows per GPU follow.
+Every row keeps its hashes on the standard inputs (`81e82a2c077f`, `5ab5041b86f2`); the largest
+inputs hash to `22ce0d3418b7` and `6bc533706417` from run to run, and were scored on METEOR and
+BERTScore at their batch. The router row changes the largest 20B input only, from a sum over seven
+splits to the eight-split sum every smaller batch uses (`5393df93d79b` before it). Its output
+changes, so does its length, and on this input the two ∥ rows split the gain unevenly: the prompts
+cycled from the benchmark file generate 957.6 tokens per request at 1536 rows, 947.0 at 1984 rows with
+seven splits and 959.1 with eight. So the batch row's +1.4 % is on 1.1 % fewer tokens a request and
+the router row's +1.2 % on 1.3 % more, in the same 180 s. On the reference prompts, where both router
+builds generate the same tokens to within 0.01 %, the router row is worth +0.9 % (190.1 against 191.8
+s, across two sittings). The total from the shipped build compares like with like: 957.6 against
+959.1 tokens a request on the 20B, 987.8 against 988.7 on the 120B.
+
+This build scores METEOR 0.5159 and BERTScore 0.9771 on the 20B at 1984 rows, 0.5484 and 0.9800 on the
+120B at 1024 rows (the first 4096 completions of each largest run, on the reference prompts), and
+0.5198 / 0.9777 and 0.5470 / 0.9798 on the shipped 4096-request input, which runs at 512 rows.
 
 At expert parallelism 8 the 120B spent 63% of every step with the GPUs idle, nearly all of it waiting
 on the expert exchange. The output half was seven dense 8.85 MB blocks per layer, one per peer,
@@ -397,6 +434,23 @@ on the benchmark input; they now go to no expert (+2.8 % and +1.1 %). Two change
 speed: the value half of the KV cache in int8, which takes a full 20B attention layer at 1024 keys
 from 2605 to 1952 µs, and expert moves inside the 20B's pairs.
 
+The last rows are about memory and the shape of the input. The attention-out GEMM ran well under the
+LM head on the same tile: its loads waited on L2 69 % of the time, and its matrix cores were 51 % busy
+against the LM head's 89 %. Both of its operands had rows of 8192 bytes, a power of two, so a tile's
+rows met on a few memory channels, the effect the KV region pad had fixed before. Padding each row by
+64 bytes took the GEMM from 445 to 388 µs at the 20B's batch, bit-exact. And the batch had been a
+constant, 1536 or 768 rows per GPU, set while the int8 V cache still sat in a bf16-sized buffer. At
+its own size it frees almost a quarter of the cache, so the engine now takes the rows from the request
+count, up to the 1984 and 1024 per GPU that fit. Two things broke on the way up and are fixed. At 1024
+rows the 120B's expert moves had no room for their staging buffer and every move was skipped (35.8k
+tok/s instead of 40.3k); they now borrow mlp2's partial-sum scratch, which is idle between steps. And
+between 1889 and 2208 rows the 20B's router split its reduction seven ways instead of eight, which
+took it off the fused kernel and onto a split-K path whose chunk boundaries dropped 24 of the 2880
+inputs to every router logit: METEOR 0.357 at 1920 rows. Its chunks are now a multiple of 8, bit-exact
+at every batch used before, and a split of 6 or 7 is rounded up to 8, which puts those batches back on
+the fused router, +0.9 % at 1984 rows (see
+[KERNELS.md](docs/KERNELS.md#the-only-runtime-decision-is-split-k)).
+
 Warm-up is dominated by reading the checkpoint off disk, so it depends on whether the file is still in
 the page cache; it is not part of what the optimisation work changed.
 
@@ -410,7 +464,7 @@ optimisations in it, so they are not the ones those scores were computed from �
 scored without a GPU: `./run.sh eval 20b` reports METEOR 0.533 and BERTScore 0.978 on them, a hair
 under the table's METEOR and the same BERTScore.
 
-Repeating a run still moves throughput - by about 1 % between sessions, less within one: the five runs behind the 20B figure spread over 0.4 %, the two behind the 120B figure over 0.9 % - but it very rarely moves the completions.
+Repeating a run still moves throughput - by about 1 % between sessions, less within one: the two runs behind each figure spread over 0.3 % on the 20B and 0.14 % on the 120B - but it very rarely moves the completions.
 That was not always true: before the expert exchange was made pull-based, a receiver could read a peer's
 buffer while it was still being written, so two runs of the _same binary_ at 8 GPUs agreed on only about
 50 % to 95 % of output lines, run pair by run pair. With the pull in place the 120B reproduces its hash from run to run, and every optimisation listed above
@@ -418,7 +472,8 @@ except the marked ones was checked by hashing the output rather than by scoring 
 720709b86d36 and the 120B against the hash of the build before it, both with zero differing lines. The
 marked ones change the numbers by design; they were judged on METEOR and BERTScore instead, and the
 output still hashes identically from one run to the next (`5ab5041b86f2` on the 120B and `81e82a2c077f` on
-the 20B's benchmark input today; the 20B's 16-step gate is now `edddca087af7`). A hash is a far sharper
+the 20B's standard input today, `6bc533706417` and `22ce0d3418b7` on the largest; the 20B's 16-step gate
+is now `edddca087af7`). A hash is a far sharper
 instrument than METEOR when the claim is that a change moved no numbers, and it is what makes a 0.6%
 win safe to accept.
 

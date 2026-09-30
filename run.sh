@@ -56,14 +56,14 @@ ${B}EXAMPLES${R}
   ./run.sh run gpt-oss-20b.bin -m chat -y "You are a concise assistant."
 
   ${DIM}# batch serving - this is the mode the throughput numbers come from.${R}
-  ${DIM}# getp accepts exactly n_devices x 1536 requests (20b) or n_devices x 768 (120b),${R}
-  ${DIM}# so build the input file first - none of the shipped ones is the right length.${R}
-  ./run.sh mkinput 20b 8 input_20b.txt  ${DIM}# 12288 requests${R}
+  ${DIM}# getp takes n_devices x rows requests and serves that many rows per GPU, up to 1984 (20b)${R}
+  ${DIM}# or 1024 (120b); mkinput writes the largest. The shipped files are small batches.${R}
+  ./run.sh mkinput 20b 8 input_20b.txt  ${DIM}# 15872 requests${R}
   ./run.sh run gpt-oss-20b.bin -m getp -i input_20b.txt -o out.txt
   ./run.sh decode -i out.txt            ${DIM}# read those completions back as text${R}
 
   ${DIM}# restrict to two GPUs (every visible GPU is used by default, up to 8)${R}
-  ./run.sh mkinput 20b 2 input_2gpu.txt ${DIM}# 3072 requests${R}
+  ./run.sh mkinput 20b 2 input_2gpu.txt ${DIM}# 3968 requests${R}
   HIP_VISIBLE_DEVICES=0,1 ./run.sh run gpt-oss-20b.bin -m getp -i input_2gpu.txt -o out.txt
 
   ${DIM}# tokenizer sanity check${R}

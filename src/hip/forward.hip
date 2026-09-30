@@ -432,9 +432,10 @@ void getp_rmsnorm_f32_bf16(float *o, __hip_bfloat16 *ob, float *x,
 // Decode attention reads the whole cache every step and is bound by those bytes: a 64-dim head
 // vector costs 128 bytes in bf16, 68 as int8 codes plus one fp32 scale per (position, sequence,
 // kv_head) vector.
-// Layout, no new allocation: code e sits at byte e of the bf16-sized allocation (the same
-// GETP_KV_OFF offsets, counted in bytes) and the scale of the vector starting at element e is float
-// e/64 of the allocation's upper half (getp_kv8_scales), so a 16-key tile has 16 consecutive scales.
+// Layout: code e sits at byte e of the tensor's allocation (the same GETP_KV_OFF offsets, counted in
+// bytes); the codes are followed, at the next 256-byte boundary, by one fp32 scale per 64-element
+// vector, the scale of the vector starting at element e being float e/64 there (getp_kv8_scales), so
+// a 16-key tile has 16 consecutive scales. transformer.cpp allocates exactly that much.
 // Writer: the qkv epilogue. A row's 64 dims sit on the 16 lanes of a lane group x 4 values, so amax
 // takes four xor-shuffles; the code is round(x * 127 / amax) + 128.
 // Reader: one 16-byte load per lane per tile, dequantized while the LDS tile is staged: v_perm_b32
@@ -3755,7 +3756,11 @@ matmul_kernel_splitk_store_tuned(
   const int colBase = blockIdx.x * BNt;
 
   const int split = blockIdx.z;
-  const int kChunk = (K + splits - 1) / splits;
+  // A multiple of 8: the loader works in groups of 8 and zero-fills a group that crosses kEnd, and the
+  // next split starts at kBeg, so an unaligned boundary drops that group's head from both splits.
+  // With K = 2880 and 7 splits (the 20B at 1889..2208 rows per GPU, before the router rounded such
+  // splits up to 8), ceil(K / 7) = 412 lost 4 elements per boundary from every router logit.
+  const int kChunk = (((K + splits - 1) / splits) + 7) & ~7;
   const int kBeg = split * kChunk;
   const int kEnd = min(K, kBeg + kChunk);
 
@@ -4314,6 +4319,22 @@ void getp_vecadd(float *x, float *y, int size, int batch_size,
 #ifndef GETP_ATTN_PREFETCH2
 #define GETP_ATTN_PREFETCH2 1
 #endif
+// GETP_AO_PAD (elements, default 32): row padding of both attn_o operands - the attention output
+// [B][n_heads x head_dim] and W_o [H][n_heads x head_dim]. Their natural stride, 4096 x bf16 = 8192
+// bytes, is a power of two, so the rows of a GEMM tile fall on few L2 channels; 64 bytes more per
+// row spreads them (op test: attn_o -10 %, bit-identical). Must be a multiple of 32 (64-byte rows);
+// transformer.cpp holds the same defaults and allocates W_o and attn_o_bf16 with it.
+#ifndef GETP_AO_PAD
+#define GETP_AO_PAD 32
+#endif
+#ifndef GETP_AO_PADX
+#define GETP_AO_PADX GETP_AO_PAD
+#endif
+#ifndef GETP_AO_PADW
+#define GETP_AO_PADW GETP_AO_PAD
+#endif
+static_assert(GETP_AO_PADX % 32 == 0 && GETP_AO_PADW % 32 == 0,
+              "GETP_AO_PAD* must keep the rows 64-byte aligned");
 template <int HPW, bool APPLY_MASK>
 __global__ void __launch_bounds__(64 * (8 / HPW))
 flash_attn_decode_mfma16_kernel(
@@ -4901,8 +4922,9 @@ flash_attn_decode_mfma16_kernel(
   // one head - so no extra LDS exchange is needed. The arithmetic is identical to
   // fp32_to_bf16_kernel: that kernel re-read these same 4 floats from HBM and called
   // f32_to_bf16bits. One full HBM read-and-write pass over the tensor disappears.
+  // Rows of tb_bf16 are n_attn_heads * head_dim + GETP_AO_PADX long (see GETP_AO_PAD).
   unsigned short *obase = reinterpret_cast<unsigned short *>(tb_bf16) +
-                          (size_t)b * n_attn_heads * head_dim;
+                          (size_t)b * (n_attn_heads * head_dim + GETP_AO_PADX);
   #pragma unroll
   for (int idx = lane; idx < HPW * HEAD_DIM / 4; idx += 64) {
     const int hh = idx / (HEAD_DIM / 4);
@@ -5459,9 +5481,9 @@ static inline void getp_dump_attn(const float *tb, int batch_size,
 }
 #endif
 
-// The scale array of an int8 KV allocation: its upper half. The int8 data takes kv_elems bytes of
-// the kv_elems bf16 slots transformer.cpp allocates (the same formula), so the scales - kv_elems/64
-// floats - start at the next 256-byte boundary and end well inside the allocation.
+// The scale array of an int8 KV allocation: the int8 codes take kv_elems bytes (the same formula as
+// transformer.cpp), and the kv_elems/64 fp32 scales start at the next 256-byte boundary, where the
+// allocation, sized for exactly that, ends.
 static inline float *getp_kv8_scales(void *cache, const Config *p, int B) {
   const int kv_dim = p->head_dim * p->n_kv_heads;
   const int even_layers = (p->n_layers + 1) / 2;
@@ -5486,6 +5508,9 @@ static inline void getp_flash_attn_decode_bf16(
     const float *k_scale_layer = nullptr, const float *v_scale_layer = nullptr) {
 #if GETP_KV8_ANY && !(FLASH_MFMA16_EVEN && FLASH_MFMA16_ODD)
 #error "GETP_KV8_* needs the mfma16 attention kernel on both layer kinds"
+#endif
+#if GETP_AO_PADX && !(FLASH_MFMA16_EVEN && FLASH_MFMA16_ODD)
+#error "GETP_AO_PADX needs the mfma16 attention kernel (the others write an unpadded tb)"
 #endif
 
   const int kv_dim = head_dim * n_kv_heads;
@@ -5574,6 +5599,9 @@ static inline void getp_gather_embedding_bf16(float *x,
 
 
 // Split count of getp_matmul_router_bf16, factored out so the fused kernel can reproduce it.
+#ifndef GETP_ROUTER_SPLITS_UP
+#define GETP_ROUTER_SPLITS_UP 6
+#endif
 static inline int getp_router_splits(int M, int N, int K) {
   constexpr int BM = 32, BK = 32;
   const int BNt = 32 * GETP_BN_AGG;
@@ -5586,6 +5614,9 @@ static inline int getp_router_splits(int M, int N, int K) {
   const int target_cta = cu * 4;
   int splits = (grid_xy >= target_cta) ? 1 : (target_cta + grid_xy - 1) / grid_xy;
   splits = min(8, max(1, splits));
+  // A split of 6 or 7 (the 20B at 1889..2656 rows) is rounded up to 8, the one split the fused router
+  // reproduces: a few more CTAs than the target cost less than the unfused pair (+0.9 % at 1984 rows).
+  if (splits >= GETP_ROUTER_SPLITS_UP) splits = 8;
   return min(splits, max(1, (K + BK - 1) / BK));
 }
 
@@ -5881,8 +5912,8 @@ constexpr int attn_o_lds_pad_slots(int BM_, int BN_, int NKC) {
 // describes; template argument AHEAD2), chosen per tile shape. Op test: the wide tile (BN 128, the
 // 20B, M = 1536) 503 -> 446 us, the narrow one (BN 64, the 120B, M = 768) 284 -> 302 us, so the
 // narrow tile keeps the one-ahead loop. Bit-exact either way. GETP_ATTN_O_MINW_WIDE promises the
-// register allocator that many waves per SIMD for the wide tile (1 = no promise; 3, which would keep
-// three blocks per CU, measured 489 us).
+// register allocator that many waves per SIMD for the wide tile (1 = no promise; 3 keeps three
+// blocks per CU: 489 us against 446 on the unpadded operands, 388 against 400 with GETP_AO_PAD).
 #ifndef GETP_ATTN_O_AHEAD2_WIDE
 #define GETP_ATTN_O_AHEAD2_WIDE 1
 #endif
@@ -5890,7 +5921,7 @@ constexpr int attn_o_lds_pad_slots(int BM_, int BN_, int NKC) {
 #define GETP_ATTN_O_AHEAD2_NARROW 0
 #endif
 #ifndef GETP_ATTN_O_MINW_WIDE
-#define GETP_ATTN_O_MINW_WIDE 1
+#define GETP_ATTN_O_MINW_WIDE 3
 #endif
 // MFMAs between two consecutive HBM loads of the two-ahead loop.
 #ifndef GETP_ATTN_O_LOAD_GAP
@@ -5920,6 +5951,8 @@ matmul_attn_o_bf16_kernel_tuned(
     const __hip_bfloat16 *__restrict__ w,
     const __hip_bfloat16 *__restrict__ b,
     int M, int N, int K) {
+  const int LDX = K + GETP_AO_PADX;  // row strides of x and w, see GETP_AO_PAD
+  const int LDW = K + GETP_AO_PADW;
 
   constexpr int MFMA_M = 16;
   constexpr int MFMA_N = 16;
@@ -6020,7 +6053,7 @@ matmul_attn_o_bf16_kernel_tuned(
 
     if (rg < M && kk + 7 < K) {
       // Fast path: uint4 load (8 bf16 = 16 bytes)
-      const uint4* p = reinterpret_cast<const uint4*>(x + (size_t)rg * K + kk);
+      const uint4* p = reinterpret_cast<const uint4*>(x + (size_t)rg * LDX + kk);
       const uint4 v = *p;
 
       // 8 consecutive k shorts = two slots -> two ds_write_b64 (was: 8 ds_write_b16).
@@ -6043,7 +6076,7 @@ matmul_attn_o_bf16_kernel_tuned(
 
     if (kk + 7 < K && cy < N) {
       // Fast path: vectorized uint4 load
-      const uint4* p = reinterpret_cast<const uint4*>(&w[(size_t)cy * K + kk]);
+      const uint4* p = reinterpret_cast<const uint4*>(&w[(size_t)cy * LDW + kk]);
       const uint4 tmp = *p;
 
       wsT[loadW_k0 + 0][loadWIdx_y + off] = attn_o_pack2(tmp.x, tmp.y);
@@ -6065,12 +6098,12 @@ matmul_attn_o_bf16_kernel_tuned(
     #pragma unroll
     for (int i = 0; i < nbLoadsX8; ++i) {
       const int rg = min(BM * (int)blockIdx.y + loadX_y8 + i * strideX8, M - 1);
-      rX[i] = *reinterpret_cast<const uint4*>(x + (size_t)rg * K + kc + X_LOAD_VEC * loadX_x8);
+      rX[i] = *reinterpret_cast<const uint4*>(x + (size_t)rg * LDX + kc + X_LOAD_VEC * loadX_x8);
     }
     #pragma unroll
     for (int i = 0; i < nbLoadsW; ++i) {
       const int cy = min(BN * (int)blockIdx.x + loadWIdx_y + i * strideW, N - 1);
-      rW[i] = *reinterpret_cast<const uint4*>(&w[(size_t)cy * K + kc + 8 * loadWIdx_x]);
+      rW[i] = *reinterpret_cast<const uint4*>(&w[(size_t)cy * LDW + kc + 8 * loadWIdx_x]);
     }
   };
   load_set(sX[1], sW[1], BK);
@@ -6163,7 +6196,7 @@ matmul_attn_o_bf16_kernel_tuned(
 
         if (row_tile < BM && rg < M && kk + 7 < K) {
           // Fast path: uint4 load (8 bf16)
-          const uint4* p = reinterpret_cast<const uint4*>(x + (size_t)rg * K + kk);
+          const uint4* p = reinterpret_cast<const uint4*>(x + (size_t)rg * LDX + kk);
           regX8[i] = *p;
         } else {
           regX8[i] = make_uint4(0,0,0,0);
@@ -6177,7 +6210,7 @@ matmul_attn_o_bf16_kernel_tuned(
         const int cy = BN * blockIdx.x + loadWIdx_y + off;
 
         if (kk + 7 < K && cy < N) {
-          const uint4* p = reinterpret_cast<const uint4*>(&w[(size_t)cy * K + kk]);
+          const uint4* p = reinterpret_cast<const uint4*>(&w[(size_t)cy * LDW + kk]);
           regW[i] = *p;
         } else {
           regW[i] = make_uint4(0,0,0,0);
@@ -7528,6 +7561,17 @@ int *getp_forward_120b(Transformer * /*transformer*/,
       ok = hipMalloc(&stage, sizeof(__hip_bfloat16) * n_ex * max_in) == hipSuccess;
       if (ok) stage_cap = max_in; else stage = nullptr;
     }
+    // No room for the staging (the 120B at 1024 rows per GPU): borrow z_partial, mlp2's scratch,
+    // which is idle between steps, when it is large enough.
+    __hip_bfloat16 *st_base = stage;
+    if (!ok) {
+      (void)hipGetLastError();
+      const size_t zp = sizeof(float) * (size_t)EXPERT_PARALLELISM * BATCH_SIZE * p->experts_per_token * hidden_dim;
+      if (sizeof(__hip_bfloat16) * n_ex * max_in <= zp) {
+        st_base = reinterpret_cast<__hip_bfloat16 *>(ext->z_partial);
+        ok = true;
+      }
+    }
     g_eplb_ok[device_index] = ok;
     sync_point.wait();
     bool all_ok = true;
@@ -7538,7 +7582,7 @@ int *getp_forward_120b(Transformer * /*transformer*/,
           const int src_lab = incoming[l][k].second, q = src_lab / epd, j = src_lab % epd;
           const DeviceTransformerWeights *sw = &dev_transformers[base_device_index + q]->weights;
           const int sdev = workers[q].device_index;
-          __hip_bfloat16 *st = stage + k * n_ex;
+          __hip_bfloat16 *st = st_base + k * n_ex;
           const size_t e = (size_t)l * epd + j;
           HIP_CHECK(hipMemcpyPeerAsync(st, device_index, sw->w_mlp1 + e * n_w1, sdev,
                                        sizeof(__hip_bfloat16) * n_w1, memory_stream));
@@ -7553,7 +7597,7 @@ int *getp_forward_120b(Transformer * /*transformer*/,
         sync_point.wait();   // every rank has READ its sources for this layer: slots may change now
         for (size_t k = 0; k < incoming[l].size(); ++k) {
           const size_t e = (size_t)l * epd + incoming[l][k].first;
-          const __hip_bfloat16 *st = stage + k * n_ex;
+          const __hip_bfloat16 *st = st_base + k * n_ex;
           HIP_CHECK(hipMemcpyAsync(dev_w->w_mlp1 + e * n_w1, st, sizeof(__hip_bfloat16) * n_w1,
                                    hipMemcpyDeviceToDevice, memory_stream));
           HIP_CHECK(hipMemcpyAsync(dev_w->b_mlp1 + e * n_b1, st + n_w1, sizeof(__hip_bfloat16) * n_b1,
@@ -7682,7 +7726,7 @@ int *getp_forward_120b(Transformer * /*transformer*/,
     }
 
     __hip_bfloat16 *dev_w_o =
-        dev_w->w_o_bf16 + 1ll * l * (head_dim * p->n_attn_heads) * hidden_dim;
+        dev_w->w_o_bf16 + 1ll * l * (head_dim * p->n_attn_heads + GETP_AO_PADW) * hidden_dim;
     __hip_bfloat16 *dev_b_o = dev_w->b_o_bf16 + 1ll * l * hidden_dim;
     // attention has already written bf16 into attn_o_bf16; the matmul adds straight into dev_x.
     getp_matmul_attn_o_bf16_acc(dev_x, ext->attn_o_bf16, dev_w_o, dev_b_o,
@@ -8396,7 +8440,7 @@ int *getp_forward_20b(Transformer * /*transformer*/,
     }
 
     __hip_bfloat16 *dev_w_o =
-        dev_w->w_o_bf16 + 1ll * l * (head_dim * p->n_attn_heads) * hidden_dim;
+        dev_w->w_o_bf16 + 1ll * l * (head_dim * p->n_attn_heads + GETP_AO_PADW) * hidden_dim;
     __hip_bfloat16 *dev_b_o = dev_w->b_o_bf16 + 1ll * l * hidden_dim;
     // getp_new_matmul(dev_s->tb2, dev_s->tb, dev_w_o, dev_b_o,
     //                     head_dim * p->n_attn_heads, hidden_dim,

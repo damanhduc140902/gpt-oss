@@ -31,7 +31,7 @@ subsequent line verbatim into two flat arenas:
 Both are `calloc`ed whole in `build_requests` ([`src/getp/eval.cpp:17-28`](../src/getp/eval.cpp)).
 The `max_seq_len` passed in is `steps`, that is the `-n` value clamped to the model's `seq_len`, so
 the arena grows with the step budget rather than with the prompts. The product is large enough to be
-worth stating. At the 12288 requests the 20B path demands, the default `-n 1024`, and
+worth stating. At the 12288 requests of the standard 20B input, the default `-n 1024`, and
 `max_token_length` (the longest token in `tokenizer.bin`) at 128, `str_reqs` is
 12288 × 128 × 1025 ≈ **1.6 GB** of zeroed host memory and `tok_gens` a further
 12288 × 1025 × 4 ≈ **50 MB**. Both are allocated and touched before any GPU is opened, on the same
@@ -40,9 +40,10 @@ request gets the same slot whatever its prompt length, and the benchmark prompts
 characters, so well over 99 % of that 1.6 GB is zeros.
 
 That product is also computed in `int` before it reaches `calloc`: 1.6 × 10⁹ still fits in a signed
-32-bit integer, but the same expression for a 16-device 20B run (24576 requests) would be
-3.2 × 10⁹ and overflow. The arena is sized for the batch the runtime was built for and not much
-more.
+32-bit integer, and so does the 2.08 × 10⁹ of the largest 8-GPU 20B input (15872 requests, see
+below), 3 % under the limit, but the same expression for a 16-device 20B run at the standard batch
+(24576 requests) would be 3.2 × 10⁹ and overflow. The arena is sized for the batch the runtime was
+built for and not much more.
 
 There are no arrival times, no priorities and no per-request objects. A request is an index. Everything
 downstream partitions that index space arithmetically, which is why the runtime needs no locking on
@@ -71,30 +72,38 @@ GPUs; for the 120B model with `EXPERT_PARALLELISM = 8` there is one group of eig
 
 How rigid the partition is differs between the two paths:
 
-|                                | 20B                                                     | 120B                                                                            |
-| ------------------------------ | ------------------------------------------------------- | ------------------------------------------------------------------------------- |
-| Model groups on 8 GPUs         | 4 (2 GPUs each)                                         | 1 (8 GPUs)                                                                      |
-| Rows per device (`BATCH_SIZE`) | 1536                                                    | 768                                                                             |
-| Requests per group             | 3072                                                    | 6144                                                                            |
-| Accepted request count         | exactly `n_devices × 1536` (12288 on 8 GPUs)            | any multiple of `n_devices × 768` (6144 on 8 GPUs) — but only on exactly 8 GPUs |
-| Enforced by                    | two asserts at [`run.cpp:268-269`](../src/getp/run.cpp) | the chunk loop in `Model_120b::distribute_requests`                             |
+|                                | 20B                                                                            | 120B                                                                               |
+| ------------------------------ | ------------------------------------------------------------------------------ | ---------------------------------------------------------------------------------- |
+| Model groups on 8 GPUs         | 4 (2 GPUs each)                                                                | 1 (8 GPUs)                                                                         |
+| Rows per device (`BATCH_SIZE`) | `num_reqs / n_devices`, at most 1984; 1536 if the count does not divide        | `num_reqs / n_devices`, at most 1024; 768 if the count does not divide             |
+| Requests per group             | 2 × `BATCH_SIZE`: 3072 at 1536, 3968 at 1984                                   | 8 × `BATCH_SIZE`: 6144 at 768, 8192 at 1024                                        |
+| Accepted request count         | a multiple of `n_devices`, at most `n_devices × 1984` (15872 on 8 GPUs)        | a multiple of `n_devices`, at most `n_devices × 1024` (8192 on 8 GPUs)             |
+| Enforced by                    | the row cap in `warm_up`, then two asserts in `Model_20b::distribute_requests` | the row cap in `warm_up`, then the chunk loop in `Model_120b::distribute_requests` |
 
-`Model_20b::distribute_requests` asserts both `n_parallel_models * requests_per_model ==
-requests->num_reqs` and `requests_per_model == EXPERT_PARALLELISM * BATCH_SIZE`, so on eight GPUs
-12288 = 4 groups × EP 2 × 1536 is the only count that runs. `Model_120b::distribute_requests` carries neither assert;
-it loops `for (idx = 0; idx < requests_per_model; idx += EXPERT_PARALLELISM * BATCH_SIZE)`, spawning
-a fresh thread set and a fresh `Barrier` for each 6144-request chunk and fully joining one chunk
-before starting the next. Both paths share the divisibility assert at
-[`run.cpp:518`](../src/getp/run.cpp).
+`Model_20b::distribute_requests` asserts both
+`n_parallel_models * requests_per_model == requests->num_reqs` and
+`requests_per_model == EXPERT_PARALLELISM * BATCH_SIZE`, so on eight GPUs the count must be 4 groups ×
+EP 2 × `BATCH_SIZE`. `BATCH_SIZE` used to be a constant, 1536, which made 12288 the only count that
+ran; `warm_up` now derives it from the count itself (see [Building an input file that
+runs](#building-an-input-file-that-runs)), so any multiple of eight up to 15872 passes.
+`Model_120b::distribute_requests` carries neither assert; it loops
+`for (idx = 0; idx < requests_per_model; idx += EXPERT_PARALLELISM * BATCH_SIZE)`, spawning a fresh
+thread set and a fresh `Barrier` for each chunk of `EXPERT_PARALLELISM × BATCH_SIZE` requests and
+fully joining one chunk before starting the next. At the fixed 768 rows that loop let the 120B run any
+multiple of 6144; with the batch taken from the count there is a single chunk, and more than one only
+when `GETP_BATCH` sets a smaller batch. Both paths share the divisibility assert in `inference`
+([`run.cpp`](../src/getp/run.cpp)).
 
 Which of the two `distribute_requests` implementations you get is decided by a bare
 `if (EXPERT_PARALLELISM == 8)` at [`run.cpp:524`](../src/getp/run.cpp), and that is a trap on a node
 with any other device count. The 120B path sets `EXPERT_PARALLELISM = n_devices`, so on four GPUs
 `EXPERT_PARALLELISM` is 4, the `== 8` test fails, and the 120B model is dispatched into
-`Model_20b::distribute_requests` — with the 120B `BATCH_SIZE` of 768. The run is not wrong, but it is
-not what the table above says: the chunk loop is gone, so instead of "any multiple of 6144" you get
-exactly one accepted count, `n_devices × 768` = 3072, enforced by the 20B asserts. The "any multiple
-of 6144" row holds on exactly eight devices and nowhere else.
+`Model_20b::distribute_requests` — with the 120B `BATCH_SIZE`. The run is not wrong, but it is not
+what the table above says: the chunk loop is gone, so a count of several
+`EXPERT_PARALLELISM × BATCH_SIZE` chunks — which at the old fixed 768 rows meant any multiple of
+`n_devices × 768`, and now needs `GETP_BATCH` below `num_reqs / n_devices` — fails the 20B asserts
+instead of running chunk by chunk. The chunk loop is reachable on exactly eight devices and nowhere
+else.
 
 The same loop contains an index confusion that is inert but confusing to read:
 `if (i == n_parallel_models - 1) workers[i].request_end = requests->num_reqs;` compares the _device_
@@ -104,8 +113,8 @@ the 20B model; for the 120B model it fires on the only group, where it is alread
 ## Building an input file that runs
 
 This is the first thing that stops anyone trying to reproduce the numbers, so it gets its own
-section. `getp` accepts exactly one request count, and no input file shipped in this repository is
-that count.
+section. `getp` accepts a request count only if it divides into the devices, and the count it is
+given also sets the batch every figure depends on.
 
 **The rule.** `Model_20b::distribute_requests` asserts two things
 ([`src/getp/run.cpp`](../src/getp/run.cpp)):
@@ -122,56 +131,76 @@ condition on the first line of the input file:
 num_reqs == n_devices × BATCH_SIZE
 ```
 
-`BATCH_SIZE` is 1536 for the 20B model and 768 for the 120B model, hard-coded in `warm_up`. So on
-eight GPUs:
+`BATCH_SIZE` used to be hard-coded in `warm_up`, 1536 for the 20B model and 768 for the 120B, which
+left exactly one count per model. It now follows the workload. `warm_up`, where every buffer is sized,
+is not given the requests — its signature belongs to the fixed harness — so `getp_input_request_count`
+reads the count itself: it finds the argument after `-i` in `/proc/self/cmdline` and reads the first
+line of that file. If the count divides evenly by `n_devices`, `BATCH_SIZE = num_reqs / n_devices`,
+provided that is at most the row cap (`GETP_BATCH_CAP_20B` = 1984, `GETP_BATCH_CAP_120B` = 1024; the
+next section has the measurements behind them). Above the cap the run stops at the start of `warm_up`,
+before any weight is uploaded, with `N requests need R rows per GPU; at most C fit`. If the count does
+not divide evenly, or the file cannot be read, the fixed defaults stay and the asserts behave as they
+always did. The environment variable `GETP_BATCH`, when set, fixes `BATCH_SIZE` instead and skips
+both the count and the cap, so the request count must then fit `GETP_BATCH` as the asserts demand:
+exactly `n_devices × GETP_BATCH` for the 20B, a multiple of it for the 120B. So on eight GPUs:
 
-| Model | `EXPERT_PARALLELISM` | `BATCH_SIZE` | Required `num_reqs` on 8 GPUs             |
-| ----- | -------------------- | ------------ | ----------------------------------------- |
-| 20B   | 2                    | 1536         | 8 × 1536 = **12288**                      |
-| 120B  | 8                    | 768          | 8 × 768 = **6144**, or any multiple of it |
+| Model | `EXPERT_PARALLELISM` | Row cap | Standard input                  | Largest input                    |
+| ----- | -------------------- | ------- | ------------------------------- | -------------------------------- |
+| 20B   | 2                    | 1984    | 8 × 1536 = **12288**, 1536 rows | 8 × 1984 = **15872**, 1984 rows  |
+| 120B  | 8                    | 1024    | 8 × 768 = **6144**, 768 rows    | 8 × 1024 = **8192**, 1024 rows   |
 
-Those are exactly the two "sequences in flight" figures in the results table. They are not defaults
-you get for free; they are the only counts the runtime accepts.
+The largest counts are the two "sequences in flight" figures in the results table; the standard
+ones, the counts of the earlier results, still run at 1536 and 768 rows per GPU. Any other multiple of eight up to the largest input is accepted at
+`num_reqs / 8` rows. On the 120B that replaces the old "any multiple of 6144": 12288, the next such
+multiple, is above the cap and stops.
 
-**What happens if you get it wrong.** Two asserts stand in the way and the first one is usually the
-one you meet: `inference` slices the requests across workers and checks each slice divides by
-`EXPERT_PARALLELISM × BATCH_SIZE` before it dispatches to either model, so that is where a badly
-sized file dies. Only a file that passes that check and still has the wrong total reaches the second
-assert, in `Model_20b::distribute_requests` ([`src/getp/run.cpp`](../src/getp/run.cpp)). Either way it
-is after warm-up has already spent its 23 s or 176 s uploading weights, because request distribution
-happens after `warm_up` returns. No target in the
-[`Makefile`](../Makefile) passes `-DNDEBUG`, so the asserts are live in the optimised build too;
-there is no configuration in which a wrong count silently produces a short run. On a device count
-other than eight, add the dispatch trap described above: the 120B model lands in the 20B code path
-and inherits these same two asserts.
+**What happens if you get it wrong.** A count above the cap stops before warm-up has uploaded
+anything. Every other mistake meets the asserts, and the first one is usually the one you meet:
+`inference` slices the requests across workers and checks each slice divides by
+`EXPERT_PARALLELISM × BATCH_SIZE` before it dispatches to either model, so that is where a badly sized
+file dies. Only a file that passes that check and still has the wrong total reaches the second assert,
+in `Model_20b::distribute_requests` ([`src/getp/run.cpp`](../src/getp/run.cpp)). Either way it is
+after warm-up has already spent its 23 s or 176 s uploading weights, because request distribution
+happens after `warm_up` returns. Since the batch is derived from the count, what reaches the asserts
+now is a count that does not divide by `n_devices` (which keeps the fixed default) or a `GETP_BATCH`
+that does not match the file. No target in the [`Makefile`](../Makefile) passes `-DNDEBUG`, so the
+asserts are live in the optimised build too; there is no configuration in which a wrong count silently
+produces a short run. On a device count other than eight, add the dispatch trap described above: the
+120B model lands in the 20B code path and inherits these same two asserts.
 
-**Every shipped input fails it**, not just the obvious one:
+**The shipped inputs** were all rejected while the batch was fixed. Every one of them declares a
+multiple of eight, so on eight GPUs they now pass the count rule, each at a batch far below the ones
+this page measures; none of those small-batch runs is measured here:
 
-| File                                              | Declared requests | Runs on 8 GPUs?                                     |
-| ------------------------------------------------- | ----------------- | --------------------------------------------------- |
-| [`tests/input.txt`](../tests/input.txt)           | 4096              | no — needs 12288 (20B) or a multiple of 6144 (120B) |
-| [`tests/data/input.txt`](../tests/data/input.txt) | 32                | no                                                  |
-| `tests/data/input_test.txt`                       | 256               | no                                                  |
-| `tests/data/input_original.txt`                   | 448               | no                                                  |
-| `tests/data/input-multi.txt`                      | 3584              | no                                                  |
+| File                                              | Declared requests | Rows per GPU on 8 GPUs |
+| ------------------------------------------------- | ----------------- | ---------------------- |
+| [`tests/input.txt`](../tests/input.txt)           | 4096              | 512                    |
+| [`tests/data/input.txt`](../tests/data/input.txt) | 32                | 4                      |
+| `tests/data/input_test.txt`                       | 256               | 32                     |
+| `tests/data/input_original.txt`                   | 448               | 56                     |
+| `tests/data/input-multi.txt`                      | 3584              | 448                    |
 
-[`run.sh`](../run.sh) no longer points its worked example at any of them: its usage text states the
-rule outright and its `getp` example builds a file with `mkinput` first (`run.sh:59-62`). Invoking
-the binary by hand against a shipped file still aborts at the assert on an eight-GPU node. The two
+[`run.sh`](../run.sh) does not point its worked example at any of them: its usage text states the
+rule and its `getp` example builds a file with `mkinput` first (`run.sh:59-62`). The two
 reference files, [`tests/references/output_20b_token_ids.txt`](../tests/references/output_20b_token_ids.txt)
-and `output_120b_token_ids.txt`, have 4096 lines each, so they match neither accepted count and
-cannot be compared row-for-row against a valid 12288- or 6144-request run.
+and `output_120b_token_ids.txt`, have 4096 lines each, so they cannot be compared row-for-row against
+a 12288-, 15872-, 6144- or 8192-request run.
 
 **Making a valid file.** [`tools/make_getp_input.py`](../tools/make_getp_input.py) computes
-`n_devices × BATCH_SIZE` and repeats a prompt pool until the file holds exactly that many lines,
-with the count on the first line:
+`n_devices × rows` — by default the row cap, so it writes the largest file that runs; `-r`/`--rows`
+asks for another row count, and a value above the cap is refused — and repeats a prompt pool until
+the file holds exactly that many lines, with the count on the first line. `./run.sh mkinput` calls it
+without `-r`, so it also writes the largest file:
 
 ```sh
-# 12288 prompts for the 20B model on 8 GPUs, from the shipped pool
+# 15872 prompts for the 20B model on 8 GPUs, from the shipped pool
 python3 tools/make_getp_input.py -m 20b -g 8 -o input_20b.txt
 
-# 6144 for the 120B model on 8 GPUs
+# 8192 for the 120B model on 8 GPUs
 python3 tools/make_getp_input.py -m 120b -g 8 -o input_120b.txt
+
+# the standard 12288-request 20B input (1536 rows per GPU)
+python3 tools/make_getp_input.py -m 20b -g 8 -r 1536 -o input_20b_1536.txt
 
 # your own prompts, one per line, on a two-GPU box
 python3 tools/make_getp_input.py -m 20b -g 2 -s my_prompts.txt -o input.txt
@@ -181,12 +210,13 @@ It also rejects any prompt at or over `max_token_length × (steps + 1)` bytes, w
 the per-request slot `read_inputfile` copies into. Repeating a small pool is fine for a throughput
 measurement — every row still runs a full 1024-step forward pass and contributes its tokens — but the
 outputs are redundant, so a quality score computed over such a file measures the distinct prompts in
-the pool, not 12288 independent ones.
+the pool, not 15872 independent ones.
 
-## Batch size and expert parallelism are chosen by a single `if`
+## Expert parallelism is chosen by a single `if`, batch size by the input
 
-There is no memory probe and no auto-tuning. `warm_up` branches on the expert count and hard-codes
-both knobs ([`src/getp/run.cpp`](../src/getp/run.cpp)):
+There is no memory probe. `warm_up` branches on the expert count for the expert parallelism and a
+default batch, then lets the request count replace the batch, up to a fixed cap per model
+([`src/getp/run.cpp`](../src/getp/run.cpp)):
 
 ```cpp
 if (p->n_experts == 128) {
@@ -199,6 +229,18 @@ else {
   EXPERT_PARALLELISM = 2;
   BATCH_SIZE = 1536;
   // BATCH_SIZE = 256;
+}
+const char *gb = getenv("GETP_BATCH");
+if (gb && atoi(gb) > 0) {
+  BATCH_SIZE = atoi(gb);
+} else {
+  const int cap = (p->n_experts == 128) ? GETP_BATCH_CAP_120B : GETP_BATCH_CAP_20B;
+  const int n_req = getp_input_request_count();
+  if (n_req > 0 && n_req % n_devices == 0) {
+    const int rows = n_req / n_devices;
+    if (rows > cap) { /* "%d requests need %d rows per GPU; at most %d fit" */ exit(EXIT_FAILURE); }
+    BATCH_SIZE = rows;
+  }
 }
 ```
 
@@ -219,8 +261,34 @@ GEMMs are the exception: `launch_mlp1_swiglu_bf16_bucketed_outbf16` and
 on one expert — `EXPERT_PARALLELISM × BATCH_SIZE × experts_per_token / experts_per_device` on
 average, about 768 rows per bucket on the 20B path and 1536 on the 120B one, and data-dependent
 either way. `BATCH_SIZE` still sets the scale there, it is just divided differently. Dropping to the
-commented-out 256 would leave the matrix cores starved. Raising it further is blocked by the KV
-cache.
+commented-out 256 would leave the matrix cores starved. Raising it is what a larger input does, up to
+where the KV cache stops it. Throughput against rows per GPU on 8 MI250 GCDs, this build, the 20B
+row in one sitting and the 120B row over two (throughput moves about 1 % between sittings):
+
+| 20B rows per GPU  | 1536  | 1920  | 1952  | 1984  | 2016  |
+| ----------------- | ----- | ----- | ----- | ----- | ----- |
+| tok/s             | 82.0k | 83.8k | 83.5k | 84.5k | 84.0k |
+
+| 120B rows per GPU | 768   | 896   | 960   | 1024  |
+| ----------------- | ----- | ----- | ----- | ----- |
+| tok/s             | 37.2k | 38.7k | 39.4k | 40.3k |
+
+The 120B allocates up to 1024 rows per GPU; at 1040 an allocation in `ext_alloc_device` fails. The
+20B allocates up to 2016 (2048 fails), but 2016 runs 0.5 % slower than 1984, so its cap is 1984.
+The 20B points are single runs on the cycled benchmark prompts, whose outputs, and so their lengths,
+move with the batch: 957 to 960 tokens a request from 1536 to 1984 rows, 934 at 2016. Those are `GETP_BATCH_CAP_120B` and `GETP_BATCH_CAP_20B`, `#ifndef`-guarded constants measured
+on this hardware at the shipped export, not a memory probe. What makes room for the larger batches is
+the V cache, which is now allocated at its int8 size (see [KV cache sizing](#kv-cache-sizing)).
+
+Two things broke on the way up and are fixed. Between 1889 and 2208 rows per GPU the 20B's router
+split its K = 2880 seven ways instead of eight, so the fused router, which needs exactly eight, was
+not used, and the split-K kernel that ran instead dropped 4 elements at every chunk boundary, 24 of
+the 2880, from every router logit: at 1920 rows METEOR fell to 0.357, against 0.52 at 1888. Its
+chunk is now a multiple of 8, every batch used before is bit-identical, and a split of 6 or 7 is
+now rounded up to 8, so the fused router serves those batches too, +0.9 % at 1984 rows (see
+[KERNELS.md](KERNELS.md#the-only-runtime-decision-is-split-k)). And at 1024 rows the 120B has no room
+left for the staging buffer of the expert moves, which then borrow mlp2's scratch buffer (see
+[PARALLELISM.md](PARALLELISM.md#moving-experts-to-balance-the-load)).
 
 `MAXIMUM_GPU` (8, in [`include/transformer.hpp`](../include/transformer.hpp)) constrains exactly one
 thing: `static thread_local hipEvent_t events_e_agg[MAXIMUM_GPU]` in `getp_forward_120b`
@@ -256,9 +324,13 @@ const size_t total_t = (size_t)even_layers * (size_t)even_tcap +
   slots and index them as a ring, `tslot = pos % cache_tcap`. Nothing older than 128 positions is
   ever read, so nothing older is stored.
 - **Odd layers** are nominally full attention, but get `seq_len / 2` slots rather than `seq_len`.
-- Both are stored in bf16-sized buffers, not fp32. By default V's buffer holds int8 codes plus one
-  fp32 scale per 64-element vector (`GETP_KV8_V`, see [KERNELS.md](KERNELS.md)): that halves the bytes
-  attention reads, not the allocation, so the sizes below hold either way.
+- Neither is stored in fp32. K is bf16. V is by default int8 codes plus one fp32 scale per
+  64-element vector (`GETP_KV8_V`, see [KERNELS.md](KERNELS.md)), in an allocation of its own size:
+  `kv_elems` bytes of codes rounded up to the next 256-byte boundary, then `kv_elems / 64` fp32
+  scales, which is where `getp_kv8_scales` looks for them. It used to sit in a bf16-sized buffer with
+  the codes in the lower half, which halved the bytes attention reads but not the memory. At its own
+  size it takes a 20B row of cache from 28.3 to 21.7 MB and a 120B row from 42.5 to 32.5 MB, and that
+  freed memory is what the larger batches are made of. With `GETP_KV8_V=0` V is bf16-sized again.
 
 The kernel matches the caps honestly rather than reading stale ring entries: the single attention
 template `flash_attn_decode_mfma16_kernel` picks its start from its compile-time `APPLY_MASK`
@@ -270,22 +342,24 @@ model silently attends to a truncated history — a real correctness limit, not 
 that the cap follows the checkpoint, not the step count: halve `seq_len` and you halve the window,
 which is why the re-export advice below comes with a warning attached.
 
-The resulting sizes, with `kv_dim = head_dim × n_kv_heads = 64 × 8 = 512`, so K+V in bf16 costs
-exactly 2 KiB per time slot per batch row:
+The resulting sizes, with `kv_dim = head_dim × n_kv_heads = 64 × 8 = 512`, so K in bf16 costs
+1 KiB per time slot per batch row and V in int8 512 bytes plus 32 bytes of scales, 1568 bytes
+together against the 2 KiB of K+V in bf16 (region pads, below, not included):
 
-| Model                   | `seq_len` | Slots per device         | Per row | Per device (B rows) |
-| ----------------------- | --------- | ------------------------ | ------- | ------------------- |
-| 20B (24 layers, B=1536) | 2048      | 12×128 + 12×1024 = 13824 | 28.3 MB | 43.49 GB            |
-| 20B                     | 1024      | 12×128 + 12×512 = 7680   | 15.7 MB | 24.16 GB            |
-| 120B (36 layers, B=768) | 2048      | 18×128 + 18×1024 = 20736 | 42.5 MB | 32.61 GB            |
-| 120B                    | 1024      | 18×128 + 18×512 = 11520  | 23.6 MB | 18.12 GB            |
+| Model            | `seq_len` | Slots per device         | Per row | Per device, standard batch | Per device, largest batch |
+| ---------------- | --------- | ------------------------ | ------- | -------------------------- | ------------------------- |
+| 20B (24 layers)  | 2048      | 12×128 + 12×1024 = 13824 | 21.7 MB | 33.29 GB (B=1536)          | 43.01 GB (B=1984)         |
+| 20B              | 1024      | 12×128 + 12×512 = 7680   | 12.0 MB | 18.50 GB                   | 23.89 GB                  |
+| 120B (36 layers) | 2048      | 18×128 + 18×1024 = 20736 | 32.5 MB | 24.97 GB (B=768)           | 33.29 GB (B=1024)         |
+| 120B             | 1024      | 18×128 + 18×512 = 11520  | 18.1 MB | 13.87 GB                   | 18.50 GB                  |
 
 For comparison, take the naive version of the same thing: every layer given all `seq_len` slots, in
-fp32. For the 20B configuration at `seq_len` 2048 that is 24 × 2048 × 512 × 4 B × 1536 =
+fp32. For the 20B configuration at `seq_len` 2048 and 1536 rows that is 24 × 2048 × 512 × 4 B × 1536 =
 **154.6 GB per device for K**, and the same again for V, so **309.2 GB** in total. The three halvings
-together bring that to 43.49 GB, a factor of **7.11×** — which is exactly the 3.56× slot reduction
-(49152 naive slots down to 13824) multiplied by the 2× from storing bf16 instead of fp32. Comparing
-against a K-only baseline would credit the slot reduction alone and give bf16 nothing.
+together, with both tensors in bf16, bring that to 43.49 GB, a factor of **7.11×** — which is exactly
+the 3.56× slot reduction (49152 naive slots down to 13824) multiplied by the 2× from storing bf16
+instead of fp32. Comparing against a K-only baseline would credit the slot reduction alone and give
+bf16 nothing. Storing V as int8 with its scales takes the same 1536 rows on to 33.29 GB, **9.29×**.
 
 Weights are the other resident cost, and they are comfortably accounted for:
 
@@ -295,18 +369,22 @@ Weights are the other resident cost, and they are comfortably accounted for:
 | 120B  | 4.26 GB    | 28.68 GB                  | 32.9 GB          |
 
 Put the two tables together with `max_seq_len = 2048` from
-[`tools/model_export/gpt-oss-20b/config.json`](../tools/model_export/gpt-oss-20b/config.json) and the
-20B configuration needs 43.5 GB of KV cache, 0.9 GB of region pads (see [KERNELS.md](KERNELS.md)) and
-22.7 GB of weights, about 67 GB, against the 68.7 GB (64 GiB) of an MI250 GCD. With the per-row state
-below and the MoE buffers, a running 20B process occupies 68.4 of those 68.7 GB: it fits, with almost
-nothing to spare.
+[`tools/model_export/gpt-oss-20b/config.json`](../tools/model_export/gpt-oss-20b/config.json). While V
+still had a bf16-sized buffer, the 20B at 1536 rows needed 43.5 GB of KV cache, 0.9 GB of region pads
+(see [KERNELS.md](KERNELS.md)) and 22.7 GB of weights, about 67 GB, against the 68.7 GB (64 GiB) of an
+MI250 GCD, and with the per-row state below and the MoE buffers a running 20B process occupied 68.4
+of those 68.7 GB. At its own size the V cache brings 1536 rows down to 33.3 GB of cache and 0.7 GB of
+pads, and the room freed is spent on rows: at 1984 the cache is back to 43.0 GB with 0.9 GB of pads,
+and 2016 rows still allocate while 2048 do not.
 
-Nothing in the code checks in advance — there is no memory probe and no capacity assert. What does
-happen is an abort. Three different `HIP_CHECK` macros are defined in this tree, and because it is
-one translation unit (see above) the one that wins is the one whose header is included first:
-[`src/getp/run.cpp:6`](../src/getp/run.cpp) pulls in `collectives.cpp`, which pulls in
-[`include/collectives.hpp`](../include/collectives.hpp), whose `HIP_CHECK` prints and then calls
-`abort()`. The gentler definitions in [`src/getp/state_ext.cpp:5`](../src/getp/state_ext.cpp) and
+There is no memory probe. The one capacity check is the row cap in `warm_up`, and it is a pair of
+measured constants, not an allocation test: anything it does not cover — a longer export,
+`GETP_BATCH`, a raised cap — is found out by an abort. Three different `HIP_CHECK` macros are defined
+in this tree, and because it is one translation unit (see above) the one that wins is the one whose
+header is included first: [`src/getp/run.cpp:6`](../src/getp/run.cpp) pulls in `collectives.cpp`,
+which pulls in [`include/collectives.hpp`](../include/collectives.hpp), whose `HIP_CHECK` prints and
+then calls `abort()`. The gentler definitions in
+[`src/getp/state_ext.cpp:5`](../src/getp/state_ext.cpp) and
 [`src/getp/transformer.cpp:13`](../src/getp/transformer.cpp) are both `#ifndef HIP_CHECK`-guarded and
 never take effect. So a failing `hipMalloc` in `init_device_run_state` kills the process at warm-up,
 with the file and line of the allocation that did not fit. That is the failure mode to expect: a hard
@@ -320,9 +398,9 @@ at position 512 — inside the measured run, not beyond it, and with no warning.
 `max_seq_len` is a batch-size knob and an attention-window knob at the same time, and the two pull in
 opposite directions: it must be at least twice the number of steps you intend to run for the odd
 layers to be exact, and small enough that `seq_len/2` slots per odd layer still fit alongside the
-weights. At `BATCH_SIZE = 1536` and 1024 steps the shipped 2048 is the only value that meets both: it
-is exactly twice the step count, and there is no memory left for more. Running longer means giving up
-`BATCH_SIZE` or accepting a truncated window.
+weights. At the largest batches, 1984 and 1024 rows, and 1024 steps the shipped 2048 is the only
+value that meets both: it is exactly twice the step count, and the memory beyond it has been spent on
+rows. Running longer means giving up rows — a smaller input — or accepting a truncated window.
 
 Inside a layer the layout is head-major, `[batch][kv_head][t][64]` with every (request, KV head)
 region padded (`GETP_KV_HEADMAJOR`, `GETP_KV_PAD`, `GETP_KV_OFF`; the `base_off` / `slot_off` arithmetic
@@ -334,9 +412,9 @@ block per (`n_kv_heads = 8`, batch row) pair (`flash_attn_decode_mfma16_kernel`,
 scattered store of one slot per region, about 20 µs per layer on the 20B. The older time-major layout,
 `[t][batch][kv_dim]`, had it the other way round; [KERNELS.md](KERNELS.md) has the measurements.
 
-At the shipped 20B settings the marginal cost of one more sequence in the batch is about **16.1 MB**
-at `seq_len` 1024. The table row above accounts for 15.7 MB of that — it is KV only. The remaining
-0.40 MB, 2.5 % of the total, is the rest of the per-row state, and it is worth naming rather than
+At the shipped 20B settings the marginal cost of one more sequence in the batch is about **12.4 MB**
+at `seq_len` 1024. The table row above accounts for 12.0 MB of that — it is KV only. The remaining
+0.40 MB, 3.2 % of the total, is the rest of the per-row state, and it is worth naming rather than
 waving away:
 
 - ~79 KB of `RunState` per row: `x`, `t`, `tb2` and `e_agg` at `hidden_dim` fp32, plus `tb` and `q`
@@ -349,9 +427,9 @@ waving away:
 - ~37 KB of per-device staging: `pre_qkv_bf16`, `attn_o_bf16` and the `allreduce_tmp` scratch that
   the never-called generic collectives would have used.
 
-KV still dominates by a factor of forty, which is why the sizing argument above is the one that
-matters — but 0.40 MB × 1536 rows is 0.62 GB, which is not nothing on a device with under 2 GB to spare
-at `seq_len` 2048.
+KV still dominates by a factor of thirty, which is why the sizing argument above is the one that
+matters — but 0.40 MB × 1984 rows is 0.79 GB, which is not nothing on a device where 2048 rows no
+longer fit at `seq_len` 2048.
 
 ## Warm-up: where the 23 s and 176 s go
 
@@ -390,9 +468,11 @@ void getp_memcpy_fp32_to_bf16(__hip_bfloat16 *dst, float *src, int n_elements) {
 
 Note the shape of the call: one pinned allocation the full size of the destination tensor, one scalar
 loop, one copy, a null-stream synchronize, one free. It is called 104 times per device for the 20B
-model (8 dense tensors plus four per layer × 24 layers) and 152 times for the 120B model
-(8 + 4 × 36). The largest staging buffers are 1.16 GB for the embedding and unembedding tables
-(579 M elements each) and 531 MB for one layer's `w_mlp1` shard.
+model (8 dense tensors plus four per layer × 24 layers) and 152 times for the 120B model (8 + 4 × 36);
+one of the dense calls, W_o's, goes through `getp_memcpy_fp32_to_bf16_pitched`, the same steps with a
+`hipMemcpy2DAsync` that writes each row at the padded stride the attention-output GEMM reads
+(`GETP_AO_PAD`, see [KERNELS.md](KERNELS.md)). The largest staging buffers are 1.16 GB for the
+embedding and unembedding tables (579 M elements each) and 531 MB for one layer's `w_mlp1` shard.
 
 |                                             | 20B                      | 120B                      |
 | ------------------------------------------- | ------------------------ | ------------------------- |
@@ -455,7 +535,8 @@ a kernel launch of each other. A condition variable would cost more to sleep and
 itself. The `yield()` is the concession to correctness if that assumption breaks.
 
 Each 20B model group allocates its own `Barrier` on the heap, so the four groups never touch each
-other's cache lines. The 120B path builds one on the stack per 6144-request chunk.
+other's cache lines. The 120B path builds one on the stack per chunk of
+`EXPERT_PARALLELISM × BATCH_SIZE` requests.
 
 The composite primitive is `sync_workers_dev` in [`forward.hip`](../src/hip/forward.hip), which is what the per-layer sync points call in the default build (`GETP_DEVSYNC` defaults to 1). On the 20B it serves both sync points. On the 120B the two are handled differently. Sync point 1 is the drain-then-barrier form below, with the row counts that `GETP_AGSKIP` needs read back in between. Sync point 2 no longer drains at all under `GETP_EVAGG`: each rank records an event after writing its expert output, a host barrier only guarantees that every rank has issued that record, and each pull waits on the one peer event it depends on. The older `sync_workers` function itself is on the live path only when the file is compiled with `-DGETP_DEVSYNC=0`:
 
@@ -585,12 +666,15 @@ Allocation also sits on the critical path, and it is cheap to overlook.
 | Frequency      | Call                                                                                   | Site                                                                                                                |
 | -------------- | -------------------------------------------------------------------------------------- | ------------------------------------------------------------------------------------------------------------------- |
 | Per token step | `hipHostMalloc` / `hipHostFree` of the `next_host` result buffer                       | end of `getp_forward_120b` ([`forward.hip`](../src/hip/forward.hip)), freed at [`run.cpp:231`](../src/getp/run.cpp) |
-| Per **layer**  | `hipMallocAsync` / `hipFreeAsync` of the split-K partials in `getp_matmul_router_bf16` | [`forward.hip`](../src/hip/forward.hip)                                                                             |
+| Per **layer**  | `hipMallocAsync` / `hipFreeAsync` of the split-K partials in `getp_matmul_router_bf16` (unfused router only; no batch up to the caps) | [`forward.hip`](../src/hip/forward.hip)                                                                             |
 
-The router case is the surprising one. `getp_matmul_router_bf16` always takes its split-K branch on
-this shape: the router grid is 48 CTAs against a target of `cu × 4` ≈ 416, so `splits` saturates at
-8, and the allocation happens on every layer, preceded by a `hipGetDevice` and a
-`hipDeviceGetAttribute`. That is 24 extra allocator round-trips per 20B step and 36 per 120B step.
+The router case used to be the surprising one. `getp_matmul_router_bf16` always takes its split-K
+branch on these shapes, and the allocation happens on every layer, preceded by a `hipGetDevice` and a
+`hipDeviceGetAttribute`: 24 extra allocator round-trips per 20B step and 36 per 120B step. It now runs
+only where the fused router (`GETP_ROUTER_FUSED`, see [KERNELS.md](KERNELS.md)) does not, which is at
+five splits or fewer. No batch up to either cap gets there: a split of 6 or 7, which the 20B's router
+grid of 62 CTAs at 1984 rows would give against the target of `cu × 4` ≈ 416, is rounded up to 8. So
+every batch on this page runs the fused router, which allocates nothing.
 Both remaining buffers are fixed-size for the life of the run and could be lifted out of the
 per-step path — into `ext_alloc_device`, or the way the argmax pair buffer already was. That one is
 not an `ext_alloc_device` allocation at all: `pairs` inside `getp_matmul_logits_argmax_bf16` is a
@@ -614,10 +698,11 @@ a per-step leak.
 
 ## One request, end to end
 
-A worker thread starts by tokenising all 1536 (or 768) of its prompts into one pinned block —
-sized once, sliced per request, so there is a single `hipHostMalloc` rather than `BATCH_SIZE` of
-them. `encode` is called with `bos = -1, eos = -1`, so neither marker is emitted and no chat
-template is applied; the cap passed is `initial_context_length` (4096), not `steps`.
+A worker thread starts by tokenising all `BATCH_SIZE` of its prompts (1536 or 768 at the standard
+inputs, up to 1984 or 1024) into one pinned block — sized once, sliced per request, so there is a
+single `hipHostMalloc` rather than `BATCH_SIZE` of them. `encode` is called with `bos = -1, eos = -1`,
+so neither marker is emitted and no chat template is applied; the cap passed is
+`initial_context_length` (4096), not `steps`.
 
 Then the lockstep loop ([`src/getp/run.cpp:191-232`](../src/getp/run.cpp)), driven by a single shared
 `pos`:
@@ -667,8 +752,9 @@ The harness times `inference()` end to end and divides the accumulated output to
 time. Two facts about the measurement before the arithmetic. The binary is the `runfast` target —
 `hipcc --std=c++17 --offload-arch=gfx90a -O3` ([`Makefile`](../Makefile)) — and _not_ the default
 `make run` target, which is the one target that drops `$(CFLAGS)` and builds at `-O0` with no offload
-arch at all. And the input is a 12288- or 6144-request file built as described above, since no
-shipped one runs. Working backwards from the published figures:
+arch at all. And the input is a 12288- or 6144-request file built as described above, the standard
+batch of 1536 or 768 rows per GPU; the larger inputs run more rows and more tokens per second (see
+the batch-size section above). Working backwards from the published figures:
 
 |                                                       | 20B         | 120B        |
 | ----------------------------------------------------- | ----------- | ----------- |
@@ -696,29 +782,38 @@ Collected in one place, in rough order of how likely they are to bite:
 
 - **No continuous batching.** A finished row holds its slot, its KV cache and its share of every
   dense GEMM until the whole group stops; only attention and the expert GEMMs skip it.
-- **Fixed request counts.** `num_reqs` must be `n_devices × BATCH_SIZE`: 12288 for the 20B model on
-  8 GPUs, a multiple of 6144 for the 120B model on 8 GPUs. _Every_ input file in the repository
-  fails this; `run.sh`'s own `getp` example builds one with `mkinput` instead of using them. See
-  [Building an input file that runs](#building-an-input-file-that-runs).
+- **Request count and batch are one number.** `num_reqs` must be `n_devices × BATCH_SIZE`, and
+  `warm_up` sets `BATCH_SIZE` from the count, which it finds by reading `/proc/self/cmdline` for the
+  `-i` argument because the harness does not pass the requests to it. Any multiple of `n_devices`
+  is accepted up to the row cap — 15872 requests for the 20B and 8192 for the 120B on 8 GPUs; above
+  it the run stops at warm-up, and a count that does not divide keeps the fixed 1536 or 768 and meets
+  the asserts. The 120B's chunk loop, which used to run any multiple of 6144, runs more than one chunk
+  only when `GETP_BATCH` asks for fewer rows than `num_reqs / n_devices`, and a count above 8192 stops
+  even then. See [Building an input file that runs](#building-an-input-file-that-runs).
 - **`EXPERT_PARALLELISM == 8` dispatch.** On anything other than eight devices the 120B model falls
-  into the 20B code path and accepts exactly one request count instead of multiples.
+  into the 20B code path and loses the chunk loop, so a count of several chunks fails instead of
+  running.
 - **`seq_len/2` attention window.** Beyond `seq_len/2` steps the odd layers silently truncate
   history — at the shipped `max_seq_len` of 2048 that is beyond 1024 steps, but it moves with the
   export.
-- **KV cache versus `max_seq_len`.** The cache is sized per device as
-  `(12 × 128 + 12 × max_seq_len/2)` time slots × 2 KiB per slot per request × `BATCH_SIZE`, the even
-  layers being pinned to the 128-key window and the odd ones to `max_seq_len/2`. At the shipped 2048
-  that is about 43 GB on top of the weights, and a running 20B process then occupies 68.4 of the GCD's
-  68.7 GB, so there is no room for a larger export at `BATCH_SIZE` 1536. Note also that lowering the export lowers the odd layers'
-  window with it — at 1024 the window is 512, inside the default 1024-step run. Nothing checks either
-  condition in advance; over-allocation shows up as a `HIP_CHECK` abort during warm-up.
+- **KV cache versus `max_seq_len`.** The 20B's cache is sized per device as
+  `(12 × 128 + 12 × max_seq_len/2)` time slots × 1568 bytes per slot per request (K in bf16, V in
+  int8 with its scales) × `BATCH_SIZE`, the even layers being pinned to the 128-key window and the odd
+  ones to `max_seq_len/2`. At the shipped 2048 and 1984 rows that is about 43 GB on top of the
+  weights, and 2048 rows no longer fit, so a larger export only fits with fewer rows, that is a
+  smaller input. Note also that lowering the export lowers the odd layers' window with it — at 1024
+  the window is 512, inside the default 1024-step run. The row caps are constants measured at the
+  shipped export, not a check of either condition; over-allocation shows up as a `HIP_CHECK` abort
+  during warm-up.
 - **Warm-up is not amortised.** 23 s for the 20B model or 176 s for the 120B, spent reading the fp32
   checkpoint off disk and converting it on the host, on every launch. Nothing is cached between
   runs.
 - **No prefill.** One forward pass per prompt token.
 - **Per-step and per-layer allocator traffic.** One pinned `hipHostMalloc` / `hipHostFree` pair per
-  step for the result buffer, and one `hipMallocAsync` / `hipFreeAsync` per layer for the router
-  split-K partials. The `hipEvent_t` objects are created once per thread and never destroyed.
+  step for the result buffer, and, where the router is not fused (at five splits or fewer, which no
+  batch up to the caps reaches), one `hipMallocAsync` / `hipFreeAsync` per layer for its split-K
+  partials. The `hipEvent_t` objects
+  are created once per thread and never destroyed.
 - **`MAXIMUM_GPU = 8`** is an unchecked bound on the 120B path.
 
 None of these are hard to fix in isolation. They are listed because the throughput figure was
@@ -729,7 +824,7 @@ parts of the design are load-bearing and which are simply unfinished.
 
 | Concept                                                                                      | File                                                      |
 | -------------------------------------------------------------------------------------------- | --------------------------------------------------------- |
-| `warm_up`, `BATCH_SIZE` / `EXPERT_PARALLELISM` choice, request partitioning, generation loop | [`src/getp/run.cpp`](../src/getp/run.cpp)                 |
+| `warm_up`, `BATCH_SIZE` / `EXPERT_PARALLELISM` choice, row caps (`GETP_BATCH_CAP_*`), `getp_input_request_count`, request partitioning, generation loop | [`src/getp/run.cpp`](../src/getp/run.cpp)                 |
 | Weight upload, fp32→bf16 conversion, KV cache sizing, stream creation                        | [`src/getp/transformer.cpp`](../src/getp/transformer.cpp) |
 | MoE extension buffers (`ext_alloc_device`)                                                   | [`src/getp/state_ext.cpp`](../src/getp/state_ext.cpp)     |
 | Spin barrier                                                                                 | [`include/barrier.hpp`](../include/barrier.hpp)           |
@@ -739,7 +834,7 @@ parts of the design are load-bearing and which are simply unfinished.
 | Unused generic collectives, `cgCreate`                                                       | [`src/getp/collectives.cpp`](../src/getp/collectives.cpp) |
 | CLI, `-n` default of 1024, checkpoint mmap, and the single-translation-unit include chain    | [`src/run.cpp`](../src/run.cpp)                           |
 | fp32 checkpoint export                                                                       | [`tools/model_export`](../tools/model_export)             |
-| Generating an input file of the accepted length                                              | [`tools/make_getp_input.py`](../tools/make_getp_input.py) |
+| Generating an input file (the largest that runs by default, `-r` for another row count)      | [`tools/make_getp_input.py`](../tools/make_getp_input.py) |
 | Build targets (`runfast` is the one the numbers come from)                                   | [`Makefile`](../Makefile)                                 |
 
 Related pages: [MODEL.md](MODEL.md) for the architecture these constants come from,

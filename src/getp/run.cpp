@@ -29,6 +29,38 @@ int BATCH_SIZE = 0;
 
 #include "hip/forward.hip"
 
+// Rows per GPU: the most that fit in memory (bf16 weights, int8 V cache) with the best throughput.
+// Measured on 8 MI250 GCDs: the 120B allocates up to 1024 rows (1040 fails); the 20B up to 2016
+// (2048 fails), but 2016 runs 0.5 % slower than 1984.
+#ifndef GETP_BATCH_CAP_120B
+#define GETP_BATCH_CAP_120B 1024
+#endif
+#ifndef GETP_BATCH_CAP_20B
+#define GETP_BATCH_CAP_20B 1984
+#endif
+// The request count of the getp input file (its first line), or 0: the path is the argument after
+// -i on this process's command line.
+static int getp_input_request_count() {
+  FILE *f = fopen("/proc/self/cmdline", "rb");
+  if (!f) return 0;
+  std::vector<char> buf(1 << 16);
+  const size_t n = fread(buf.data(), 1, buf.size() - 1, f);
+  fclose(f);
+  buf[n] = 0;
+  std::vector<const char *> args;
+  for (size_t i = 0; i < n; i += strlen(buf.data() + i) + 1) args.push_back(buf.data() + i);
+  for (size_t i = 0; i + 1 < args.size(); ++i) {
+    if (strcmp(args[i], "-i") != 0) continue;
+    FILE *in = fopen(args[i + 1], "r");
+    if (!in) return 0;
+    int count = 0;
+    if (fscanf(in, "%d", &count) != 1) count = 0;
+    fclose(in);
+    return count;
+  }
+  return 0;
+}
+
 void warm_up(Transformer *transformer, Tokenizer *tokenizer) {
   // Do not inference here
   // You should handle the warm-up process
@@ -54,6 +86,25 @@ void warm_up(Transformer *transformer, Tokenizer *tokenizer) {
     EXPERT_PARALLELISM = 2;
     BATCH_SIZE = 1536;
     // BATCH_SIZE = 256;
+  }
+  // The rows per GPU follow the workload: n_devices x BATCH_SIZE must equal the request count (see
+  // inference), so a larger input runs larger batches, up to the largest that fits in memory.
+  // GETP_BATCH, when set, fixes the rows per GPU instead (the request count must then be
+  // n_devices x GETP_BATCH).
+  const char *gb = getenv("GETP_BATCH");
+  if (gb && atoi(gb) > 0) {
+    BATCH_SIZE = atoi(gb);
+  } else {
+    const int cap = (p->n_experts == 128) ? GETP_BATCH_CAP_120B : GETP_BATCH_CAP_20B;
+    const int n_req = getp_input_request_count();
+    if (n_req > 0 && n_req % n_devices == 0) {
+      const int rows = n_req / n_devices;
+      if (rows > cap) {
+        fprintf(stderr, "%d requests need %d rows per GPU; at most %d fit\n", n_req, rows, cap);
+        exit(EXIT_FAILURE);
+      }
+      BATCH_SIZE = rows;
+    }
   }
 
   if (n_devices % EXPERT_PARALLELISM) {

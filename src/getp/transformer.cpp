@@ -23,6 +23,17 @@
 #endif
 #endif
 
+// attn_o row padding (see GETP_AO_PAD in forward.hip); the definitions must match.
+#ifndef GETP_AO_PAD
+#define GETP_AO_PAD 32
+#endif
+#ifndef GETP_AO_PADX
+#define GETP_AO_PADX GETP_AO_PAD
+#endif
+#ifndef GETP_AO_PADW
+#define GETP_AO_PADW GETP_AO_PAD
+#endif
+
 #include <cassert>
 #include <hip/hip_runtime.h>
 
@@ -78,6 +89,20 @@ void getp_memcpy_fp32_to_bf16(__hip_bfloat16 *dst, float *src, int n_elements) {
                       hipMemcpyHostToDevice, 0));
   HIP_CHECK(hipStreamSynchronize(0));
   
+  HIP_CHECK(hipHostFree(tmp));
+}
+
+// As getp_memcpy_fp32_to_bf16, for `rows` rows of `width` elements written at a pitch of `pitch`
+// elements (the padding stays unwritten: nothing reads it).
+static void getp_memcpy_fp32_to_bf16_pitched(__hip_bfloat16 *dst, const float *src, size_t rows,
+                                             size_t width, size_t pitch) {
+  const size_t n = rows * width;
+  __hip_bfloat16 *tmp = nullptr;
+  HIP_CHECK(hipHostMalloc(&tmp, sizeof(__hip_bfloat16) * n, hipHostMallocDefault));
+  for (size_t i = 0; i < n; ++i) tmp[i] = __float2bfloat16(src[i]);
+  HIP_CHECK(hipMemcpy2DAsync(dst, pitch * sizeof(__hip_bfloat16), tmp, width * sizeof(__hip_bfloat16),
+                             width * sizeof(__hip_bfloat16), rows, hipMemcpyHostToDevice, 0));
+  HIP_CHECK(hipStreamSynchronize(0));
   HIP_CHECK(hipHostFree(tmp));
 }
 
@@ -146,8 +171,9 @@ static void upload_weights(TransformerWeights *w,
                        2ull * (size_t)D * (size_t)cfg->n_kv_heads);
   const size_t bqkv = (size_t)L * ((size_t)D * (size_t)cfg->n_attn_heads +
                                    2ull * (size_t)D * (size_t)cfg->n_kv_heads);
-  const size_t wo =
-      (size_t)L * (size_t)H * (size_t)D * (size_t)cfg->n_attn_heads;
+  // W_o rows are D * n_attn_heads + GETP_AO_PADW long on the device (see GETP_AO_PAD).
+  const size_t wo_row = (size_t)D * (size_t)cfg->n_attn_heads;
+  const size_t wo = (size_t)L * (size_t)H * (wo_row + GETP_AO_PADW);
   const size_t bo = (size_t)L * (size_t)H;
   const size_t wr = (size_t)L * (size_t)H * (size_t)E;
   const size_t br = (size_t)L * (size_t)E;
@@ -171,7 +197,7 @@ static void upload_weights(TransformerWeights *w,
   getp_memcpy_fp32_to_bf16(p16, w->b_qkv, bqkv);
   p16 += bqkv;
   dev_w->w_o_bf16 = p16;
-  getp_memcpy_fp32_to_bf16(p16, w->w_o, wo);
+  getp_memcpy_fp32_to_bf16_pitched(p16, w->w_o, (size_t)L * H, wo_row, wo_row + GETP_AO_PADW);
   p16 += wo;
   dev_w->b_o_bf16 = p16;
   getp_memcpy_fp32_to_bf16(p16, w->b_o, bo);
@@ -260,8 +286,11 @@ void init_device_run_state(RunState *s, Config *p) {
                                                    GETP_KV_PAD
                                              : 0);
 
-  HIP_CHECK(hipMalloc(&s->key_cache, kv_elems * sizeof(__hip_bfloat16)));
-  HIP_CHECK(hipMalloc(&s->value_cache, kv_elems * sizeof(__hip_bfloat16)));
+  // An int8 tensor (GETP_KV8_*): kv_elems bytes of codes up to the next 256-byte boundary, then one
+  // fp32 scale per 64 elements - the layout getp_kv8_scales in forward.hip expects.
+  const size_t kv8_bytes = ((kv_elems + 255) & ~(size_t)255) + kv_elems / 64 * sizeof(float);
+  HIP_CHECK(hipMalloc(&s->key_cache, GETP_KV8_K ? kv8_bytes : kv_elems * sizeof(__hip_bfloat16)));
+  HIP_CHECK(hipMalloc(&s->value_cache, GETP_KV8_V ? kv8_bytes : kv_elems * sizeof(__hip_bfloat16)));
 
   s->qkv = nullptr;
   s->att = nullptr;

@@ -43,16 +43,21 @@ else {
 }
 ```
 
-|                              | `gpt-oss-20b` | `gpt-oss-120b`  |
-| ---------------------------- | ------------- | --------------- |
-| Experts in the model         | 32            | 128             |
-| Decoder layers               | 24            | 36              |
-| `EXPERT_PARALLELISM` (EP)    | 2             | 8 (`n_devices`) |
-| `BATCH_SIZE` per device      | 1536          | 768             |
-| Experts per device           | 16            | 16              |
-| Replicas on an 8-GPU node    | 4             | 1               |
-| Tokens in flight per replica | 3072          | 6144            |
-| Tokens in flight per node    | 12288         | 6144            |
+The two batch sizes there are defaults. Right after, `warm_up` reads the request count from the
+input file and, when it divides by `n_devices`, sets `BATCH_SIZE` to the quotient, up to 1984 rows
+per device for 20B and 1024 for 120B ([SERVING.md](SERVING.md) has the rule and the measurements).
+The standard inputs run the defaults, and the table is at those:
+
+|                              | `gpt-oss-20b`       | `gpt-oss-120b`     |
+| ---------------------------- | ------------------- | ------------------ |
+| Experts in the model         | 32                  | 128                |
+| Decoder layers               | 24                  | 36                 |
+| `EXPERT_PARALLELISM` (EP)    | 2                   | 8 (`n_devices`)    |
+| `BATCH_SIZE` per device      | 1536 (up to 1984)   | 768 (up to 1024)   |
+| Experts per device           | 16                  | 16                 |
+| Replicas on an 8-GPU node    | 4                   | 1                  |
+| Tokens in flight per replica | 3072 (up to 3968)   | 6144 (up to 8192)  |
+| Tokens in flight per node    | 12288 (up to 15872) | 6144 (up to 8192)  |
 
 `hidden_dim` is 2880 and `experts_per_token` is 4 in both models
 ([`tools/model_export/gpt-oss-20b/config.json`](../tools/model_export/gpt-oss-20b/config.json),
@@ -73,18 +78,18 @@ and it would remove the collectives entirely. It is still not chosen, and there 
 one.
 
 The first is capacity, via the KV cache rather than the weights. At `seq_len` 1024 one batch row costs
-15.7 MB of cache across the 24 layers, and at 2048 it costs 28.3 MB (the KV table in
-[SERVING.md](SERVING.md) derives both). The ~22 GB that EP = 1 leaves free is about 1400 rows at 1024
-and about 780 at 2048 — under the 1536 the engine actually runs, and that is before the MoE pair
-buffers (`z_partial`, `a_in` and `gate_up_bf16`, ~142 MB at 1536 rows) and the per-row activation
-state. The EP staging buffers below are not part of that bill: `ext_alloc_device` skips them
-entirely when `expert_parallelism == 1`. EP = 1 is not merely slower at the shipped
-`BATCH_SIZE`; it does not fit.
+12.0 MB of cache across the 24 layers, and at 2048 it costs 21.7 MB, K in bf16 and V in int8 with its
+scales (the KV table in [SERVING.md](SERVING.md) derives both). The ~22 GB that EP = 1 leaves free is
+about 1800 rows at 1024 and about 1000 at 2048 — at the shipped 2048, under the 1536 of the standard
+input, let alone the 1984 of the largest, and that is before the MoE pair buffers (`z_partial`, `a_in`
+and `gate_up_bf16`, ~142 MB at 1536 rows) and the per-row activation state. The EP staging buffers
+below are not part of that bill: `ext_alloc_device` skips them entirely when
+`expert_parallelism == 1`. EP = 1 is not merely slower at the shipped `BATCH_SIZE`; it does not fit.
 
 The second is throughput, which is what the freed memory is spent on. EP = 2 halves the expert shard
 and takes resident weights from 41.8 GB to 22.7 GB — 3.60 GB dense plus 19.12 GB for 16 of the 32
-experts — roughly doubling what is available to the cache, and that is what lets `BATCH_SIZE` be 1536.
-Throughput on this workload is dominated by how many rows the GEMMs see: the MoE MLPs are
+experts — roughly doubling what is available to the cache, and that is what lets `BATCH_SIZE` be 1536
+and more. Throughput on this workload is dominated by how many rows the GEMMs see: the MoE MLPs are
 memory-bound at small M, because each expert weight matrix is read from HBM once regardless of how
 many tokens it serves. Doubling the tokens per expert roughly doubles the arithmetic done per byte of
 weight fetched. The collectives are the price paid for that, and on 20B they are cheap — a single
@@ -92,21 +97,22 @@ peer, 26.6 MB per layer, over 24 layers.
 
 Put plainly: EP = 2 buys headroom and spends it on batch size. Neither reason forces it alone, and the
 size of the effect is worth pinning down. At EP = 2 a replica holds 3072 tokens, and with
-`experts_per_token` = 4 over 32 experts that is 12288/32 = **384 rows per expert GEMM**. A `BATCH_SIZE`
-of 1024 — a round number inside the ~1400 rows that do fit at EP = 1 — gives 4096/32 = **128 rows** — three times thinner, against the
-same weight fetch, in exchange for removing the P2P traffic entirely. The repository contains no
-measurement of that trade, so read this as the project's judgement rather than as a demonstrated
-optimum.
+`experts_per_token` = 4 over 32 experts that is 12288/32 = **384 rows per expert GEMM**. A
+`BATCH_SIZE` of 1024 — a round number close to the ~1000 rows that fit at EP = 1 — gives 4096/32 =
+**128 rows** — three times thinner, against the same weight fetch, in exchange for removing the P2P
+traffic entirely. The repository contains no measurement of that trade, so read this as the project's
+judgement rather than as a demonstrated optimum.
 
 On `gpt-oss-120b` the argument is shorter and admits no trade. 116,829,156,672 parameters in bf16 is
 116,829,156,672 × 2 B = **233.7 GB**, so a single 64 GB device cannot hold the weights at any batch
 size, and EP = 8 is forced; with the experts split eight ways and the dense weights still replicated,
-resident weights come to 32.9 GB per device. The
-120B path also drops `BATCH_SIZE` to 768, because the staging buffers are sized
-`EP × BATCH_SIZE × hidden_dim` ([`src/getp/state_ext.cpp`](../src/getp/state_ext.cpp)) and so grow
-linearly with EP. At EP = 8 that is 6144 tokens in flight per replica with a per-device activation
-footprint that stays bounded; at 1536 rows per device the same buffers would be twice the size —
-~637 MB instead of the ~319 MB tabulated below, not four times, since only `BATCH_SIZE` changes.
+resident weights come to 32.9 GB per device. The 120B path also drops its default `BATCH_SIZE` to 768,
+because the staging buffers are sized `EP × BATCH_SIZE × hidden_dim`
+([`src/getp/state_ext.cpp`](../src/getp/state_ext.cpp)) and so grow linearly with EP. At EP = 8 that
+is 6144 tokens in flight per replica with a per-device activation footprint that stays bounded; at
+1536 rows per device the same buffers would be twice the size — ~637 MB instead of the ~319 MB
+tabulated below, not four times, since only `BATCH_SIZE` changes. The largest 120B input runs 1024
+rows, where they come to ~425 MB.
 
 With EP fixed, the node layout follows. `n_parallel_models = n_devices / EXPERT_PARALLELISM`
 ([`src/getp/run.cpp`](../src/getp/run.cpp)), so an 8-GPU node runs one 8-way replica for 120B and four
@@ -118,37 +124,41 @@ That dispatch is a trap on any node that is not exactly eight GPUs, and it is wo
 because the test is on EP and not on the model. The 120B branch sets `EXPERT_PARALLELISM = n_devices`,
 so on a 4-GPU node a 120B run gets EP = 4, fails the `== 8` test at
 [`src/getp/run.cpp:524`](../src/getp/run.cpp), and is handled by `Model_20b::distribute_requests` with
-the 120B `BATCH_SIZE` of 768 still in force. The two are not interchangeable:
+the 120B `BATCH_SIZE` still in force. The two are not interchangeable:
 
 - `Model_120b::distribute_requests` loops over the request list in chunks,
   `for (idx = 0; idx < requests_per_model; idx += EXPERT_PARALLELISM * BATCH_SIZE)`, so it accepts any
   multiple of `EP × BATCH_SIZE` and drains it batch by batch.
 - `Model_20b::distribute_requests` has no such loop. It asserts
   `requests_per_model == EXPERT_PARALLELISM * BATCH_SIZE` outright
-  ([`src/getp/run.cpp:268-269`](../src/getp/run.cpp)) and runs exactly one batch per replica.
+  ([`src/getp/run.cpp`](../src/getp/run.cpp)) and runs exactly one batch per replica.
 
 So a 120B run on 4 GPUs does not crash in the kernels — both paths call `getp_forward_120b`, and with
 `n_parallel_models = 1` the thread layout comes out the same — but it silently loses the chunking
-loop, and the request count stops being "any multiple of `n_devices × 768`" and becomes exactly
-`n_devices × 768`. Going the other way is worse: EP above 8 overruns `events_e_agg[MAXIMUM_GPU]`, the
+loop, and a request count of several `EP × BATCH_SIZE` chunks — any multiple of `n_devices × 768`
+while the batch was fixed, and now only with `GETP_BATCH` below `num_reqs / n_devices` — fails instead
+of running. Going the other way is worse: EP above 8 overruns `events_e_agg[MAXIMUM_GPU]`, the
 `static thread_local` event array declared at the top of `getp_forward_120b`
-([`src/hip/forward.hip`](../src/hip/forward.hip)), which is a fixed array of 8. A 16-GPU node therefore
-cannot run 120B at all without changing `MAXIMUM_GPU`.
+([`src/hip/forward.hip`](../src/hip/forward.hip)), which is a fixed array of 8. A 16-GPU node
+therefore cannot run 120B at all without changing `MAXIMUM_GPU`.
 
 The request-count rule that follows is the first thing a new reader trips on, so state it directly.
 `requests_per_model` is `num_reqs / n_parallel_models`, and for 20B the assert demands it equal
-`EP × BATCH_SIZE` = 3072 exactly, with `n_parallel_models = n_devices / 2`. The total request count
-must therefore be exactly `n_devices × 1536` — **12288 on an 8-GPU node**, and nothing else. For 120B
-on eight GPUs the chunking loop relaxes this to any multiple of `8 × 768` = **6144**, enforced by the
-weaker `% (EXPERT_PARALLELISM * BATCH_SIZE) == 0` assert in `inference`; off eight GPUs, as above, it
-tightens back to exactly `n_devices × 768`. No input file in the tree satisfies any of these:
-`tests/input.txt` declares 4096 requests and the four under `tests/data/` declare 32, 256, 448 and
-3584, so pointing `-m getp` at any of them aborts before a single token is generated — on that same
-`% (EXPERT_PARALLELISM * BATCH_SIZE) == 0` assert in `inference`
+`EP × BATCH_SIZE`, with `n_parallel_models = n_devices / 2`, so the total request count must be
+exactly `n_devices × BATCH_SIZE`. While `BATCH_SIZE` was fixed that meant **12288 on an 8-GPU node**
+and nothing else for 20B, and any multiple of `8 × 768` = **6144** for 120B, whose chunking loop
+relaxes the rule on eight GPUs. `warm_up` now reads the count from the input file and, when it divides
+by `n_devices`, makes `BATCH_SIZE` the quotient, up to 1984 rows for 20B and 1024 for 120B, so on
+eight GPUs any multiple of eight up to **15872** (20B) or **8192** (120B) is accepted, a larger one
+stops at warm-up, and a count that does not divide keeps the fixed default and aborts on one of the
+asserts — usually the `% (EXPERT_PARALLELISM * BATCH_SIZE) == 0` assert in `inference`
 ([`src/getp/run.cpp`](../src/getp/run.cpp)), which sits in the worker-layout loop and so runs ahead of
-either `distribute_requests`. Build a
-correctly-sized file instead — `./run.sh mkinput 20b 8 input_20b.txt` emits the 12288 requests the
-8-GPU 20B path demands, and `mkinput 20b 2` the 3072 for a two-GPU run.
+either `distribute_requests`. The standard 12288 and 6144 still run at 1536 and 768 rows; the
+multiples of 6144 above that are over the 120B's cap. The shipped inputs — `tests/input.txt` with 4096
+requests and the four under `tests/data/` with 32, 256, 448 and 3584 — are all multiples of eight, so
+on eight GPUs they now pass the count rule at small batches (512 rows per device for
+`tests/input.txt`). `./run.sh mkinput 20b 8 input_20b.txt` builds the largest 8-GPU 20B file, 15872
+requests, and `mkinput 20b 2` the 3968 for a two-GPU run.
 
 ## Where the collectives actually live
 
@@ -467,6 +477,18 @@ against the engine's non-blocking streams - and allocated and freed its staging 
 host loaded by other work, four runs of that version gave four different outputs, all diverging at
 the second move; three runs of this one under the same load gave the unloaded output.
 
+The staging buffer has to hold every expert a rank receives in a layer at once. A move must read every
+source of a layer before any slot of that layer is overwritten, because a vacated slot is another
+rank's source, so a layer's move cannot be split into rounds. The buffer is allocated at the first
+move, at step 40, and a move is applied only if every rank has one. At 1024 rows per device the 120B
+had no room left for it: every move reported `NOT applied: staging allocation failed`, and the run
+lost its load balance, 35.8k tok/s instead of 40.3k. When that allocation fails, the moves now borrow
+`z_partial`, mlp2's fp32 partial-sum scratch — `EP × BATCH_SIZE × experts_per_token × hidden_dim`
+floats, idle between steps, which is when the moves run — provided it holds the most experts the rank
+receives in any one layer. At 1024 rows it is 377 MB, room for 7 of the 120B's experts, while the plan
+changes the GPU of at most eight experts per layer across all ranks, in swaps, so no rank receives
+more than four in a layer.
+
 Measured paired: 26,012 to 28,670 tok/s (+10.2 %), and the slowest rank's lag at the exchange falls
 from 1.27 to 0.40 ms per layer. The output changes - a token's expert partial sums are grouped on
 different GPUs - so it was accepted on METEOR 0.5545 and BERTScore 0.9811 rather than on a hash.
@@ -572,7 +594,8 @@ These numbers are the argument for both the delta rotation and sending bf16 on t
 both row-skips and the bf16 return leg, 0.96 GB of P2P traffic per device per token step is not
 something to leave half-duplex — and it was 3.35 GB before them.
 
-Staging memory is the other cost. Every EP buffer is sized `EP × BATCH_SIZE × hidden_dim`, so on 120B:
+Staging memory is the other cost. Every EP buffer is sized `EP × BATCH_SIZE × hidden_dim`, so on 120B
+at `BATCH_SIZE` = 768:
 
 | Buffer       | Type |         Size |
 | ------------ | ---- | -----------: |

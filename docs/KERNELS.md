@@ -5,8 +5,10 @@ of the time goes, and all three are implemented from scratch in a single file,
 [`src/hip/forward.hip`](../src/hip/forward.hip), against the project's constraint of standard C/C++ plus
 `hip` and `omp` — no rocBLAS, no hipBLAS. The target is one GCD of an AMD MI250 (`gfx90a`, 64-lane
 waves, 104 compute units, 64 KB of LDS per CU), and the workload is a large batch of _requests_ decoded
-one token at a time: 1536 requests per GPU for `gpt-oss-20b`, 768 for `gpt-oss-120b`
-([`src/getp/run.cpp`](../src/getp/run.cpp)). That single fact shapes everything below. The GEMMs see a
+one token at a time: 1536 requests per GPU for `gpt-oss-20b` and 768 for `gpt-oss-120b` at the
+standard inputs, up to 1984 and 1024 on larger ones, since the batch follows the request count
+([`src/getp/run.cpp`](../src/getp/run.cpp), [SERVING.md](SERVING.md)). Figures on this page are at
+1536 and 768 unless they say otherwise. That single fact shapes everything below. The GEMMs see a
 tall, thin left-hand operand and can be tuned per call site; attention sees exactly one query token per
 request, which looks like a pure memory-traffic problem and was treated as one until a drain test said
 otherwise — see [Multi-head attention](#multi-head-attention).
@@ -346,6 +348,36 @@ at 128 steps; 2 is the value the shipped 1024-step number was taken with. The hi
 sentence: the 96-row, six-wave tile shipped before this ran best at 3, which is not a power of two and so
 was never on the grid of the sweep that tried 2, 4 and 8.
 
+### Attention-out: padding the operand rows
+
+Both operands of the attention-output GEMM are bf16 rows of `n_attn_heads × head_dim` = 4096
+elements: the attention output, `[B][4096]`, and W_o, `[2880][4096]`. That is an 8192-byte row
+stride, a power of two, so the rows of one GEMM tile fell onto few L2 channels — the same effect the
+KV cache's region pad works around (see [Cache layout and tiling](#cache-layout-and-tiling)). The
+profile showed it without naming it: on a grid of one round, 69 % of the kernel's time was "TD stalled
+on TC" and the matrix cores were 51 % busy, while the logits GEMM, on the same tile, kept them 89 %
+busy.
+
+`GETP_AO_PAD` (default 32 elements) lengthens every row of both operands by 64 bytes, which spreads
+them. Four places agree on it: the attention kernel (`flash_attn_decode_mfma16_kernel`) writes its
+bf16 output at the padded stride, `attn_o_bf16` is allocated padded in `ext_alloc_device`, W_o is
+uploaded at the padded pitch (`getp_memcpy_fp32_to_bf16_pitched`, a `hipMemcpy2DAsync` from the rows
+converted on the host), and the per-layer W_o offset uses the padded row length. The pad itself is
+never written or read, and only addresses change, so the output is bit-identical. The two retired
+attention kernels write an unpadded output, so selecting either with a non-zero pad is a compile
+error. Op test: at M = 1536 (the 20B, wide tile) 445 → 400 µs, and 388 µs with
+`GETP_ATTN_O_MINW_WIDE = 3` on top — the `__launch_bounds__` promise of three waves per SIMD for the
+wide tile, which lost on the unpadded operands (489 against 446 µs) and is now the default; at
+M = 768 (the 120B, narrow tile) 282 → 252 µs. End to end that is +0.4 % on the 20B and +0.2 % on the
+120B at the standard batch.
+
+The pad has to keep the rows 64-byte aligned, and a `static_assert` holds it to a multiple of 32
+elements: a pad of 16 elements lost badly in the op test (674 µs), and 128 and 256 lost too. The
+rule that came out of it is that a row stride counted in 64-byte lines should have at most one factor
+of two. The unpadded 8192 bytes are 128 lines, 2⁷; padded they are 129. qkv, mlp1, mlp2 and the
+logits GEMM read 5760-byte rows, 90 lines = 2 × 45, which is fine: padding qkv to 91 lines gains
+under 1 %.
+
 ### The only runtime decision is split-K
 
 Two launchers make a runtime choice, and both use the same rule: query the CU count (falling back to
@@ -362,8 +394,12 @@ splits = min(splits, max_splits_by_K);
 
 For the router this always fires at the shipped batch sizes. With `gx = 1`, 20b gives
 `gy = ceil(1536/32) = 48` and so `ceil(416/48) = 9`, clamped to 8; 120b gives `gy = 24`, so 18, again
-clamped to 8. `matmul_kernel_nosplit` is therefore dead code in both shipped configurations — with
-`gx = 1` it takes $\lceil \text{M}/32 \rceil \ge 416$, that is $\text{M} \ge 13281$, to run. The split-K router allocates an
+clamped to 8, and at its largest batch of 1024 `gy = 32`, so 13, clamped to 8. The 20B's largest
+batch would split differently: at 1984 rows `gy = 62` and `ceil(416/62) = 7`, under the clamp. The
+router alone then rounds a split of 6 or 7 up to 8 (`GETP_ROUTER_SPLITS_UP`, default 6), because
+eight is the split the fused router reproduces (see [Routing](#routing)): a few more workgroups than
+the target cost less than the unfused pair, +0.9 % end to end at 1984 rows on the reference prompts. `matmul_kernel_nosplit` is therefore dead code in both
+shipped configurations — with `gx = 1` it takes $\lceil \text{M}/32 \rceil \ge 416$, that is $\text{M} \ge 13281$, to run. The split-K router allocates an
 $\text{M} \times \text{N} \times \text{splits}$ fp32 scratch with `hipMallocAsync` and finishes with
 `reduce_splitk_with_bias`, which sums the slices and adds the router bias.
 
@@ -381,11 +417,23 @@ with the 96-row build, and split-K had no speed to sell: 62 865 tok/s with it ag
 The `total_pairs` read that sizes the memset is a synchronous `hipMemcpy` now; the old
 `hipMemcpyAsync` into a stack `int` only worked because ROCm copies synchronously into pageable memory.
 
-One constraint worth recording: both split-K paths compute `kChunk = ceil(K / splits)` without forcing
-any alignment, while the loads are 16-byte vectors guarded by `kk + 7 < kEnd`. At the shipped
-`splits = 8` over $\text{K}=2880$ this is exact, `kChunk = 360`. At `splits = 7`, `kChunk = 412` would
-silently zero-fill four k values at the tail of every chunk and misalign the bf16 weight load by 8
-bytes. `splits = 7` needs `grid_xy` in 60..69, which the shipped batch sizes do not produce.
+One constraint turned into a bug once the batch began to follow the input. Both split-K paths
+computed `kChunk = ceil(K / splits)` without forcing any alignment, while their loaders take 8-element
+groups guarded by `kk + 7 < kEnd`, zero-fill a group that does not fit before `kEnd`, and start the
+next split at `kBeg = split × kChunk`. At `splits = 8` over $\text{K}=2880$ this is exact,
+`kChunk = 360`. `splits = 7` needs `grid_xy` in 60..69, which the router, with its row blocks of 32,
+reached on the 20B at 1889 to 2208 rows per GPU before seven was rounded up to eight — and there the
+fused router, which needs exactly eight splits (see [Routing](#routing)), stepped aside for
+`matmul_kernel_splitk_store_tuned`. Its `kChunk` was `ceil(2880/7) = 412`: the last group of every chunk crossed `kEnd` and was zero-filled,
+while the next split started four elements into that group, so 4 elements per chunk boundary, 24 of
+the 2880, vanished from every router logit, and the bf16 weight loads of the odd-numbered splits sat
+8 bytes off their 16-byte alignment. At 1920 rows the 20B's METEOR fell to 0.357, against 0.52 at
+1888. The kernel now rounds `kChunk` up to a multiple of 8 — 416 at seven splits — which drops
+nothing; the eight-split chunk of 360 is unchanged, so every configuration used before is
+bit-identical, and the fused router still reproduces the unfused one bit for bit. With splits of 6
+and 7 now rounded up to 8, no batch up to either cap reaches an unaligned chunk any more; the rounding
+guards the unfused path for anyone who raises `GETP_ROUTER_SPLITS_UP`. MLP2's split-K has the same
+formula, unrounded, but `MATMUL_MLP2_MAX_SPLITS = 1` keeps it from engaging.
 
 ## Multi-head attention
 
@@ -566,14 +614,15 @@ list.
 
 ### Cache layout and tiling
 
-The KV cache is one bf16-sized allocation per device for K and one for V, head-major inside each layer
-(`GETP_KV_HEADMAJOR`, default 1): after the layer offset the element address runs batch, then KV head,
-then the ring slot `t % cache_tcap`, then head dim - each (request, KV head) owns one contiguous region
-of `cache_tcap × 64` elements plus a pad of `GETP_KV_PAD` elements (768 by default, 384 when both
-tensors are bf16; see below). `GETP_KV_OFF(t, b, col, B, KVD, CAP)`
-computes the offset, and it is additive in _t_ and _(b, col)_, so the qkv epilogue's slot pointer
-`GETP_KV_OFF(slot, 0, 0, ...)` plus the per-element offset `GETP_KV_OFF(0, b, col, ...)` addresses
-the same element the attention kernel reads. Time capacity differs by layer class.
+The KV cache is one allocation per device for K and one for V (bf16-sized for a bf16 tensor, smaller
+for an int8 one, below), head-major inside each layer (`GETP_KV_HEADMAJOR`, default 1): after the
+layer offset the element address runs batch, then KV head, then the ring slot `t % cache_tcap`, then
+head dim - each (request, KV head) owns one contiguous region of `cache_tcap × 64` elements plus a pad
+of `GETP_KV_PAD` elements (768 by default, 384 when both tensors are bf16; see below).
+`GETP_KV_OFF(t, b, col, B, KVD, CAP)` computes the offset, and it is additive in _t_ and _(b, col)_,
+so the qkv epilogue's slot pointer `GETP_KV_OFF(slot, 0, 0, ...)` plus the per-element offset
+`GETP_KV_OFF(0, b, col, ...)` addresses the same element the attention kernel reads. Time capacity
+differs by layer class.
 
 | Layer class    | Slots (`cache_tcap`)           | Why                                            |
 | -------------- | ------------------------------ | ---------------------------------------------- |
@@ -581,11 +630,11 @@ the same element the attention kernel reads. Time capacity differs by layer clas
 | Odd (full)     | 1024, equal to `seq_len / 2`   | a ring sized to the memory budget              |
 
 For 20b that is 12 × 128 + 12 × 1024 = 13 824 time slots per device across 24 layers, at 1.5 MiB per
-slot for K and the same for V (1536 requests × 512 elements × 2 B), plus the pads: 24 layers × 1536 ×
-8 regions × 768 elements × 2 B = 453 MB for K and the same for V (340 MB each on the 120B), which
-`transformer.cpp` adds to the allocation with the same macros. Note the consequence for the full
-layers: they hold half the advertised `seq_len` of 2048, so history beyond 1024 positions is dropped
-there too.
+slot for K (1536 requests × 512 elements × 2 B) and half that for V in int8, plus its scales, plus the
+pads: 24 layers × 1536 × 8 regions × 768 elements × 2 B = 453 MB for K and 241 MB for V with its
+scales (340 and 180 MB on the 120B at 768 rows), which `transformer.cpp` adds to the allocation with
+the same macros. Note the consequence for the full layers: they hold half the advertised `seq_len` of
+2048, so history beyond 1024 positions is dropped there too.
 
 With `GETP_ROPE_FUSED_KV` (default 1) the qkv epilogue writes the new token's K and V into this layout
 itself, two bf16 per lane, and `kv_store_pair_fp32_to_bf16` is no longer launched; that kernel and the
@@ -607,11 +656,15 @@ the output is bit-exact; the qkv epilogue's scattered write costs about 20 µs p
 
 **V in int8** (`GETP_KV8_V`, default 1; `GETP_KV8_K` does the same for K and defaults to 0). Decode
 attention is bound by the bytes of the cache it reads, and a 64-element head vector costs 128 bytes in
-bf16 against 68 as int8 codes plus one fp32 scale. There is no new allocation: code _e_ sits at byte _e_
-of the bf16-sized buffer - the same `GETP_KV_OFF` offsets, counted in bytes - and the scale of the
-vector that starts at element _e_ is float _e_/64 of the buffer's upper half (`getp_kv8_scales`), so a
-16-key tile has 16 consecutive scales. The rest of the upper half is unused; the saving is bandwidth,
-not memory. The qkv epilogue quantizes: a row's 64 dims sit on the 16 lanes of a lane group times 4
+bf16 against 68 as int8 codes plus one fp32 scale. Code _e_ sits at byte _e_ of the tensor's
+allocation - the same `GETP_KV_OFF` offsets, counted in bytes - and the scale of the vector that
+starts at element _e_ is float _e_/64 of a scale array that begins at the first 256-byte boundary
+after the codes (`getp_kv8_scales`), so a 16-key tile has 16 consecutive scales. The allocation is
+sized to exactly that: `kv_elems` bytes rounded up to 256, then `kv_elems / 64` floats. It used to be
+the bf16-sized buffer, codes in the lower half and scales at the start of the upper, which saved
+bandwidth but no memory; at its own size V takes 17/32 of its bf16 footprint, a 20B row of cache
+shrinks from 28.3 to 21.7 MB, and that is the room the larger batches in [SERVING.md](SERVING.md)
+run in. The qkv epilogue quantizes: a row's 64 dims sit on the 16 lanes of a lane group times 4
 values, so the absolute maximum takes four `__shfl_xor`, and the stored code is
 `round(x × 127 / amax) + 128`. Because the pad is counted in elements, the int8 tensor needs twice the
 element count for the same byte stagger, hence the default of 768 whenever a tensor is int8 (K, still
@@ -685,6 +738,15 @@ same bf16 bits in the kernel, wrote eight partials and summed them in a second k
 its epilogue - so it is bit-exact. Since nothing else reads the fp32 copy, the pre-MoE RMSNorm now
 writes bf16 only. Norm and router together went from 134 to 58 µs per layer on the 20B and from 83 to
 57 µs on the 120B.
+
+It reproduces the eight-split arithmetic only, so it runs only where `getp_router_splits` — the split
+rule above, `ceil(4 × CUs / row blocks)` at most 8, over row blocks of 32 — comes to exactly 8
+(`getp_router_fused_ok`). A split of 6 or 7 is rounded up to 8 for that reason (the 20B at 1889 to
+2656 rows per GPU, its largest batch of 1984 included), so every batch up to both caps is fused. The
+unfused split-K pair runs only at five splits or fewer — the 20B above 2656 rows, past its cap — or
+with `GETP_ROUTER_SPLITS_UP` raised; the pre-MoE RMSNorm then writes the fp32 copy again, with the
+chunk rounding described under
+[The only runtime decision is split-K](#the-only-runtime-decision-is-split-k).
 
 Top-k selection is `router_topk_softmax_batch_kernel`: one block per token, scores cached in LDS, and
 K sequential selection passes, each a block-wide argmax followed by poisoning the winner with
@@ -935,8 +997,9 @@ outright rather than degrading to a CPU path.
 | Tile macros: `MATMUL_*`, `NUM_CTA_*`, `GETP_BN_AGG` (no `MATMUL_QKV_*` exists)                                                                                                                             | [`src/hip/forward.hip`](../src/hip/forward.hip), defined next to each kernel                               |
 | Attention switches: `FLASH_MFMA16` (and the per-parity `FLASH_MFMA16_EVEN` / `_ODD`), `FLASH_HEADS_PER_WAVE`, `FLASH_LDS_PAD`, `FLASH_P_HILO`; `FLASH_DECODE_TILE_T` now sizes only the retired kernels    | [`src/hip/forward.hip`](../src/hip/forward.hip)                                                            |
 | Load pipeline depth: `GETP_MLP1_AHEAD2`, `GETP_MLP2_AHEAD2` and their `*_LOAD_GAP`, `GETP_ATTN_O_AHEAD2_WIDE` / `_NARROW`, `GETP_QKV_AHEAD2_MAXM`; attention's `GETP_ATTN_PREFETCH2`                    | [`src/hip/forward.hip`](../src/hip/forward.hip)                                                            |
+| Attention-out operand padding and occupancy: `GETP_AO_PAD` (with `GETP_AO_PADX` / `GETP_AO_PADW`), `GETP_ATTN_O_MINW_WIDE`                                                                              | [`src/hip/forward.hip`](../src/hip/forward.hip), [`src/getp/transformer.cpp`](../src/getp/transformer.cpp), [`src/getp/state_ext.cpp`](../src/getp/state_ext.cpp) |
 | KV cache layout and format: `GETP_KV_HEADMAJOR`, `GETP_KV_PAD`, `GETP_KV_OFF`, `GETP_KV8_K`, `GETP_KV8_V`, `getp_kv8_scales`                                                                                    | [`src/hip/forward.hip`](../src/hip/forward.hip), [`src/getp/transformer.cpp`](../src/getp/transformer.cpp) |
-| Router and small kernels: `GETP_ROUTER_FUSED`, `GETP_DEAD_ROWS`, `GETP_RMSNORM_WAVE`, `GETP_SMALL_VEC`, `GETP_GP_OWN_LAST`                                                                                       | [`src/hip/forward.hip`](../src/hip/forward.hip)                                                            |
+| Router and small kernels: `GETP_ROUTER_FUSED`, `GETP_ROUTER_SPLITS_UP`, `GETP_DEAD_ROWS`, `GETP_RMSNORM_WAVE`, `GETP_SMALL_VEC`, `GETP_GP_OWN_LAST`                                                                                       | [`src/hip/forward.hip`](../src/hip/forward.hip)                                                            |
 | LDS padding, one macro per staging layout: `MATMUL_MLP1_LDS_PAD_SLOTS`, `MATMUL_MLP2_LDS_PAD_SLOTS`, `GETP_QKV_LDS_PAD_SLOTS`, `MATMUL_ATTN_O_LDS_PAD_SLOTS` (cells) and `MATMUL_LOGITS_LDS_KPAD` (halves) | [`src/hip/forward.hip`](../src/hip/forward.hip)                                                            |
 | Batch size, expert parallelism, per-device request slicing                                                                                                                                                 | [`src/getp/run.cpp`](../src/getp/run.cpp)                                                                  |
 | KV cache sizing and per-layer ring capacities                                                                                                                                                              | [`src/getp/transformer.cpp`](../src/getp/transformer.cpp)                                                  |

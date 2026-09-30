@@ -108,9 +108,10 @@ void ext_alloc_device(int device_index, int batch_size, int expert_parallelism,
   HIP_CHECK(
       hipMalloc(&g_ext[device_index].pre_qkv_bf16,
                 sizeof(__hip_bfloat16) * (size_t)batch_size * hidden_dim));
+  // Rows padded by GETP_AO_PADX elements (see GETP_AO_PAD in forward.hip).
   HIP_CHECK(hipMalloc(&g_ext[device_index].attn_o_bf16,
                       sizeof(__hip_bfloat16) * (size_t)batch_size *
-                          (size_t)p->head_dim * (size_t)p->n_attn_heads));
+                          ((size_t)p->head_dim * (size_t)p->n_attn_heads + GETP_AO_PADX)));
 
   // Pre-allocate temporary buffer for collective operations
   // Allocate enough for typical allreduce operations
